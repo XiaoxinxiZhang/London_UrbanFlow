@@ -74,7 +74,7 @@ curl.exe -L --retry 3 --retry-all-errors -o data\live\imports\westminster_2026.z
 
 ## 地图与联动分析
 
-城市总览采用本地固定版本 MapLibre GL JS 5.6.2 与 OpenFreeMap Dark / Positron 底图，图表采用 ECharts 5.6.0。伦敦行政边界与泰晤士河水系使用随项目提供的 GeoJSON 独立叠加，可分别开关；河道采用 OS Open Rivers 的概化中心线，线宽不代表实际河宽。运行 `python tools/update_london_rivers.py` 可从 OS Open Rivers GeoJSON 服务重新生成数据：主河道保留在伦敦边界外接矩形内，其他河道保留在行政边界及周边 1 公里内，以免沿潮汐河岸裁切的行政面删掉河道；日常浏览无需访问该服务。自行车使用本地 Supercluster 8.0.1 生成聚合标记：缩放级别小于 13 时以可点击的数字圆圈展示，数字为站点数；放大后显示全部原始站点，可查看车辆与空位。聚合标记通过 DOM 绘制，避开聚合 GeoJSON 的渲染缺失；聚合组件加载失败时直接显示原始点位。更新数据、历史回放、图层开关和底图切换均同步更新标记。第三方代码及许可证在 `assets/vendor/`。底图需要网络连接；底图资源失败时仍可查询业务数据、图表与表格。
+城市总览采用本地固定版本 MapLibre GL JS 5.6.2 与 OpenFreeMap Dark / Positron 底图，图表采用 ECharts 5.6.0。伦敦行政边界使用项目提供的 GeoJSON 叠加；河流专题图层已从当前页面移除。自行车使用本地 Supercluster 8.0.1 生成聚合标记：缩放级别小于 13 时以可点击的数字圆圈展示，数字为站点数；放大后显示全部原始站点，可查看车辆与空位。聚合标记通过 DOM 绘制；聚合组件加载失败时直接显示原始点位。更新数据、历史回放、图层开关和底图切换均同步更新标记。第三方代码及许可证在 `assets/vendor/`。底图需要网络连接；底图资源失败时仍可查询业务数据、图表与表格。
 
 默认分析最近 48 小时，支持最近 7 天或自选日期。历史回放按所选小时结束时刻取值，并展示统一时间游标。LAQN 小时值优先采用来源小时数据，缺少小时值时至少使用 3 个不同的 15 分钟观测求均值。返回的 `sample_count` 与 `aggregation` 保留计算依据。地图的最新值可切换 LAQN 的 15 分钟或小时粒度。地图圆点为 LAQN、菱形为 Breathe London，浓度分级在选定时间范围内固定；指数使用来源等级。灰色代表缺测。
 
@@ -83,3 +83,5 @@ curl.exe -L --retry 3 --retry-all-errors -o data\live\imports\westminster_2026.z
 选择监测站后显示周围 500 米自行车站和 1 公里道路事件，可切换为 500 米、1 公里或 2 公里。自行车站关联 1 公里内最近的有值污染监测点。道路范围距离使用实际几何；区域气象仅采用 `area=London / Greater London` 的有效站点，默认选择所选时间范围有效观测最多者。气象缺少精确站点坐标和来源单位，界面显示区域、geohash 和单位缺失状态。同 UTC 小时配对至少 24 对且两列均有变化时计算 Pearson 相关系数，作为观察性分析。
 
 分析接口为 `/api/map`、`/api/analysis/series`、`/api/analysis/nearby`、`/api/analysis/weather`。共同参数 `start`、`end`、`cursor` 使用带时区 ISO 时间，`start <= t < end`，回放数据满足 `t <= cursor`。`source` 可选 `laqn`、`breathe`、`breathe_wcc`；`metric` 可选四种浓度污染物或 `PM25_INDEX`、`NO2_INDEX`。附近查询通过 `kind=air / bike / road` 与 `site` 指定对象。气象接口使用 `weather_site` 指定伦敦站点，series 接口使用逗号分隔的 `sites` 对比最多 4 站。
+
+智慧出行使用 `POST /api/journeys/plan`，请求体含 `[经度,纬度]` 的 `start`、`end`，`mode=shared_bike / walk / personal_bike`，以及 `max_walk_m=1000 / 2000`。服务器只读取最新 TfL BikePoint 快照，超过 15 分钟时不推荐取还车站；取车站需要至少 1 辆车，还车站需要至少 1 个空位。道路路线由 openrouteservice 的步行与骑行服务计算，需在启动服务的进程中设置 `ORS_API_KEY`；密钥不返回前端。路线服务失败时仍可查看现有站点和环境数据，但不能生成道路导航。Defra 的 Greater London DAQI 地区等级用于官方分人群健康指导，与 LAQN / Breathe London 的地点附近浓度估计分别展示。

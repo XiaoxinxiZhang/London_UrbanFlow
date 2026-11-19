@@ -49,13 +49,12 @@
         })[c],
     );
   const GIS_LABELS = {
-    region: "大伦敦", borough: "行政区", thames: "泰晤士河", tributary: "支流",
+    region: "大伦敦", borough: "行政区",
     laqn: "LAQN 监测点", breathe: "Breathe London 监测点",
     bikes: "自行车站", roadPoint: "道路点事件", roadArea: "道路面事件",
   };
   const GIS_CONTROLS = {
     region: ["layerBoundary", "layerRegion"], borough: ["layerBoundary", "layerBorough"],
-    thames: ["layerRiver", "layerThames"], tributary: ["layerRiver", "layerTributary"],
     laqn: ["layerAir", "layerLaqn"], breathe: ["layerAir", "layerBreathe"],
     bikes: ["layerBikes"], roadPoint: ["layerRoads", "layerRoadPoints"],
     roadArea: ["layerRoads", "layerRoadAreas"],
@@ -63,8 +62,6 @@
   const GIS_STATIC = {
     region: ["boundaries", "data/london_region_2025.geojson"],
     borough: ["boundaries", "data/london_boroughs_2025.geojson"],
-    thames: ["rivers", "data/london_thames_rivers.geojson"],
-    tributary: ["rivers", "data/london_thames_rivers.geojson"],
   };
   function gisVisible(layer) {
     return GIS_CONTROLS[layer].every((id) => $(id).checked !== false);
@@ -88,8 +85,6 @@
     if (GIS_STATIC[layer]) {
       const path = GIS_STATIC[layer][1], data = S.spatial[path + "Data"];
       if (!data) return [];
-      if (layer === "thames" || layer === "tributary")
-        return data.features.filter((f) => f.properties.class === layer);
       return data.features;
     }
     if (!S.data) return [];
@@ -100,7 +95,6 @@
   }
   function gisColumns(layer) {
     if (layer === "region" || layer === "borough") return ["名称", "代码", "面积 km²", "周长 km", "类型"];
-    if (layer === "thames" || layer === "tributary") return ["名称", "类别", "编号"];
     if (layer === "laqn" || layer === "breathe") return ["站点", "来源", "类型", "指标值", "观测时间", "数据质量", "位置"];
     if (layer === "bikes") return ["站点", "车辆", "空位", "容量", "快照时间", "位置"];
     return ["事件", "编号", "类别", "严重程度", "状态", "开始时间", "修改时间"];
@@ -111,7 +105,6 @@
       const region = layer === "region";
       return [p[region ? "RGN25NM" : "LAD25NM"], p[region ? "RGN25CD" : "LAD25CD"], n(p.Shape__Area / 1e6), n(p.Shape__Length / 1000), region ? "大伦敦" : "行政区"];
     }
-    if (layer === "thames" || layer === "tributary") return [p.name, layer === "thames" ? "泰晤士河" : "支流", p.id];
     if (layer === "laqn" || layer === "breathe") return [p.name, p.source === "breathe_wcc" ? "Breathe London · Westminster 导入" : sourceNames[p.source] || p.source, p.kind, p.value === null ? "缺测" : n(p.value) + (p.unit ? " " + p.unit : ""), time(p.observed_at), p.quality || "—", p.borough || f.geometry.coordinates.map(v => n(v, 4)).join(", ")];
     if (layer === "bikes") return [p.name, n(p.bikes, 0), n(p.empty_docks, 0), n(p.capacity, 0), time(p.captured_at), f.geometry.coordinates.map(v => n(v, 4)).join(", ")];
     return [p.name, p.id, p.category, p.severity, p.status, time(p.starts_at), time(p.modified_at)];
@@ -256,13 +249,29 @@
         time(new Date(S.hours[Number($("replayHour").value)]).toISOString()) +
         " 小时";
   }
+  function showAnalysisSection(section) {
+    S.analysisSection = section;
+    Array.from(document.querySelectorAll("[data-analysis-section]"))
+      .filter(node => node.dataset?.analysisSection)
+      .forEach(node => { node.hidden = node.dataset.analysisSection !== section; });
+    Array.from(document.querySelectorAll("[data-analysis-tab]"))
+      .filter(node => node.dataset?.analysisTab)
+      .forEach(node => node.classList.toggle("active", node.dataset.analysisTab === section));
+    requestAnimationFrame(() => Object.values(S.charts).forEach(chart => chart.resize()));
+  }
   function showPage(page) {
     const previousPage = S.page;
     S.page = page;
     $("cityOverview").hidden = page !== "overview";
+    if ($("journeyPage")) $("journeyPage").hidden = page !== "journey";
     $("cityAnalysis").hidden = page !== "analysis";
     $("tablesPage").hidden = page !== "tables";
-    $("cityControls").hidden = page === "tables";
+    $("cityControls").hidden = page === "tables" || page === "journey";
+    const mapNode = $("cityMap"), journeyHost = $("journeyMapHost");
+    if (page === "journey" && journeyHost?.append && mapNode?.parentElement !== journeyHost)
+      journeyHost.append(mapNode);
+    else if (page === "overview" && S.overviewMapHost?.append && mapNode?.parentElement !== S.overviewMapHost)
+      S.overviewMapHost.append(mapNode);
     document.querySelectorAll("[data-page]").forEach((b) => {
       const active = b.dataset.page === page;
       b.classList.toggle("active", active);
@@ -270,16 +279,37 @@
       else b.removeAttribute("aria-current");
     });
     requestAnimationFrame(() => {
-      if (S.map) S.map.resize();
+      if (S.map) {
+        S.map.resize();
+        if (page === "overview" && previousPage === "journey" && !S.selectedBoundary)
+          fitLondonView();
+      }
       Object.values(S.charts).forEach((c) => c.resize());
     });
     if (page === "analysis") {
+      showAnalysisSection(S.analysisSection || "series");
       loadAnalysis();
+    }
+    if (page === "journey" && $("cityMode").value !== "latest") {
+      $("cityMode").value = "latest";
+      refreshCity(true).catch((e) => error(e.message));
     }
     if (page === "overview" && previousPage === "tables")
       refreshCity($("cityMode").value === "latest").catch((e) =>
         error(e.message),
       );
+  }
+  function fitLondonView() {
+    if (!S.map || !S.ready) return;
+    S.map.resize();
+    S.map.fitBounds([[-0.51025, 51.28678], [0.33404, 51.69189]], {
+      padding: {top: 36, bottom: 36, left: 40, right: 40}, maxZoom: 11.2, duration: 0,
+    });
+  }
+  function fitInitialMap() {
+    if (S.initialMapFitted || !S.map || !S.ready || !S.data || S.selectedBoundary) return;
+    S.initialMapFitted = true;
+    requestAnimationFrame(fitLondonView);
   }
   function initMap() {
     if (!window.maplibregl) {
@@ -311,10 +341,10 @@
         S.ready = true;
         installLayers();
         installBoundaryLayers();
-        installRiverLayers();
         drawLayers();
         legend();
         $("mapNotice").textContent = "底图已加载 · ○ LAQN · ◇ Breathe London";
+        fitInitialMap();
         if (S.pendingBoundaryFocus && S.selectedBoundary) {
           S.pendingBoundaryFocus = false;
           requestAnimationFrame(() => focusBoundary(S.selectedBoundary));
@@ -335,11 +365,6 @@
       ? { outer: "#8b5700", borough: "#416578" }
       : { outer: "#f5cf72", borough: "#96bdcf" };
   }
-  function riverColors() {
-    return $("basemap").value === "positron"
-      ? { thames: "#087ba9", tributary: "#398fb2" }
-      : { thames: "#56c9ff", tributary: "#7dbbdb" };
-  }
   function selectedBoundaryFilter(level) {
     const field = level === "region" ? "RGN25CD" : "LAD25CD";
     const code = S.selectedBoundary?.level === level ? S.selectedBoundary.code : "";
@@ -354,7 +379,7 @@
   }
   function positionBoundaryLayers() {
     if (!S.map.getLayer("bike-clusters")) return;
-    for (const id of ["london-region-fill", "london-borough-fill", "london-borough-boundaries", "london-tributaries", "london-thames", "london-outer-boundary", "london-selected-region", "london-selected-borough"])
+    for (const id of ["london-region-fill", "london-borough-fill", "london-borough-boundaries", "london-outer-boundary", "london-selected-region", "london-selected-borough"])
       if (S.map.getLayer(id)) S.map.moveLayer(id, "bike-clusters");
   }
   function installBoundaryLayers() {
@@ -398,24 +423,6 @@
         },
       }, before);
     }
-    positionBoundaryLayers();
-    visibility();
-  }
-  function installRiverLayers() {
-    if (!S.ready) return;
-    const m = S.map, colors = riverColors();
-    if (!m.getSource("london-rivers"))
-      m.addSource("london-rivers", { type: "geojson", data: "data/london_thames_rivers.geojson" });
-    const before = m.getLayer("bike-clusters") ? "bike-clusters" : undefined;
-    for (const [id, kind, color, width] of [
-      ["london-tributaries", "tributary", colors.tributary, 1.7],
-      ["london-thames", "thames", colors.thames, 3.5],
-    ])
-      if (!m.getLayer(id)) m.addLayer({
-        id, type: "line", source: "london-rivers",
-        filter: ["==", ["get", "class"], kind],
-        paint: { "line-color": color, "line-width": width, "line-opacity": 0.95 },
-      }, before);
     positionBoundaryLayers();
     visibility();
   }
@@ -611,6 +618,7 @@
       "road-line",
     ]) {
       m.on("click", layer, (event) => {
+        if ($("journeyPage")?.dataset?.picking) return;
         if (event.originalEvent?.gisHandled) return;
         if (event.originalEvent) event.originalEvent.gisHandled = true;
         const point = event.features[0],
@@ -632,6 +640,7 @@
       m.on("mouseleave", layer, () => (m.getCanvas().style.cursor = ""));
     }
     m.on("click", "bike-clusters", async (event) => {
+      if ($("journeyPage")?.dataset?.picking) return;
       if (!S.bikeIndex) return;
       const f = event.features[0],
         zoom = S.bikeIndex.getClusterExpansionZoom(f.properties.cluster_id);
@@ -639,8 +648,9 @@
     });
     m.on("mouseenter", "bike-clusters", () => (m.getCanvas().style.cursor = "pointer"));
     m.on("mouseleave", "bike-clusters", () => (m.getCanvas().style.cursor = ""));
-    for (const [layer, gisLayer] of [["london-thames","thames"],["london-tributaries","tributary"],["london-borough-fill","borough"],["london-region-fill","region"]]) {
+    for (const [layer, gisLayer] of [["london-borough-fill","borough"],["london-region-fill","region"]]) {
       m.on("click", layer, (event) => {
+        if ($("journeyPage")?.dataset?.picking) return;
         if (event.originalEvent?.gisHandled) return;
         if (event.originalEvent) event.originalEvent.gisHandled = true;
         if (event.features?.[0]) chooseGisFeature(gisLayer, event.features[0], false, true);
@@ -702,6 +712,7 @@
           element.style.background = ({empty:"#ee9a69",full:"#bf92df",available:"#58b9d1"})[p.state] || "#7b8c9c";
         }
         element.addEventListener("click", (event) => {
+          if ($("journeyPage")?.dataset?.picking) return;
           event.stopPropagation();
           if (p.cluster) {
             S.map.easeTo({center:feature.geometry.coordinates,zoom:S.bikeIndex.getClusterExpansionZoom(p.cluster_id)});
@@ -738,6 +749,7 @@
         element.setAttribute("aria-label", element.title);
         if (!p.cluster) element.style.background = layer === "roadPoint" ? ({Serious:"#ef7b84",Severe:"#ef7b84",Moderate:"#e9bc70",Minimal:"#8bbddd"})[p.severity] || "#98aabd" : p.color || "#758290";
         element.addEventListener("click", (event) => {
+          if ($("journeyPage")?.dataset?.picking) return;
           event.stopPropagation();
           if (p.cluster) S.map.easeTo({center:feature.geometry.coordinates, zoom:group.index.getClusterExpansionZoom(p.cluster_id)});
           else chooseGisFeature(layer, feature, false, true);
@@ -754,7 +766,6 @@
     const flags = {
       "london-region-fill":gisVisible("region"), "london-outer-boundary":gisVisible("region"), "london-selected-region":gisVisible("region"),
       "london-borough-fill":gisVisible("borough"), "london-borough-boundaries":gisVisible("borough"), "london-selected-borough":gisVisible("borough"),
-      "london-thames":gisVisible("thames"), "london-tributaries":gisVisible("tributary"),
       "air-laqn":gisVisible("laqn") && !(low && S.pointGroups.laqn?.index),
       "air-breathe":gisVisible("breathe") && !(low && S.pointGroups.breathe?.index),
       "air-values":(gisVisible("laqn") || gisVisible("breathe")) && !(low && (S.pointGroups.laqn?.index || S.pointGroups.breathe?.index)),
@@ -773,12 +784,9 @@
   }
   function legend() {
     const boundary = boundaryColors();
-    const river = riverColors();
     const parts = [];
     if (gisVisible("region")) parts.push("<span><i class='boundary-key' style='border-top:3px solid " + boundary.outer + "'></i>大伦敦外边界</span>");
     if (gisVisible("borough")) parts.push("<span><i class='boundary-key' style='border-top:1px solid " + boundary.borough + "'></i>行政区边界</span>");
-    if (gisVisible("thames")) parts.push("<span><i class='boundary-key' style='border-top:4px solid " + river.thames + "'></i>泰晤士河</span>");
-    if (gisVisible("tributary")) parts.push("<span><i class='boundary-key' style='border-top:2px solid " + river.tributary + "'></i>伦敦支流</span>");
     if (!S.data) {
       $("mapLegend").innerHTML = parts.join("");
       return;
@@ -918,6 +926,7 @@
     if ([...$("bikeStation").options].some((o) => o.value === bike))
       $("bikeStation").value = bike;
     legend();
+    fitInitialMap();
   }
   async function refreshCity(reset = false) {
     if (location.protocol === "file:") return;
@@ -991,14 +1000,14 @@
       textStyle: {
         color: "#a8bfce",
         fontFamily: "Inter, Segoe UI, sans-serif",
-        fontSize: 11,
+        fontSize: 13,
       },
       tooltip: {
         trigger: "axis",
         confine: true,
         backgroundColor: "#122638",
         borderColor: "#3b5a6d",
-        textStyle: { color: "#e5edf5" },
+        textStyle: { color: "#e5edf5", fontSize: 14 },
       },
       grid: { left: 60, right: 25, top: 45, bottom: 65 },
       xAxis: {
@@ -1006,14 +1015,14 @@
         axisLabel: {
           formatter: (value) =>
             time(new Date(value).toISOString()).slice(5, 16),
-          color: "#94a8ba",
+          color: "#94a8ba", fontSize: 13,
         },
         splitLine: { show: false },
       },
       yAxis: {
         type: "value",
         splitLine: { lineStyle: { color: "#283d4c" } },
-        axisLabel: { color: "#94a8ba" },
+        axisLabel: { color: "#94a8ba", fontSize: 13 },
       },
       ...extra,
     };
@@ -1102,6 +1111,11 @@
     button.className = "map-popup-button";
     button.addEventListener("click", openSelected);
     content.append(button);
+    const nearbyButton = document.createElement("button");
+    nearbyButton.textContent = "周边详情";
+    nearbyButton.className = "map-popup-button";
+    nearbyButton.addEventListener("click", () => $("linkageDialog")?.showModal?.());
+    content.append(nearbyButton);
     const bounds = f.geometry.type === "Point" ? null : geometryBounds(f.geometry);
     S.popup = new maplibregl.Popup({ maxWidth: "310px" })
       .setLngLat(lngLat || (bounds ? [(bounds[0][0] + bounds[1][0]) / 2, (bounds[0][1] + bounds[1][1]) / 2] : f.geometry.coordinates))
@@ -1433,12 +1447,12 @@
         xAxis: {
           type: "category",
           data: hours,
-          axisLabel: { color: "#94a8ba", fontSize: 9 },
+          axisLabel: { color: "#94a8ba", fontSize: 13 },
         },
         yAxis: {
           type: "category",
           data: days,
-          axisLabel: { color: "#94a8ba", fontSize: 10 },
+          axisLabel: { color: "#94a8ba", fontSize: 13 },
         },
         visualMap: {
           min: missing ? 0 : Math.min(...values, 0),
@@ -1725,11 +1739,20 @@
       )
       .join("");
   }
+  S.overviewMapHost = $("cityMap")?.parentElement;
+  if ($("gisTableDialog")?.append) $("gisTableDialog").append(document.querySelector(".gis-table-panel"));
+  if ($("linkageDialog")?.append) $("linkageDialog").append(document.querySelector(".linkage"));
+  $("closeGisTable")?.addEventListener?.("click", () => $("gisTableDialog").close());
+  $("closeLinkage")?.addEventListener?.("click", () => $("linkageDialog").close());
   document
     .querySelectorAll("[data-page]")
     .forEach((b) =>
       b.addEventListener("click", () => showPage(b.dataset.page)),
     );
+  document.querySelectorAll("[data-analysis-tab]").forEach(button => {
+    if (button.dataset?.analysisTab)
+      button.addEventListener("click", () => showAnalysisSection(button.dataset.analysisTab));
+  });
   window.addEventListener("airwatch:show-boundary", (event) => {
     const selected = event.detail;
     if (!selected || !["region", "borough"].includes(selected.level) ||
@@ -1748,7 +1771,7 @@
     }
     requestAnimationFrame(() => focusBoundary(selected));
   });
-  for (const id of ["layerBoundary", "layerRegion", "layerBorough", "layerRiver", "layerThames", "layerTributary", "layerAir", "layerLaqn", "layerBreathe", "layerBikes", "layerRoads", "layerRoadPoints", "layerRoadAreas"])
+  for (const id of ["layerBoundary", "layerRegion", "layerBorough", "layerAir", "layerLaqn", "layerBreathe", "layerBikes", "layerRoads", "layerRoadPoints", "layerRoadAreas"])
     $(id).addEventListener("change", () => {
       if (S.gisSelected && !gisVisible(S.gisSelected.layer)) S.gisSelected = null;
       visibility();
@@ -1757,7 +1780,7 @@
       renderGisTable();
     });
   document.querySelectorAll("[data-gis-table]").forEach((button) =>
-    button.addEventListener("click", () => openGisTable(button.dataset.gisTable)));
+    button.addEventListener("click", () => { openGisTable(button.dataset.gisTable); $("gisTableDialog")?.showModal?.(); }));
   $("gisTable").addEventListener("click", (event) => {
     const button = event.target.closest?.("[data-gis-row]");
     if (!button) return;
@@ -1868,14 +1891,13 @@
     zone(),
   );
   $("cityEnd").value = calendarDate(new Date(), zone());
-  const gisSidebar = document.querySelector?.(".gis-sidebar"), narrowMap = window.matchMedia?.("(max-width: 900px)");
-  if (gisSidebar && narrowMap) {
-    const syncSidebar = () => { gisSidebar.open = !narrowMap.matches; S.map?.resize(); };
-    syncSidebar();
-    narrowMap.addEventListener("change", syncSidebar);
+  const gisSidebar = document.querySelector?.(".gis-sidebar");
+  if (gisSidebar) {
+    gisSidebar.open = false;
     gisSidebar.addEventListener("toggle", () => S.map?.resize());
   }
   renderGisTable();
+  window.AirWatchCity = {getMap: () => S.map, showPage, fitLondonView, getData: () => S.data};
   if (location.protocol !== "file:") {
     initMap();
     refreshCity(true).catch((e) => error(e.message));

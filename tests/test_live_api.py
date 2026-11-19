@@ -102,9 +102,10 @@ class LiveAPITests(unittest.TestCase):
             for url,code in [("/index.html",200),
                              ("/data.js",404),
                              ("/assets/insights.js",200),
+                             ("/assets/journey.js",200),
                              ("/data/london_region_2025.geojson",200),
                              ("/data/london_boroughs_2025.geojson",200),
-                             ("/data/london_thames_rivers.geojson",200),
+                             ("/data/london_thames_rivers.geojson",404),
                              ("/api/status",200),
                              ("/api/measurements?source=laqn",200),
                              ("/api/locations?source=invalid",400),
@@ -124,6 +125,18 @@ class LiveAPITests(unittest.TestCase):
                 response = connection.getresponse()
                 self.assertEqual(response.status,202)
                 self.assertEqual(json.loads(response.read())["id"],"test")
+            route = {"start": [-.15, 51.5], "end": [-.1, 51.5], "mode": "walk"}
+            with patch.object(server.journeys,"plan",return_value={"legs": []}) as planned:
+                connection.request("POST","/api/journeys/plan",body=json.dumps(route),headers={
+                    "Origin":f"http://127.0.0.1:{server.server_port}","Content-Type":"application/json"})
+                response = connection.getresponse()
+                self.assertEqual(response.status,200)
+                self.assertEqual(json.loads(response.read())["legs"],[])
+                planned.assert_called_once_with(route)
+            connection.request("POST","/api/journeys/plan",body="{}",headers={"Content-Type":"application/json"})
+            response = connection.getresponse()
+            self.assertEqual(response.status,403)
+            response.read()
         finally:
             connection.close()
             server.shutdown()

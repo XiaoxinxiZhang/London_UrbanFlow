@@ -413,6 +413,120 @@
   font-size: 13px;
   margin: 12px 0 5px;
 }
+
+/* The dashboard is designed for a 1920 × 1080 browser viewport. */
+html, body { height: 100%; }
+body { height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
+header { width: 100%; max-width: none; height: 72px; flex: none; padding: 9px 28px; }
+main { width: 100%; max-width: none; flex: 1; min-height: 0; padding: 7px 28px 8px; display: flex; flex-direction: column; overflow: hidden; }
+main > .context { min-height: 27px; margin: 0 0 3px; }
+main > .page-tabs { min-height: 45px; margin: 0 0 7px; flex: none; }
+main > .city-controls { min-height: 59px; flex: none; padding: 8px 12px; margin-bottom: 7px; }
+main > .city-controls label { min-width: 115px; }
+main > .notice { flex: none; margin-bottom: 5px; padding: 5px 10px; }
+main > footer { flex: none; min-height: 29px; padding: 2px 0 0; line-height: 1.2; }
+main > footer br { display: none; }
+#cityOverview { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+#cityOverview[hidden], #journeyPage[hidden], #cityAnalysis[hidden], #tablesPage[hidden] { display: none !important; }
+.city-kpis { flex: none; gap: 10px; margin: 0 0 7px; }
+.city-kpi { padding: 7px 14px; }
+.city-kpi strong { font-size: 23px; line-height: 1.15; }
+.city-kpi small { font-size: 10px; }
+.city-grid { flex: 1; min-height: 0; grid-template-columns: minmax(0,1fr); gap: 0; }
+.geo-panel { margin: 0; min-height: 0; display: flex; flex-direction: column; }
+.geo-panel .panel-title { flex: none; padding: 7px 14px 4px; }
+.geo-panel .panel-title p { margin: 0; }
+.map-toolbar { flex: none; padding: 0 14px 6px; }
+.map-workspace { flex: 1; min-height: 0; grid-template-columns: 225px minmax(0,1fr); }
+.gis-sidebar { overflow: hidden; }
+.gis-sidebar > summary { display: block; font-weight: 600; padding: 7px 12px; cursor: pointer; }
+.gis-sidebar-content { height: calc(100% - 34px); max-height: none; overflow: auto; padding: 4px 10px; }
+.gis-layer-group { margin: 0; padding: 4px 0; }
+.gis-layer-group > summary { cursor: pointer; font-size: 12px; list-style-position: inside; }
+.gis-layer-group > summary .check { display: inline-flex; color: var(--ink); font-size: 12px; font-weight: 600; }
+.gis-sublayer { padding: 3px 0 3px 13px; }
+.map-legend { flex-direction: column; align-items: stretch; }
+.map-legend span { justify-content: space-between; flex-direction: row-reverse; }
+#cityMap { height: 100%; min-height: 0; }
+.map-notice { flex: none; min-height: 24px; padding: 3px 12px; }
+.map-attribution-text { flex: none; padding: 3px 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.overview-bottom { flex: none; display: flex; align-items: center; margin: 7px 0 0; padding: 3px 10px; min-height: 62px; }
+.overview-bottom .panel-title { flex: none; padding: 0 8px; display: block; }
+.overview-bottom .panel-title h2 { font-size: 13px; }
+.overview-bottom .panel-title p { margin: 0; }
+.coverage-summary { flex: 1; min-width: 0; padding: 0 12px; gap: 14px; }
+.quick-sites { flex: none; padding: 0; width: 335px; }
+.quick-sites label { min-width: 0; }
+.quick-sites select { width: 100%; }
+.workspace-dialog { width: min(1450px, 86vw); max-height: 82vh; overflow: auto; }
+.workspace-dialog .gis-table-panel { border: 1px solid var(--line); }
+.workspace-dialog .gis-table-scroll { max-height: 55vh; }
+.workspace-dialog .linkage { display: block; border: 0; margin: 0; }
+.workspace-dialog .linkage .nearby-content { max-height: 35vh; overflow: auto; }
+.workspace-dialog .linkage .compact-chart { height: 170px; }
+#cityAnalysis { flex: 1; min-height: 0; overflow: auto; }
+#cityAnalysis .analysis-selection { padding: 8px 12px; margin-bottom: 7px; }
+#cityAnalysis .analysis-selection select[multiple] { height: 60px; }
+#cityAnalysis .panel-title { padding: 9px 14px; }
+#cityAnalysis .chart { height: 495px; }
+#cityAnalysis .analysis-grid { gap: 10px; }
+#cityAnalysis .analysis-grid > [data-analysis-section="heatmap"],
+#cityAnalysis .analysis-grid > [data-analysis-section="bike"] { grid-column: 1 / -1; }
+.analysis-tabs { display: flex; gap: 8px; padding: 0 0 8px; }
+.analysis-tabs button { padding: 6px 15px; font-size: 12px; }
+.analysis-tabs button.active { color: var(--accent); border-color: var(--accent); background: #183a3b; }
+#tablesPage { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+#tablesPage .sources { flex: none; margin-bottom: 7px; }
+#tablesPage .source { padding: 7px 12px; gap: 0; }
+#tablesPage > .panel:not(.status-panel) { flex: 1; min-height: 0; display: flex; flex-direction: column; margin-bottom: 7px; }
+#tablesPage > .panel .panel-title { padding: 8px 14px; }
+#tablesPage > .panel .filters { padding: 0 14px 8px; }
+#tablesPage .table-wrap { flex: 1; min-height: 0; max-height: none; }
+#tablesPage .table-wrap td { padding: 5px 10px; line-height: 1.3; }
+#tablesPage .table-wrap th { padding: 8px 10px; }
+#tablesPage .table-wrap td .obs-time, #tablesPage .table-wrap td .sub { margin-top: 2px; }
+#tablesPage .status-panel { flex: none; max-height: 90px; overflow: auto; margin-bottom: 0; padding: 5px 12px; }
+#tablesPage .status-panel .table-wrap { max-height: 70px; }
+#journeyPage { flex: 1; min-height: 0; display: grid; grid-template-columns: 390px minmax(0,1fr); gap: 10px; }
+.journey-planner, .journey-map-panel { min-height: 0; margin: 0; }
+.journey-planner { display: flex; flex-direction: column; }
+.journey-planner .panel-title { padding: 12px 16px 5px; }
+.journey-form { padding: 0 16px 12px; display: flex; flex-direction: column; gap: 8px; border-bottom: 1px solid var(--line); }
+.journey-point { display: flex; align-items: center; gap: 9px; min-height: 36px; }
+.journey-point button { width: 150px; flex: none; }
+.journey-point button.active { border-color: var(--accent); color: var(--accent); }
+.journey-point span { font-size: 11px; color: var(--muted); }
+.journey-actions { display: flex; gap: 7px; }
+.journey-actions button { flex: 1; padding: 4px 7px; }
+.journey-form select { width: 100%; }
+.journey-result { padding: 12px 16px; overflow: auto; min-height: 0; font-size: 12px; }
+.journey-result h3 { margin: 12px 0 5px; font-size: 13px; }
+.journey-result p { margin: 7px 0; }
+.journey-warning { border-left: 3px solid #e9bc70; background: #403827; padding: 9px; }
+.journey-total { display: flex; align-items: baseline; gap: 12px; border-bottom: 1px solid var(--line); padding-bottom: 7px; }
+.journey-total strong { font-size: 25px; color: var(--accent); }
+.journey-leg { border-bottom: 1px solid var(--line); padding: 7px 0; }
+.journey-leg summary, .journey-context summary { cursor: pointer; font-weight: 600; }
+.journey-leg ol { padding-left: 21px; margin: 6px 0; }
+.journey-leg li { margin: 4px 0; }
+.journey-alternatives button { display: block; width: 100%; margin: 5px 0; text-align: left; }
+.journey-alerts ul, .journey-context ul { padding-left: 19px; margin: 6px 0; }
+.journey-environment { margin-top: 13px; border-top: 1px solid var(--line); }
+.journey-context { margin: 8px 0; }
+.journey-map-panel { display: flex; flex-direction: column; }
+.journey-map-head, .journey-map-foot { flex: none; display: flex; justify-content: space-between; padding: 8px 13px; font-size: 12px; color: var(--muted); }
+.journey-map-head strong { color: var(--ink); }
+#journeyMapHost { flex: 1; min-height: 0; }
+#journeyMapHost #cityMap { height: 100%; width: 100%; }
+.journey-map-foot { font-size: 10px; }
+.gis-sublayer .check { flex: 1; min-width: 0; }
+.layer-symbol { display: inline-block; width: 12px; height: 12px; margin-left: auto; flex: none; }
+.boundary-symbol { height: 0; border-top: 3px solid #f5cf72; }
+.borough-symbol { height: 0; border-top: 1px solid #96bdcf; }
+.laqn-symbol { border-radius: 50%; background: #63dfc6; }
+.breathe-symbol { background: #63dfc6; transform: rotate(45deg) scale(.8); }
+.road-point-symbol { border-radius: 50%; background: #e9bc70; }
+.road-area-symbol { background: #e9bc70; opacity: .7; }
 @media (min-width: 1600px) {
   #cityMap {
     height: 650px;
@@ -575,4 +689,101 @@
 }
 @media (max-width: 650px) {
   .sources { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (min-width: 1600px) {
+  .city-grid { align-items: stretch; }
+  #cityMap { height: 100%; }
+  .gis-sidebar-content { max-height: none; }
+}
+
+/* 1920 × 1080 desktop: readable type without shrinking the browser page. */
+@media (min-width: 1600px) {
+  :root { font-size: 16px; }
+  body { font-size: 16px; line-height: 1.35; }
+  button, select, input { font-size: 14px; }
+  button { padding: 5px 11px; min-height: 34px; }
+  select, input[type="search"], input[type="date"] { min-height: 34px; padding: 4px 8px; }
+  label { font-size: 14px; }
+  .context, .panel-title p, .panel-title > span, .muted, small { font-size: 13px; }
+  h2 { font-size: 19px; }
+  h3 { font-size: 16px; }
+  header { height: 60px; padding: 5px 20px; }
+  .brand { gap: 10px; }
+  .brandmark { width: 40px; height: 40px; font-size: 32px; }
+  .wordmark { font-size: 21px; letter-spacing: .6px; }
+  header h1 { font-size: 13px; margin: 0; }
+  .updates { gap: 10px; }
+  .updates label { gap: 1px; }
+  main { padding: 4px 20px 5px; }
+  main > .context { min-height: 25px; margin-bottom: 2px; }
+  main > .page-tabs { min-height: 40px; margin-bottom: 5px; gap: 25px; }
+  .page-tabs button { font-size: 15px; min-height: 40px; padding: 7px 2px; }
+  main > .city-controls { min-height: 60px; padding: 4px 10px; margin-bottom: 5px; gap: 10px; }
+  .city-controls label { gap: 2px; font-size: 14px; }
+  .city-controls select { width: 100%; }
+  main > .notice { font-size: 14px; }
+  main > footer { min-height: 25px; font-size: 13px; line-height: 1.2; }
+  .city-kpis { gap: 8px; margin-bottom: 5px; }
+  .city-kpi { padding: 4px 10px; min-height: 58px; }
+  .city-kpi > span, .city-kpi small { font-size: 13px; line-height: 1.1; }
+  .city-kpi strong { font-size: 23px; line-height: 1.1; }
+  .geo-panel .panel-title { align-items: center; min-height: 38px; padding: 4px 12px; }
+  .geo-panel .panel-title > div { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
+  .geo-panel .panel-title p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .geo-panel .panel-title label { flex-direction: row; align-items: center; gap: 6px; }
+  .map-toolbar { min-height: 31px; padding: 0 12px 4px; }
+  .map-toolbar > label { font-size: 13px; }
+  .map-workspace { position: relative; display: block; min-height: 0; }
+  #cityMap { width: 100%; height: 100%; }
+  .gis-sidebar { position: absolute; top: 10px; left: 10px; z-index: 5; width: auto; height: auto; max-height: calc(100% - 20px); overflow: hidden; border: 1px solid #3a5868; border-radius: 8px; box-shadow: 0 8px 24px #050d19b8; }
+  .gis-sidebar[open] { width: 285px; height: calc(100% - 20px); }
+  .gis-sidebar > summary { display: block; padding: 8px 12px; font-size: 14px; background: #102b3ae8; }
+  .gis-sidebar-content { height: calc(100% - 39px); max-height: none; padding: 5px 12px; background: #102131ed; overflow: auto; }
+  .gis-layer-group { padding: 5px 0; }
+  .gis-layer-group > summary, .gis-layer-group > summary .check, .gis-sublayer .check { font-size: 14px; }
+  .gis-sublayer { gap: 5px; padding: 4px 0 4px 12px; }
+  .gis-sublayer button { font-size: 14px; padding: 3px 6px; min-height: 29px; }
+  .gis-sidebar .map-legend { gap: 7px; padding: 8px 0; }
+  .gis-sidebar .map-legend span, .map-legend { font-size: 13px; }
+  .map-notice { min-height: 23px; padding: 2px 12px; font-size: 13px; }
+  .map-attribution-text { min-height: 20px; padding: 2px 12px; font-size: 13px; }
+  .overview-bottom { display: block; position: relative; z-index: 6; flex: none; height: 38px; min-height: 38px; padding: 0; margin-top: 5px; overflow: visible; }
+  .overview-bottom > summary { display: flex; align-items: center; gap: 12px; height: 37px; padding: 0 13px; cursor: pointer; font-size: 14px; font-weight: 600; list-style: none; }
+  .overview-bottom > summary::-webkit-details-marker { display: none; }
+  .overview-bottom > summary::before { content: "▸"; color: var(--accent); }
+  .overview-bottom[open] > summary::before { content: "▾"; }
+  .overview-bottom > summary span { color: var(--muted); font-size: 13px; font-weight: 400; }
+  .overview-extra { position: absolute; left: -1px; right: -1px; bottom: 100%; display: flex; align-items: center; gap: 15px; min-height: 82px; max-height: 230px; padding: 11px 14px; overflow: auto; background: #142738; border: 1px solid var(--line); border-radius: 8px 8px 0 0; box-shadow: 0 -8px 24px #030911aa; }
+  .coverage-summary { flex: 1; min-width: 0; padding: 0; gap: 12px; font-size: 13px; }
+  .quick-sites { flex: none; width: 350px; padding: 0; gap: 8px; }
+  .quick-sites label { font-size: 14px; }
+  .gis-table-head h3 { font-size: 16px; }
+  .gis-table-head span, .gis-table-foot span, .gis-row-button { font-size: 13px; }
+  table, .gis-table-scroll table { font-size: 14px; }
+  th, td { padding: 8px 10px; }
+  .sub, .obs-time, .unit, .quality, .station-name { font-size: 13px; }
+  td .site-link { font-size: 14px; }
+  .pagination, .notice, .status-panel summary, .status-panel summary span, .status-extra, .jobs { font-size: 13px; }
+  .source span, .source small { font-size: 13px; }
+  .source strong { font-size: 18px; }
+  #tablesPage .source { min-height: 76px; }
+  #tablesPage .table-wrap td { padding: 6px 10px; line-height: 1.3; }
+  #tablesPage .status-panel { max-height: 88px; }
+  .analysis-tabs button { font-size: 14px; }
+  #seriesSummary, .chart-note, .borough-item { font-size: 13px; }
+  .journey-point span, .journey-map-head, .journey-map-foot { font-size: 13px; }
+  .journey-result { font-size: 14px; }
+  .journey-result h3 { font-size: 16px; }
+  .journey-planner { overflow: hidden; }
+  .journey-form { flex: none; }
+  .maplibregl-popup-content { font-size: 14px; line-height: 1.5; }
+  .map-popup-name { font-size: 16px; }
+  .map-popup-text, .map-popup-button { font-size: 13px; }
+  .maplibregl-ctrl-attrib { font-size: 13px !important; }
+  .replay output, .nearby-content, .citizen-card, .nearby-stat span,
+  .nearby-list small, .chart-note, .city-info { font-size: 13px; }
+  .nearby-list button, .link-buttons button { font-size: 14px; }
+  .citizen-card h3 { font-size: 16px; }
+  dialog { font-size: 14px; }
+  .dialog-header p, .metadata-item, .metadata-item span, .raw-data, .road-summary p { font-size: 13px; }
 }

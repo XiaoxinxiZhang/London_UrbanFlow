@@ -7,8 +7,8 @@ const root = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(root, 'assets/city.js'), 'utf8');
 const elements = new Map(), handlers = new Map(), sources = new Map(), layers = new Map(), visibility = new Map();
 const tabs = ['overview','analysis','tables'].map(page => ({dataset:{page},addEventListener(){},classList:{toggle(){}},setAttribute(){},removeAttribute(){}}));
-const tableButtons = ['region','borough','thames','tributary','laqn','breathe','bikes','roadPoint','roadArea'].map(gisTable => ({dataset:{gisTable},addEventListener(){},classList:{toggle(){}}}));
-const layerIds = new Set(['layerBoundary','layerRegion','layerBorough','layerRiver','layerThames','layerTributary','layerAir','layerLaqn','layerBreathe','layerBikes','layerRoads','layerRoadPoints','layerRoadAreas']);
+const tableButtons = ['region','borough','laqn','breathe','bikes','roadPoint','roadArea'].map(gisTable => ({dataset:{gisTable},addEventListener(){},classList:{toggle(){}}}));
+const layerIds = new Set(['layerBoundary','layerRegion','layerBorough','layerAir','layerLaqn','layerBreathe','layerBikes','layerRoads','layerRoadPoints','layerRoadAreas']);
 function element(id) {
   if (!elements.has(id)) elements.set(id, {
     value:({timezone:'Europe/London',cityRange:'48',cityMode:'latest',cityMetric:'PM25',cityPeriod:'900',basemap:'dark',mapColor:'concentration'})[id] || '',
@@ -37,7 +37,6 @@ let mapReply = null;
 const staticFiles = {
   '/data/london_region_2025.geojson':JSON.parse(fs.readFileSync(path.join(root,'data/london_region_2025.geojson'))),
   '/data/london_boroughs_2025.geojson':JSON.parse(fs.readFileSync(path.join(root,'data/london_boroughs_2025.geojson'))),
-  '/data/london_thames_rivers.geojson':JSON.parse(fs.readFileSync(path.join(root,'data/london_thames_rivers.geojson'))),
 };
 const context = {
   window:{AirWatchData:{api(url){if(staticFiles[url]) return Promise.resolve(staticFiles[url]); if(url==='/api/map' && mapReply) return Promise.resolve(mapReply); return new Promise(()=>{});},time:v=>v || '—',calendarDate:d=>d.toISOString().slice(0,10),dateRange(){throw Error('unused');}},maplibregl:library,Supercluster:require('../assets/vendor/supercluster-8.0.1.min.js'),addEventListener(){}},
@@ -86,18 +85,13 @@ const represented = markers => markers.reduce((sum,item)=>sum+(item.feature.prop
   await openGisTable('region'); assert.match(element('gisTable').innerHTML,/>London</);
   await openGisTable('borough'); assert.match(element('gisTableCount').textContent,/33/);
   assert.match(element('gisTable').innerHTML,/面积 km²/);
-  await openGisTable('thames'); assert.match(element('gisTableCount').textContent,/86/);
-  await openGisTable('tributary'); assert.match(element('gisTableCount').textContent,/701/);
-  await chooseGisFeature('tributary',staticFiles['/data/london_thames_rivers.geojson'].features.filter(f=>f.properties.class==='tributary')[80],false,true);
-  assert.equal(S.gisPage,2);
-  assert.match(element('gisTable').innerHTML,/class='selected'/);
   await openGisTable('borough');
   handlers.get('click:london-borough-fill')({features:[staticFiles['/data/london_boroughs_2025.geojson'].features[0]],originalEvent:{}});
   await new Promise(setImmediate);
   assert.equal(S.gisSelected.key,'borough:E09000001');
   assert.match(element('gisTable').innerHTML,/class='selected'/);
-  await openGisTable('tributary');
-  element('gisTableSearch').value='River Lea'; renderGisTable();
+  await openGisTable('borough');
+  element('gisTableSearch').value='Westminster'; renderGisTable();
   assert.match(element('gisTableCount').textContent,/匹配/);
 
   await openGisTable('laqn');

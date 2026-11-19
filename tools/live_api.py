@@ -35,7 +35,7 @@ def timestamp(value):
 def page_params(params):
     page = int(params.get("page", "1"))
     size = int(params.get("page_size", "50"))
-    if page < 1 or page > 100000 or size not in (25, 50, 100):
+    if page < 1 or page > 100000 or size not in (8, 25, 50, 100):
         raise ValueError("分页参数无效")
     return page, size
 

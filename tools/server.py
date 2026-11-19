@@ -14,14 +14,15 @@ import webbrowser
 from live_api import LiveAPI, UpdateManager
 import live_store as store
 import traffic_history
+from journey import JourneyPlanner
 
 ROOT = Path(__file__).resolve().parents[1]
-STATIC = {"/index.html", "/assets/live.css", "/assets/live.js", "/assets/city.css", "/assets/city.js", "/assets/insights.js",
+STATIC = {"/index.html", "/assets/live.css", "/assets/live.js", "/assets/city.css", "/assets/city.js", "/assets/journey.js", "/assets/insights.js",
           "/assets/vendor/maplibre-gl-5.6.2.js", "/assets/vendor/maplibre-gl-5.6.2.css",
           "/assets/vendor/supercluster-8.0.1.min.js",
           "/assets/vendor/echarts-5.6.0.min.js",
           "/data/london_region_2025.geojson", "/data/london_boroughs_2025.geojson",
-          "/data/london_thames_rivers.geojson"}
+          }
 
 
 class LocalServer(http.server.ThreadingHTTPServer):
@@ -104,16 +105,31 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def do_POST(self):
         origin = f"http://127.0.0.1:{self.server.server_port}"
         if not self.valid_host() or self.headers.get("Origin") != origin:
-            self.reply({"error": "更新请求必须来自本地页面"}, 403)
+            self.reply({"error": "请求必须来自本地页面"}, 403)
             return
-        if self.path != "/api/update":
+        if self.path not in ("/api/update", "/api/journeys/plan"):
             self.reply({"error": "接口不存在"}, 404)
             return
-        if self.headers.get("Content-Length", "0") != "0" or self.headers.get("Transfer-Encoding"):
+        if self.headers.get("Transfer-Encoding"):
             self.close_connection = True
-            self.reply({"error": "更新请求无需请求体"}, 400)
+            self.reply({"error": "不支持分块请求体"}, 400)
             return
-        self.reply(self.server.updates.start(), 202)
+        if self.path == "/api/update":
+            if self.headers.get("Content-Length", "0") != "0":
+                self.reply({"error": "更新请求无需请求体"}, 400)
+                return
+            self.reply(self.server.updates.start(), 202)
+            return
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            if not 1 <= size <= 2048 or self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json":
+                raise ValueError("路线请求须为不超过 2 KB 的 JSON")
+            payload = json.loads(self.rfile.read(size))
+            self.reply(self.server.journeys.plan(payload))
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            self.reply({"error": str(exc)}, 400)
+        except sqlite3.Error:
+            self.reply({"error": "数据库暂时无法读取，请稍后刷新"}, 503)
 
     def log_message(self, fmt, *args):
         if args and "favicon" in str(args[0]):
@@ -128,6 +144,7 @@ def create_server(port=8765, database=store.DB):
     server = LocalServer(("127.0.0.1", port),
         lambda *args, **kwargs: Handler(*args, directory=str(ROOT), **kwargs))
     server.api = LiveAPI(database)
+    server.journeys = JourneyPlanner(server.api.analysis)
     server.updates = UpdateManager(database)
     return server
 
@@ -145,7 +162,7 @@ def main():
     except OSError:
         server = create_server(0, args.db)
     url = f"http://127.0.0.1:{server.server_port}/index.html"
-    print("London AirWatch: " + url, flush=True)
+    print("london UrbanFlow: " + url, flush=True)
     print("Keep this window open. Ctrl+C stops the server.", flush=True)
     if args.open:
         threading.Timer(.4, lambda: webbrowser.open(url)).start()

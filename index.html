@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>London AirWatch · 城市数据</title>
+<title>london UrbanFlow · 城市数据</title>
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="assets/live.css">
 <link rel="stylesheet" href="assets/vendor/maplibre-gl-5.6.2.css">
@@ -14,18 +14,19 @@
 <script src="assets/live.js" defer></script>
 <script src="assets/insights.js?v=20261118" defer></script>
 <script src="assets/city.js?v=20261118" defer></script>
+<script src="assets/journey.js?v=20261118" defer></script>
 </head>
 <body>
 <noscript><p class="notice">请启用 JavaScript 以查询数据库。</p></noscript>
 <header>
-  <div class="brand"><div class="brandmark" aria-hidden="true">⌁</div><div><span class="wordmark">LONDON <b>AIRWATCH</b></span><h1>伦敦环境与出行观测平台</h1></div></div>
+  <div class="brand"><div class="brandmark" aria-hidden="true">⌁</div><div><span class="wordmark">london <b>UrbanFlow</b></span><h1>伦敦环境与出行观测平台</h1></div></div>
   <div class="updates"><button id="updateButton" class="primary">更新数据</button><label>自动更新 <select id="autoInterval"><option value="0">关闭</option><option value="1">每 1 分钟</option><option value="5" selected>每 5 分钟</option><option value="15">每 15 分钟</option></select></label></div>
 </header>
 <main>
   <div class="context"><span>伦敦多源观测</span><label>显示时区 <select id="timezone"><option value="Europe/London">伦敦 · GMT / BST</option><option value="UTC">UTC</option><option value="Asia/Shanghai">北京 · UTC+8</option></select></label><span id="readTime"></span></div>
   <div id="startupError" class="notice error" hidden role="alert"></div>
   <div id="updateProgress" class="notice" hidden role="status" aria-live="polite"></div>
-  <nav class="page-tabs" aria-label="页面"><button data-page="overview" class="active" aria-current="page">城市总览</button><button data-page="analysis">环境与出行分析</button><button data-page="tables">数据表格</button></nav>
+  <nav class="page-tabs" aria-label="页面"><button data-page="overview" class="active" aria-current="page">城市总览</button><button data-page="journey">智慧出行</button><button data-page="analysis">环境与交通分析</button><button data-page="tables">数据中心</button></nav>
   <div id="cityControls" class="panel city-controls">
     <label>污染指标<select id="cityMetric"><option value="PM25">PM₂.₅</option><option value="NO2">NO₂</option><option value="PM10">PM₁₀</option><option value="O3">O₃</option><option value="PM25_INDEX">PM₂.₅ 空气质量指数</option><option value="NO2_INDEX">NO₂ 空气质量指数</option></select></label>
     <label>监测来源<select id="citySource"><option value="">LAQN 与 Breathe London</option><option value="laqn">LAQN 参考站</option><option value="breathe">Breathe London 传感器</option><option value="breathe_wcc">Westminster 年度导入</option></select></label>
@@ -45,18 +46,17 @@
         <div class="map-toolbar"><label>监测点颜色<select id="mapColor"><option value="concentration">指标数值</option><option value="freshness">数据新鲜度</option></select></label></div>
         <div class="map-workspace">
           <details class="gis-sidebar"><summary>图层与图例</summary><div class="gis-sidebar-content">
-            <div class="gis-layer-group"><label class="check"><input id="layerBoundary" type="checkbox" checked> 行政区划 · 面</label><div class="gis-sublayer"><label class="check"><input id="layerRegion" type="checkbox" checked> 大伦敦</label><button type="button" data-gis-table="region">属性表</button></div><div class="gis-sublayer"><label class="check"><input id="layerBorough" type="checkbox" checked> 33 个行政区</label><button type="button" data-gis-table="borough">属性表</button></div></div>
-            <div class="gis-layer-group"><label class="check"><input id="layerRiver" type="checkbox" checked> 河流 · 线</label><div class="gis-sublayer"><label class="check"><input id="layerThames" type="checkbox" checked> 泰晤士河</label><button type="button" data-gis-table="thames">属性表</button></div><div class="gis-sublayer"><label class="check"><input id="layerTributary" type="checkbox" checked> 支流</label><button type="button" data-gis-table="tributary">属性表</button></div></div>
-            <div class="gis-layer-group"><label class="check"><input id="layerAir" type="checkbox" checked> 空气监测点 · 点</label><div class="gis-sublayer"><label class="check"><input id="layerLaqn" type="checkbox" checked> LAQN</label><button type="button" data-gis-table="laqn">属性表</button></div><div class="gis-sublayer"><label class="check"><input id="layerBreathe" type="checkbox" checked> Breathe London</label><button type="button" data-gis-table="breathe">属性表</button></div></div>
+            <details class="gis-layer-group" open><summary><label class="check"><input id="layerBoundary" type="checkbox" checked> 行政区划</label></summary><div class="gis-sublayer"><label class="check"><input id="layerRegion" type="checkbox" checked> 大伦敦 <i class="layer-symbol boundary-symbol"></i></label><button type="button" data-gis-table="region">属性表</button></div><div class="gis-sublayer"><label class="check"><input id="layerBorough" type="checkbox" checked> 33 个行政区 <i class="layer-symbol borough-symbol"></i></label><button type="button" data-gis-table="borough">属性表</button></div></details>
+            <details class="gis-layer-group" open><summary><label class="check"><input id="layerAir" type="checkbox" checked> 空气监测点</label></summary><div class="gis-sublayer"><label class="check"><input id="layerLaqn" type="checkbox" checked> LAQN <i class="layer-symbol laqn-symbol"></i></label><button type="button" data-gis-table="laqn">属性表</button></div><div class="gis-sublayer"><label class="check"><input id="layerBreathe" type="checkbox" checked> Breathe London <i class="layer-symbol breathe-symbol"></i></label><button type="button" data-gis-table="breathe">属性表</button></div></details>
             <div class="gis-layer-group"><div class="gis-sublayer"><label class="check"><input id="layerBikes" type="checkbox" checked> 自行车站 · 点</label><button type="button" data-gis-table="bikes">属性表</button></div></div>
-            <div class="gis-layer-group"><label class="check"><input id="layerRoads" type="checkbox" checked> 道路事件</label><div class="gis-sublayer"><label class="check"><input id="layerRoadPoints" type="checkbox" checked> 点事件</label><button type="button" data-gis-table="roadPoint">属性表</button></div><div class="gis-sublayer"><label class="check"><input id="layerRoadAreas" type="checkbox" checked> 面事件</label><button type="button" data-gis-table="roadArea">属性表</button></div></div>
+            <details class="gis-layer-group" open><summary><label class="check"><input id="layerRoads" type="checkbox" checked> 道路事件</label></summary><div class="gis-sublayer"><label class="check"><input id="layerRoadPoints" type="checkbox" checked> 点事件 <i class="layer-symbol road-point-symbol"></i></label><button type="button" data-gis-table="roadPoint">属性表</button></div><div class="gis-sublayer"><label class="check"><input id="layerRoadAreas" type="checkbox" checked> 面事件 <i class="layer-symbol road-area-symbol"></i></label><button type="button" data-gis-table="roadArea">属性表</button></div></details>
             <div id="mapLegend" class="map-legend"></div>
           </div></details>
           <div id="cityMap" aria-label="伦敦环境与交通地图"></div>
         </div>
         <div id="mapNotice" class="map-notice" role="status">正在加载底图…</div>
-        <section class="gis-table-panel" aria-label="地图属性表"><div class="gis-table-head"><div><h3 id="gisTableTitle">LAQN 监测点属性表</h3><span id="gisTableCount"></span></div><label>搜索要素<input id="gisTableSearch" type="search" placeholder="名称、编号或属性"></label></div><div id="gisTable" class="gis-table-scroll"></div><div class="gis-table-foot"><span id="gisTablePage"></span><button id="gisTablePrevious" type="button">上一页</button><button id="gisTableNext" type="button">下一页</button></div></section>
-        <div class="map-attribution-text">OpenFreeMap · © OpenMapTiles · © OpenStreetMap contributors<br>边界：<a href="https://www.ons.gov.uk/methodology/geography/licences" target="_blank" rel="noopener">Source: Office for National Statistics licensed under the Open Government Licence v.3.0</a> · Contains OS data © Crown copyright and database right 2025<br>水系：<a href="https://www.ordnancesurvey.co.uk/products/os-open-rivers" target="_blank" rel="noopener">OS Open Rivers</a> · Contains OS data © Crown copyright and database right 2026 · 河道中心线不表示实际河宽</div>
+         <section class="gis-table-panel" aria-label="地图属性表"><div class="gis-table-head"><div><h3 id="gisTableTitle">LAQN 监测点属性表</h3><span id="gisTableCount"></span></div><label>搜索要素<input id="gisTableSearch" type="search" placeholder="名称、编号或属性"></label></div><div id="gisTable" class="gis-table-scroll"></div><div class="gis-table-foot"><span id="gisTablePage"></span><button id="gisTablePrevious" type="button">上一页</button><button id="gisTableNext" type="button">下一页</button></div></section>
+         <div class="map-attribution-text">OpenFreeMap · © OpenMapTiles · © OpenStreetMap contributors · 边界：<a href="https://www.ons.gov.uk/methodology/geography/licences" target="_blank" rel="noopener">ONS / OS Open Government Licence v3.0</a></div>
       </section>
       <aside class="panel linkage">
         <div class="panel-title"><div><h2 id="linkTitle">周边环境与出行</h2><p id="linkSubtitle">点击地图中的站点或道路事件</p></div></div>
@@ -67,7 +67,22 @@
         <div class="link-buttons"><button id="openSelected" disabled>元数据与原始记录</button><button id="analyseSelected" disabled>分析此站</button></div>
       </aside>
     </div>
-    <section class="panel overview-bottom"><div class="panel-title"><h2>观测覆盖与新鲜度</h2><p>○ LAQN 参考站 · ◇ Breathe London 传感器</p></div><div id="coverageSummary" class="coverage-summary"></div><div class="quick-sites"><label>快速选择监测站<select id="quickStation"></select></label><button id="chooseQuick">查看周边</button></div></section>
+    <details class="panel overview-bottom"><summary>观测覆盖与新鲜度 <span>展开详情与快速选站</span></summary><div class="overview-extra"><div id="coverageSummary" class="coverage-summary"></div><div class="quick-sites"><label>快速选择监测站<select id="quickStation"></select></label><button id="chooseQuick">查看周边</button></div></div></details>
+  </section>
+  <section id="journeyPage" hidden>
+    <aside class="panel journey-planner">
+      <div class="panel-title"><div><h2>规划出行</h2><p>Santander Cycles 固定站点 · 车辆与空位为快照</p></div></div>
+      <div class="journey-form">
+        <div class="journey-point"><button id="pickStart" type="button">在地图选起点</button><span id="startLabel">尚未选择</span></div>
+        <div class="journey-point"><button id="pickEnd" type="button">在地图选终点</button><span id="endLabel">尚未选择</span></div>
+        <div class="journey-actions"><button id="swapJourney" type="button">交换起终点</button><button id="clearJourney" type="button">清除</button></div>
+        <label>出行方式<select id="journeyMode"><option value="shared_bike">Santander Cycles</option><option value="walk">步行</option><option value="personal_bike">个人自行车</option></select></label>
+        <label id="maxWalkLabel">取车与还车步行上限<select id="maxWalk"><option value="1000">各 1 公里</option><option value="2000">各 2 公里</option></select></label>
+        <button id="planJourney" class="primary" type="button">规划路线</button>
+      </div>
+      <div id="journeyResult" class="journey-result" role="status" aria-live="polite"><p class="muted">在地图上依次选择起点和终点。</p></div>
+    </aside>
+    <div class="panel journey-map-panel"><div class="journey-map-head"><strong>取车 · 骑行 · 还车</strong><span id="journeyMapHint">选择起点</span></div><div id="journeyMapHost"></div><div class="journey-map-foot">路线：© openrouteservice / OpenStreetMap · 站点：TfL BikePoint · 数据不保证车辆或空位预留</div></div>
   </section>
   <section id="cityAnalysis" hidden>
     <div class="panel analysis-selection">
@@ -78,16 +93,17 @@
       <button id="analysisApply" class="primary">更新分析</button>
     </div>
     <div id="analysisNote" class="notice"></div>
-    <section class="panel"><div class="panel-title"><h2>污染变化与站点对比</h2><span id="seriesSummary"></span></div><div id="pollutionChart" class="chart" aria-label="污染时间序列"></div></section>
+    <nav class="analysis-tabs" aria-label="分析图表"><button type="button" data-analysis-tab="series" class="active">污染趋势</button><button type="button" data-analysis-tab="heatmap">小时热力</button><button type="button" data-analysis-tab="coverage">覆盖与缺测</button><button type="button" data-analysis-tab="weather">气象关联</button><button type="button" data-analysis-tab="bike">自行车时序</button><button type="button" data-analysis-tab="borough">行政区覆盖</button></nav>
+    <section class="panel" data-analysis-section="series"><div class="panel-title"><h2>污染变化与站点对比</h2><span id="seriesSummary"></span></div><div id="pollutionChart" class="chart" aria-label="污染时间序列"></div></section>
     <div class="analysis-grid">
-      <section class="panel"><div class="panel-title"><h2>日期 × 小时污染变化</h2></div><div id="pollutionHeatmap" class="chart" aria-label="污染小时热力图"></div></section>
-      <section class="panel"><div class="panel-title"><h2>有效监测站覆盖</h2></div><div id="coverageChart" class="chart" aria-label="逐小时覆盖率"></div></section>
-      <section class="panel"><div class="panel-title"><h2>缺测时段分布</h2></div><div id="missingHeatmap" class="chart" aria-label="缺测小时热力图"></div></section>
-      <section class="panel"><div class="panel-title"><h2>污染与气象同步变化</h2></div><div id="weatherChart" class="chart" aria-label="污染与气象时序"></div><p id="weatherNote" class="chart-note"></p></section>
-      <section class="panel"><div class="panel-title"><h2>风速与污染的小时配对</h2></div><div id="weatherScatter" class="chart" aria-label="风速污染散点图"></div><p id="correlationNote" class="chart-note"></p></section>
-      <section class="panel"><div class="panel-title"><h2>自行车车辆与空位变化</h2></div><div class="bike-choice"><label>自行车站<select id="bikeStation"></select></label></div><div id="bikeChart" class="chart" aria-label="自行车快照时序"></div><p id="bikeNote" class="chart-note"></p></section>
+      <section class="panel" data-analysis-section="heatmap" hidden><div class="panel-title"><h2>日期 × 小时污染变化</h2></div><div id="pollutionHeatmap" class="chart" aria-label="污染小时热力图"></div></section>
+      <section class="panel" data-analysis-section="coverage" hidden><div class="panel-title"><h2>有效监测站覆盖</h2></div><div id="coverageChart" class="chart" aria-label="逐小时覆盖率"></div></section>
+      <section class="panel" data-analysis-section="coverage" hidden><div class="panel-title"><h2>缺测时段分布</h2></div><div id="missingHeatmap" class="chart" aria-label="缺测小时热力图"></div></section>
+      <section class="panel" data-analysis-section="weather" hidden><div class="panel-title"><h2>污染与气象同步变化</h2></div><div id="weatherChart" class="chart" aria-label="污染与气象时序"></div><p id="weatherNote" class="chart-note"></p></section>
+      <section class="panel" data-analysis-section="weather" hidden><div class="panel-title"><h2>风速与污染的小时配对</h2></div><div id="weatherScatter" class="chart" aria-label="风速污染散点图"></div><p id="correlationNote" class="chart-note"></p></section>
+      <section class="panel" data-analysis-section="bike" hidden><div class="panel-title"><h2>自行车车辆与空位变化</h2></div><div class="bike-choice"><label>自行车站<select id="bikeStation"></select></label></div><div id="bikeChart" class="chart" aria-label="自行车快照时序"></div><p id="bikeNote" class="chart-note"></p></section>
     </div>
-    <section class="panel"><div class="panel-title"><h2>行政区监测覆盖</h2></div><div id="boroughCoverage" class="borough-list"></div></section>
+    <section class="panel" data-analysis-section="borough" hidden><div class="panel-title"><h2>行政区监测覆盖</h2></div><div id="boroughCoverage" class="borough-list"></div></section>
   </section>
   <div id="tablesPage" hidden>
   <nav id="sources" class="sources" aria-label="数据来源">
@@ -106,7 +122,7 @@
       <label id="weatherFilter" hidden>区域<select id="region"><option value="">全部区域</option></select></label>
       <label class="search"><span id="searchLabel">搜索站名或编号</span><input id="search" type="search" placeholder="输入名称或编号" autocomplete="off"></label>
       <label id="showAllFilter" class="check"><input id="showAll" type="checkbox"> <span id="showAllLabel">包括停用站点</span></label>
-      <label>每页<select id="pageSize"><option>25</option><option selected>50</option><option>100</option></select></label>
+      <label>每页<select id="pageSize"><option selected>8</option><option>25</option><option>50</option><option>100</option></select></label>
     </div>
     <div id="tableError" class="notice error" hidden role="alert"></div>
     <div id="dataTable" class="table-wrap" aria-live="polite" aria-busy="true"></div>
@@ -116,6 +132,8 @@
   </div>
   <footer><span>来源 <a href="https://www.londonair.org.uk/" target="_blank" rel="noopener">LAQN</a> · <a href="https://www.breathelondon.org/" target="_blank" rel="noopener">Breathe London</a> · <a href="https://tfl.gov.uk/" target="_blank" rel="noopener">TfL</a> · <a href="https://www.metoffice.gov.uk/" target="_blank" rel="noopener">Met Office</a><br>Contains Breathe London data licensed under the Open Government Licence v3.0.</span><span>时间与质量状态来自各数据源<br>U 未提供审定状态 · P 暂定 · R 已审定</span></footer>
 </main>
+<dialog id="gisTableDialog" class="workspace-dialog"><div class="dialog-header"><h2>图层属性表</h2><button id="closeGisTable" type="button">关闭 ×</button></div></dialog>
+<dialog id="linkageDialog" class="workspace-dialog"><div class="dialog-header"><h2>周边详情</h2><button id="closeLinkage" type="button">关闭 ×</button></div></dialog>
 <dialog id="detail">
   <div class="dialog-header"><div><h2 id="detailTitle">站点详情</h2><p id="detailSubtitle"></p></div><button id="closeDetail" aria-label="关闭详情">关闭 ×</button></div>
   <div id="detailError" class="notice error" hidden role="alert"></div>

@@ -6,7 +6,6 @@ const vm = require("node:vm");
 const root = path.resolve(__dirname, "..");
 const region = JSON.parse(fs.readFileSync(path.join(root, "data/london_region_2025.geojson"), "utf8"));
 const boroughs = JSON.parse(fs.readFileSync(path.join(root, "data/london_boroughs_2025.geojson"), "utf8"));
-const rivers = JSON.parse(fs.readFileSync(path.join(root, "data/london_thames_rivers.geojson"), "utf8"));
 assert.equal(region.type, "FeatureCollection");
 assert.deepEqual(region.features.map(f => f.properties.RGN25CD), ["E12000007"]);
 assert.equal(boroughs.type, "FeatureCollection");
@@ -29,27 +28,6 @@ for (const feature of [...region.features, ...boroughs.features]) {
   }
   checkCoordinates(feature.geometry.coordinates);
 }
-assert.equal(rivers.type, "FeatureCollection");
-assert.equal(rivers.metadata.source, "OS Open Rivers");
-const waterwayNames = new Set(rivers.features.map(f => f.properties.name));
-for (const name of ["River Thames", "River Brent", "River Lea", "River Wandle", "Ravensbourne River"])
-  assert.ok(waterwayNames.has(name), `missing ${name}`);
-const thamesPoints = [];
-for (const feature of rivers.features) {
-  assert.equal(feature.geometry.type, "MultiLineString");
-  assert.ok(["thames", "tributary"].includes(feature.properties.class));
-  assert.doesNotMatch(feature.properties.name, /canal|navigation/i);
-  for (const line of feature.geometry.coordinates) {
-    assert.ok(line.length >= 2);
-    for (const [x, y] of line) {
-      assert.ok(x >= -0.511 && x <= 0.335);
-      assert.ok(y >= 51.286 && y <= 51.692);
-      if (feature.properties.class === "thames") thamesPoints.push([x, y]);
-    }
-  }
-}
-assert.ok(Math.min(...thamesPoints.map(p => p[0])) < -0.4);
-assert.ok(Math.max(...thamesPoints.map(p => p[0])) > 0.2);
 
 const elements = new Map();
 const events = {};
@@ -121,39 +99,24 @@ vm.runInNewContext(fs.readFileSync(path.join(root, "assets/city.js"), "utf8"), c
 events["style.load"]();
 assert.equal(sources.get("london-region").data, "data/london_region_2025.geojson");
 assert.equal(sources.get("london-boroughs").data, "data/london_boroughs_2025.geojson");
-assert.equal(sources.get("london-rivers").data, "data/london_thames_rivers.geojson");
+assert.equal(sources.has("london-rivers"), false);
 assert.equal(layers.get("london-outer-boundary").type, "line");
 assert.equal(layers.get("london-borough-boundaries").type, "line");
-assert.equal(layers.get("london-thames").type, "line");
-assert.equal(layers.get("london-tributaries").type, "line");
-assert.ok(layerOrder.indexOf("london-borough-boundaries") < layerOrder.indexOf("london-tributaries"));
-assert.ok(layerOrder.indexOf("london-tributaries") < layerOrder.indexOf("london-thames"));
-assert.ok(layerOrder.indexOf("london-thames") < layerOrder.indexOf("london-selected-borough"));
-assert.ok(layerOrder.indexOf("london-thames") < layerOrder.indexOf("bike-clusters"));
+assert.equal(layers.has("london-thames"), false);
+assert.ok(layerOrder.indexOf("london-borough-boundaries") < layerOrder.indexOf("bike-clusters"));
 assert.notEqual(layers.get("london-outer-boundary").paint["line-color"], layers.get("london-borough-boundaries").paint["line-color"]);
-assert.match(element("mapLegend").innerHTML, /大伦敦外边界.*行政区边界.*泰晤士河.*伦敦支流/);
+assert.match(element("mapLegend").innerHTML, /大伦敦外边界.*行政区边界/);
 element("layerBoundary").checked = false;
 element("layerBoundary").change();
 assert.equal(visibility.get("london-outer-boundary"), "none");
 assert.equal(visibility.get("london-borough-boundaries"), "none");
-assert.equal(visibility.get("london-thames"), "visible");
-element("layerRiver").checked = false;
-element("layerRiver").change();
-assert.equal(visibility.get("london-thames"), "none");
-assert.equal(visibility.get("london-tributaries"), "none");
 const darkColor = layers.get("london-outer-boundary").paint["line-color"];
-const darkRiverColor = layers.get("london-thames").paint["line-color"];
 element("basemap").value = "positron";
 element("basemap").change();
 events["style.load"]();
 assert.notEqual(layers.get("london-outer-boundary").paint["line-color"], darkColor);
-assert.notEqual(layers.get("london-thames").paint["line-color"], darkRiverColor);
 assert.equal(visibility.get("london-outer-boundary"), "none");
 assert.equal(visibility.get("london-borough-boundaries"), "none");
-assert.equal(visibility.get("london-thames"), "none");
-element("layerRiver").checked = true;
-element("layerRiver").change();
-assert.equal(visibility.get("london-thames"), "visible");
 element("layerBoundary").checked = true;
 element("layerBoundary").change();
 const selectedBounds = [[-0.12, 51.50], [-0.07, 51.53]];
