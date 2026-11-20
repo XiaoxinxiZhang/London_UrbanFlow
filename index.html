@@ -43,7 +43,7 @@
     <div class="city-grid">
       <section class="panel geo-panel">
         <div class="panel-title"><div><h2>伦敦环境与出行分布</h2><p id="mapWindow"></p></div><label>底图<select id="basemap"><option value="dark">深色 · Dark</option><option value="positron">浅色 · Positron</option></select></label></div>
-        <div class="map-toolbar"><label>监测点颜色<select id="mapColor"><option value="concentration">指标数值</option><option value="freshness">数据新鲜度</option></select></label></div>
+        <div class="map-toolbar"><label>监测点颜色<select id="mapColor"><option value="concentration">指标数值</option><option value="freshness">数据新鲜度</option></select></label><label class="check pollution-toggle"><input id="pollutionZones" type="checkbox"> 污染划分</label></div>
         <div class="map-workspace">
           <details class="gis-sidebar"><summary>图层与图例</summary><div class="gis-sidebar-content">
             <details class="gis-layer-group" open><summary><label class="check"><input id="layerBoundary" type="checkbox" checked> 行政区划</label></summary><div class="gis-sublayer"><label class="check"><input id="layerRegion" type="checkbox" checked> 大伦敦 <i class="layer-symbol boundary-symbol"></i></label><button type="button" data-gis-table="region">属性表</button></div><div class="gis-sublayer"><label class="check"><input id="layerBorough" type="checkbox" checked> 33 个行政区 <i class="layer-symbol borough-symbol"></i></label><button type="button" data-gis-table="borough">属性表</button></div></details>
@@ -53,21 +53,25 @@
             <div id="mapLegend" class="map-legend"></div>
           </div></details>
           <div id="cityMap" aria-label="伦敦环境与交通地图"></div>
+          <div id="pollutionZoneLegend" class="pollution-zone-legend" hidden aria-live="polite"></div>
         </div>
         <div id="mapNotice" class="map-notice" role="status">正在加载底图…</div>
          <section class="gis-table-panel" aria-label="地图属性表"><div class="gis-table-head"><div><h3 id="gisTableTitle">LAQN 监测点属性表</h3><span id="gisTableCount"></span></div><label>搜索要素<input id="gisTableSearch" type="search" placeholder="名称、编号或属性"></label></div><div id="gisTable" class="gis-table-scroll"></div><div class="gis-table-foot"><span id="gisTablePage"></span><button id="gisTablePrevious" type="button">上一页</button><button id="gisTableNext" type="button">下一页</button></div></section>
          <div class="map-attribution-text">OpenFreeMap · © OpenMapTiles · © OpenStreetMap contributors · 边界：<a href="https://www.ons.gov.uk/methodology/geography/licences" target="_blank" rel="noopener">ONS / OS Open Government Licence v3.0</a></div>
       </section>
+      <div class="overview-rail">
       <aside class="panel linkage">
+        <div class="advice-heading"><span class="eyebrow">YOUR LOCAL OUTLOOK</span><h2>所选地点 · 健康与出行</h2><label>关注人群<select id="healthGroup"><option value="general">健康人群</option><option value="older">老年人</option><option value="children">儿童与照护者</option><option value="asthma">哮喘人群</option><option value="heartlung">其他心肺疾病人群</option></select></label></div>
         <div class="panel-title"><div><h2 id="linkTitle">周边环境与出行</h2><p id="linkSubtitle">点击地图中的站点或道路事件</p></div></div>
         <div class="link-controls"><label>自行车 / 监测点范围<select id="nearRadius"><option value="500">500 米</option><option value="1000">1 公里</option><option value="2000">2 公里</option></select></label><label>道路事件范围<select id="roadRadius"><option value="500">500 米</option><option value="1000" selected>1 公里</option><option value="2000">2 公里</option></select></label></div>
         <div id="citizenCard" class="citizen-card" role="status" aria-live="polite"></div>
-        <div id="nearbyContent" class="nearby-content"><p class="muted">选择一个监测站，查看污染变化和附近出行资源。</p></div>
+        <details class="nearby-details"><summary>周边资源与观测趋势</summary><div id="nearbyContent" class="nearby-content"><p class="muted">选择一个监测站，查看污染变化和附近出行资源。</p></div>
         <div id="miniTrend" class="chart compact-chart" aria-label="所选站点污染趋势"></div>
-        <div class="link-buttons"><button id="openSelected" disabled>元数据与原始记录</button><button id="analyseSelected" disabled>分析此站</button></div>
+        <div class="link-buttons"><button id="openSelected" disabled>元数据与原始记录</button><button id="analyseSelected" disabled>分析此站</button></div></details>
       </aside>
+    <details class="panel overview-bottom" open><summary>观测覆盖与新鲜度 <span>数据状态 / 快速选站</span></summary><div class="overview-extra"><div id="coverageSummary" class="coverage-summary"></div><div class="quick-sites"><label>快速选择监测站<select id="quickStation"></select></label><button id="chooseQuick">查看周边</button></div></div></details>
+      </div>
     </div>
-    <details class="panel overview-bottom"><summary>观测覆盖与新鲜度 <span>展开详情与快速选站</span></summary><div class="overview-extra"><div id="coverageSummary" class="coverage-summary"></div><div class="quick-sites"><label>快速选择监测站<select id="quickStation"></select></label><button id="chooseQuick">查看周边</button></div></div></details>
   </section>
   <section id="journeyPage" hidden>
     <aside class="panel journey-planner">
@@ -96,7 +100,7 @@
     <nav class="analysis-tabs" aria-label="分析图表"><button type="button" data-analysis-tab="series" class="active">污染趋势</button><button type="button" data-analysis-tab="heatmap">小时热力</button><button type="button" data-analysis-tab="coverage">覆盖与缺测</button><button type="button" data-analysis-tab="weather">气象关联</button><button type="button" data-analysis-tab="bike">自行车时序</button><button type="button" data-analysis-tab="borough">行政区覆盖</button></nav>
     <section class="panel" data-analysis-section="series"><div class="panel-title"><h2>污染变化与站点对比</h2><span id="seriesSummary"></span></div><div id="pollutionChart" class="chart" aria-label="污染时间序列"></div></section>
     <div class="analysis-grid">
-      <section class="panel" data-analysis-section="heatmap" hidden><div class="panel-title"><h2>日期 × 小时污染变化</h2></div><div id="pollutionHeatmap" class="chart" aria-label="污染小时热力图"></div></section>
+      <section class="panel" data-analysis-section="heatmap" hidden><div class="panel-title"><h2>日期 × 小时污染变化</h2></div><p id="heatmapNote" class="chart-note" role="status"></p><div id="pollutionHeatmap" class="chart" aria-label="污染小时热力图"></div></section>
       <section class="panel" data-analysis-section="coverage" hidden><div class="panel-title"><h2>有效监测站覆盖</h2></div><div id="coverageChart" class="chart" aria-label="逐小时覆盖率"></div></section>
       <section class="panel" data-analysis-section="coverage" hidden><div class="panel-title"><h2>缺测时段分布</h2></div><div id="missingHeatmap" class="chart" aria-label="缺测小时热力图"></div></section>
       <section class="panel" data-analysis-section="weather" hidden><div class="panel-title"><h2>污染与气象同步变化</h2></div><div id="weatherChart" class="chart" aria-label="污染与气象时序"></div><p id="weatherNote" class="chart-note"></p></section>

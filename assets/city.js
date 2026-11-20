@@ -257,11 +257,15 @@
     Array.from(document.querySelectorAll("[data-analysis-tab]"))
       .filter(node => node.dataset?.analysisTab)
       .forEach(node => node.classList.toggle("active", node.dataset.analysisTab === section));
-    requestAnimationFrame(() => Object.values(S.charts).forEach(chart => chart.resize()));
+    requestAnimationFrame(() => {
+      Object.values(S.charts).forEach(chart => chart.resize());
+      if (S.series && S.weather) drawAnalysis();
+    });
   }
   function showPage(page) {
     const previousPage = S.page;
     S.page = page;
+    if (S.map?.getLayer?.("pollution-fill")) S.map.setLayoutProperty("pollution-fill", "visibility", page === "overview" && $("pollutionZones")?.checked ? "visible" : "none");
     $("cityOverview").hidden = page !== "overview";
     if ($("journeyPage")) $("journeyPage").hidden = page !== "journey";
     $("cityAnalysis").hidden = page !== "analysis";
@@ -684,7 +688,33 @@
     drawBikes();
     S.map.getSource("city-roads").setData(S.data.roads);
     drawPointClusters();
+    drawPollutionZones();
     visibility();
+  }
+  async function drawPollutionZones() {
+    const enabled = !!$("pollutionZones")?.checked;
+    const box = $("pollutionZoneLegend");
+    if (!box) return;
+    box.hidden = !enabled;
+    if (!enabled) {
+      if (S.map?.getLayer?.("pollution-fill")) S.map.setLayoutProperty("pollution-fill", "visibility", "none");
+      return;
+    }
+    if (!S.ready || !S.data) return;
+    try {
+      const boundary = await loadSpatial("borough");
+      if (!$("pollutionZones").checked || !S.ready) return;
+      const index = $("cityMetric").value.endsWith("_INDEX");
+      const zones = window.AirWatchInsights.pollutionZones(boundary, S.data.air.features, S.data.breaks, index);
+      if (!S.map.getSource("pollution-zones")) S.map.addSource("pollution-zones", {type:"geojson", data:zones});
+      else S.map.getSource("pollution-zones").setData(zones);
+      if (!S.map.getLayer("pollution-fill")) S.map.addLayer({id:"pollution-fill",type:"fill",source:"pollution-zones",paint:{"fill-color":["get","pollution_color"],"fill-opacity":0.58,"fill-outline-color":"#bca99e"}}, S.map.getLayer("road-fill") ? "road-fill" : undefined);
+      S.map.setLayoutProperty("pollution-fill", "visibility", S.page === "overview" ? "visible" : "none");
+      const palette = window.AirWatchInsights.pollutionPalette;
+      const b = S.data.breaks;
+      const labels = index ? ["低 1–3","中 4–6","高 7–9","极高 10"] : b.length ? b.map((v,i)=>(i ? "> "+b[i-1]+"–" : "≤ ")+v).concat("> "+b[b.length-1]) : ["同值 / 单一等级"];
+      box.innerHTML = "<strong>"+esc(metric())+" · 污染划分</strong><div class='zone-scale'>"+labels.map((v,i)=>"<span><i style='background:"+palette[index ? [0,1,3,4][i] : i]+"'></i>"+esc(v)+"</span>").join("")+"<span><i style='background:#657481'></i>无有效观测</span></div><small>"+(index ? "区内来源单项指数最高值" : "区内监测点均值 · µg/m³ · 所选范围分位数分级")+"；颜色越深，数值越高。<br>"+zones.features.filter(f=>f.properties.pollution_count).length+" / "+zones.features.length+" 个区有有效观测；不代表全区实测或官方 DAQI。</small>";
+    } catch(e) { box.textContent="污染划分暂不可用："+e.message; }
   }
   function drawBikes() {
     if (!S.ready || !S.data || !S.map.getSource("city-bikes")) return;
@@ -1114,7 +1144,11 @@
     const nearbyButton = document.createElement("button");
     nearbyButton.textContent = "周边详情";
     nearbyButton.className = "map-popup-button";
-    nearbyButton.addEventListener("click", () => $("linkageDialog")?.showModal?.());
+    nearbyButton.addEventListener("click", () => {
+      const details = document.querySelector(".nearby-details");
+      if (details) details.open = true;
+      document.querySelector(".linkage")?.scrollIntoView?.({block:"nearest", behavior:"smooth"});
+    });
     content.append(nearbyButton);
     const bounds = f.geometry.type === "Point" ? null : geometryBounds(f.geometry);
     S.popup = new maplibregl.Popup({ maxWidth: "310px" })
@@ -1165,11 +1199,15 @@
       $("compareStations").options[0].selected = true;
   }
   function renderCitizen(air, nearby, hourlyPoints = []) {
+    S.citizenContext = {air, nearby, hourlyPoints};
     const cursor = query().cursor;
     const reference = cursor ? Date.parse(cursor) : Date.now();
     const item = window.AirWatchInsights.citizen(air, nearby, hourlyPoints, reference, !!cursor);
     const label = cursor ? "历史回放参考" : "当前出行参考";
-    let html = "<h3>" + label + "</h3>";
+    const health = window.AirWatchInsights.healthAdvice(S.officialDAQI, $("healthGroup")?.value || "general", !!cursor);
+    let html = "<div class='health-band " + health.tone + "'><span>" + esc(health.basis) + "</span><strong>" + esc(health.title) + "</strong></div>" +
+      "<p class='health-action'>" + esc(health.advice) + "</p><p class='health-note'>" + esc(health.note) +
+      (health.tone !== "unknown" ? " 官方发布时间：" + esc(time(S.officialDAQI.observed_at)) + "。" : "") + "</p><h3>" + label + "</h3>";
     if (!item.air || item.air.value === null || item.air.observed_at === null) {
       html += "<p>附近暂无有效空气监测读数，无法判断当前环境。</p>";
     } else {
@@ -1191,6 +1229,7 @@
       : "道路事件快照缺失或超过 15 分钟，" + (cursor ? "该时刻" : "当前") + "事件状态未知。") + "</p>";
     html += "<p class='muted'>" + (cursor ? "以上均为所选时刻的历史快照。" : "以上为站点附近的当前观测参考。") +
       "站点读数不代表整条路线；单项指数不等于完整官方 DAQI。</p>";
+    html += "<p class='health-source'><a href='https://www.gov.uk/government/publications/health-effects-of-air-pollution/health-advice-for-the-daily-air-quality-index-daqi' target='_blank' rel='noopener'>英国 Defra 健康指导 ↗</a> · 2026-04-13 更新</p>";
     $("citizenCard").innerHTML = html;
   }
   async function loadNearby() {
@@ -1276,6 +1315,8 @@
         selected.kind === "air"
           ? p
           : data.nearest_air || data.air.find((a) => a.value !== null);
+      S.officialDAQI = await api("/api/health", {}).catch(() => ({status:"unavailable"}));
+      if (generation !== S.detailGeneration) return;
       renderCitizen(air, data);
       $("nearbyContent").innerHTML = html;
       if (air) {
@@ -1455,6 +1496,8 @@
           axisLabel: { color: "#94a8ba", fontSize: 13 },
         },
         visualMap: {
+          dimension: 2,
+          seriesIndex: 1,
           min: missing ? 0 : Math.min(...values, 0),
           max: missing ? 1 : Math.max(...values, 1),
           calculable: false,
@@ -1465,13 +1508,14 @@
           inRange: {
             color: missing
               ? ["#3da58f", "#8c5563"]
-              : ["#163e45", "#63c0a5", "#e9ca6b", "#e27e6a"],
+              : ["#fee5d9", "#fcae91", "#fb6a4a", "#de2d26", "#99000d"],
           },
         },
         series: [
+          {type:"heatmap", silent:true, data:cells.map(p=>[hours.indexOf(label(p.time)),days.indexOf(calendarDate(new Date(p.time),zone())),0]), itemStyle:{color:"#253848",borderColor:"#182837",borderWidth:1}},
           {
             type: "heatmap",
-            data,
+            data: data.filter(p => p[2] !== null),
             itemStyle: { borderColor: "#182837", borderWidth: 1 },
           },
         ],
@@ -1544,8 +1588,9 @@
       });
     heatmap(
       "pollutionHeatmap",
-      cells.filter((p) => p.value !== null),
+      cells,
     );
+    if ($("heatmapNote")) $("heatmapNote").textContent = (first ? first.name + " · " + first.id : "尚未选择站点") + " · " + metric() + " · 有值 " + cells.filter(p=>p.value!==null).length + " / " + cells.length + " 个小时。" + (cells.some(p=>p.value!==null) ? "颜色越深表示数值越高；灰色格为缺测。" : "所选站点、指标和时间范围内没有有效小时数据，请调整筛选。") + " 时区：" + zone();
     heatmap(
       "missingHeatmap",
       cells.map((p) => ({ ...p, value: p.value === null ? 1 : 0 })),
@@ -1741,7 +1786,10 @@
   }
   S.overviewMapHost = $("cityMap")?.parentElement;
   if ($("gisTableDialog")?.append) $("gisTableDialog").append(document.querySelector(".gis-table-panel"));
-  if ($("linkageDialog")?.append) $("linkageDialog").append(document.querySelector(".linkage"));
+  $("healthGroup")?.addEventListener?.("change", () => {
+    const context = S.citizenContext;
+    if (context) renderCitizen(context.air, context.nearby, context.hourlyPoints);
+  });
   $("closeGisTable")?.addEventListener?.("click", () => $("gisTableDialog").close());
   $("closeLinkage")?.addEventListener?.("click", () => $("linkageDialog").close());
   document
@@ -1794,6 +1842,7 @@
     drawLayers();
     if (S.data) legend();
   });
+  $("pollutionZones")?.addEventListener?.("change", drawPollutionZones);
   $("basemap").addEventListener("change", () => {
     if (!S.map) return;
     S.ready = false;

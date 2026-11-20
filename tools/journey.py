@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
 from city_analysis import distance, dt, geometry_distance, valid_coordinate
+from secure_curl import open_https, curl_https
 
 UTC = timezone.utc
 ORS_BASE = "https://api.heigit.org/openrouteservice/v2"
@@ -24,7 +25,7 @@ class RoutingUnavailable(Exception):
 
 
 class OpenRouteService:
-    def __init__(self, key=None, opener=urlopen):
+    def __init__(self, key=None, opener=None):
         self.key = key if key is not None else os.environ.get("ORS_API_KEY", "")
         self.opener = opener
 
@@ -32,15 +33,28 @@ class OpenRouteService:
         if not self.key:
             raise RoutingUnavailable("尚未配置 ORS_API_KEY，无法生成道路导航")
         request = Request(ORS_BASE + endpoint, data=json.dumps(body).encode("utf-8"),
-                          headers={"Authorization": self.key, "Content-Type": "application/json"},
+                          headers={"Authorization": self.key, "Content-Type": "application/json",
+                                   "Accept": "application/geo+json, application/json"},
                           method="POST")
         try:
-            with self.opener(request, timeout=12) as response:
-                return json.load(response)
+            if self.opener is not None:
+                with self.opener(request, timeout=25) as response:
+                    return json.load(response)
+            status, raw = curl_https(ORS_BASE + endpoint,
+                {"Authorization": self.key, "Content-Type": "application/json",
+                 "Accept": "application/geo+json, application/json"},
+                timeout=25, data=request.data)
+            if status != 200:
+                raise HTTPError(ORS_BASE + endpoint, status, "routing upstream error", {}, None)
+            return json.loads(raw)
         except HTTPError as exc:
             if exc.code == 429:
                 raise RoutingUnavailable("路线服务请求频率已达上限，请稍后重试") from exc
-            raise RoutingUnavailable("路线服务暂不可用，请稍后重试") from exc
+            if exc.code in (401, 403):
+                raise RoutingUnavailable("路线服务认证失败（HTTP " + str(exc.code) + "），请检查本机 ORS 密钥及服务权限") from exc
+            if exc.code in (400, 404, 406, 413):
+                raise RoutingUnavailable("路线服务无法处理该路线请求（HTTP " + str(exc.code) + "），请调整起终点后重试") from exc
+            raise RoutingUnavailable("路线服务暂不可用（HTTP " + str(exc.code) + "），请稍后重试") from exc
         except (URLError, TimeoutError, OSError, ValueError) as exc:
             raise RoutingUnavailable("路线服务连接失败，请稍后重试") from exc
 
@@ -70,7 +84,7 @@ class OpenRouteService:
 
 
 class DAQI:
-    def __init__(self, opener=urlopen):
+    def __init__(self, opener=None):
         self.opener = opener
         self.lock = threading.Lock()
         self.cached = None
@@ -82,8 +96,14 @@ class DAQI:
             if self.checked_at is None or now-self.checked_at > timedelta(minutes=10):
                 self.checked_at = now
                 try:
-                    with self.opener(DAQI_FEED, timeout=6) as response:
-                        root = ET.fromstring(response.read())
+                    if self.opener is not None:
+                        with self.opener(DAQI_FEED, timeout=6) as response:
+                            raw = response.read()
+                    else:
+                        status, raw = open_https(DAQI_FEED, {"Accept": "application/xml"}, timeout=6)
+                        if status != 200:
+                            raise ValueError("DAQI feed unavailable")
+                    root = ET.fromstring(raw)
                     item = next(row for row in root.findall("./channel/item")
                                 if row.findtext("title") == "Greater London")
                     match = re.search(r"index\s+(\d+)", item.findtext("description", ""), re.I)

@@ -28,7 +28,49 @@
       roadCount: roadFresh ? nearby.roads.length : null,
     };
   }
-  const exposed = {citizen};
+  function healthAdvice(daqi, group = "general", replay = false) {
+    const names = {general:"健康人群", older:"老年人", children:"儿童与照护者", asthma:"哮喘人群", heartlung:"心肺疾病人群"};
+    const index = daqi?.index;
+    const fresh = !replay && daqi?.status === "fresh" && Number.isInteger(index) && index >= 1 && index <= 10 &&
+      Number.isFinite(Date.parse(daqi.observed_at)) && Date.now() - Date.parse(daqi.observed_at) <= 3 * HOUR && Date.parse(daqi.observed_at) <= Date.now();
+    const condition = group === "asthma" || group === "heartlung";
+    const note = group === "asthma" ? "遵循个人哮喘行动计划；也留意花粉等诱因，不自行调整药量。" :
+      condition ? "按医生或护士提供的疾病管理计划安排活动。" :
+      group === "children" ? "由照护者关注咳嗽、喘息等症状；有心肺疾病的儿童请同时参考对应人群建议。" :
+      "出现新症状、症状加重或一周未改善，请联系医生或护士。";
+    if (!fresh) return {tone:"unknown", basis:replay ? "历史回放 · 健康参考" : "大伦敦官方 DAQI · 暂不可用", title:names[group] || names.general,
+      advice:replay ? "当前官方等级不适用于历史时刻。请结合当时的官方预报与个人健康计划查看历史观测。" : "官方等级缺失或过期，暂不生成按等级的活动判断。可查看下方地点读数，并在出行前核对官方预报。", note};
+    const band = index <= 3 ? "低" : index <= 6 ? "中" : index <= 9 ? "高" : "极高";
+    let advice;
+    if (index <= 3) advice = "可继续通常的户外活动；敏感者即使在低污染时也可能有症状。";
+    else if (index <= 6) advice = condition ? "适当调整户外高强度活动，尤其在症状加重时；遵循个人健康管理计划。" : "多数人可继续通常的户外活动；如出现症状，应减少污染暴露。";
+    else advice = condition || group === "older" ? "减少污染暴露，并调整户外高强度活动，尤其在出现或加重症状时。" : "尽量减少污染暴露，尤其在出现症状时；调整户外活动安排。";
+    return {tone:index <= 3 ? "low" : index <= 6 ? "moderate" : "high", basis:"大伦敦官方 DAQI · " + index + "/10 · " + band,
+      title:names[group] || names.general, advice, note:note + " 地区等级提供健康背景，所选点读数用于了解附近污染状况。"};
+  }
+  const pollutionPalette = ["#fee5d9", "#fcae91", "#fb6a4a", "#de2d26", "#99000d"];
+  function pollutionZones(boundaries, stations, breaks, index = false) {
+    function ringContains(point, ring) {
+      let inside = false;
+      for (let i=0, j=ring.length-1; i<ring.length; j=i++) {
+        const a=ring[i], b=ring[j];
+        if ((a[1]>point[1]) !== (b[1]>point[1]) && point[0] < (b[0]-a[0])*(point[1]-a[1])/(b[1]-a[1])+a[0]) inside=!inside;
+      }
+      return inside;
+    }
+    function contains(point, geometry) {
+      const polygons = geometry.type === "MultiPolygon" ? geometry.coordinates : geometry.type === "Polygon" ? [geometry.coordinates] : [];
+      return polygons.some(rings => rings.length && ringContains(point,rings[0]) && !rings.slice(1).some(ring => ringContains(point,ring)));
+    }
+    const validStations = stations.filter(f => typeof f.properties.value === "number" && Number.isFinite(f.properties.value) && !f.properties.stale);
+    return {type:"FeatureCollection", features:boundaries.features.map(f => {
+      const points=validStations.filter(s => contains(s.geometry.coordinates,f.geometry));
+      const value=points.length ? index ? Math.max(...points.map(s=>s.properties.value)) : points.reduce((n,s)=>n+s.properties.value,0)/points.length : null;
+      const grade=value===null ? -1 : index ? value<=3 ? 0 : value<=6 ? 1 : value<=9 ? 3 : 4 : breaks.filter(b=>value>b).length;
+      return {...f, properties:{...f.properties, pollution_value:value, pollution_count:points.length, pollution_color:grade<0 ? "#657481" : pollutionPalette[Math.min(4,grade)]}};
+    })};
+  }
+  const exposed = {citizen, healthAdvice, pollutionZones, pollutionPalette};
   if (typeof module !== "undefined") module.exports = exposed;
   if (typeof window !== "undefined") window.AirWatchInsights = exposed;
 })();

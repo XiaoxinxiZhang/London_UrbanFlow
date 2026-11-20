@@ -50,7 +50,7 @@ for (const failure of ["missing-library", "webgl-failure", "network-error"]) {
     requestAnimationFrame: handler => handler(),
     console, Date, Intl, Map, Set, Promise,
   };
-  const instrumented = source.replace(/\}\)\(\);\s*$/, "window.bikeTest = {S, drawBikes, renderCitizen};})();");
+  const instrumented = source.replace(/\}\)\(\);\s*$/, "window.bikeTest = {S, drawBikes, renderCitizen, heatmap};})();");
   vm.runInNewContext(instrumented, context);
   if (failure === "network-error") events.error();
   assert.match(element("mapNotice").textContent, /未加载|无法初始化|暂不可用/);
@@ -60,7 +60,15 @@ for (const failure of ["missing-library", "webgl-failure", "network-error"]) {
   if (failure === "missing-library") {
     // Exercise the production drawing path against real clustering, including
     // refreshes, an empty replay frame, a recreated basemap source and fallback.
-    const {S, drawBikes, renderCitizen} = context.window.bikeTest;
+    const {S, drawBikes, renderCitizen, heatmap} = context.window.bikeTest;
+    let heatmapOption;
+    S.charts.regressionHeatmap = {setOption(option){heatmapOption=option;}};
+    heatmap("regressionHeatmap", [{time:"2026-11-18T01:00:00Z",value:12},{time:"2026-11-18T02:00:00Z",value:null}]);
+    assert.equal(heatmapOption.visualMap.dimension,2);
+    assert.equal(heatmapOption.visualMap.seriesIndex,1);
+    assert.equal(heatmapOption.series[0].data.length,2);
+    assert.equal(heatmapOption.series[1].data.length,1);
+    assert.equal(heatmapOption.series[1].data[0][2],12);
     context.window.Supercluster = require("../assets/vendor/supercluster-8.0.1.min.js");
     const bike = (id, lon, bikes) => ({type:"Feature", geometry:{type:"Point", coordinates:[lon,51.5]}, properties:{id,bikes}});
     const points = [bike("a",-.1,0), bike("b",-.1001,7), bike("c",-.4,2)];

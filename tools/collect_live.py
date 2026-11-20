@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import live_sources as parsers
+from secure_curl import open_https
 import live_store as store
 import traffic_history
 from collector_lock import CollectorLock
@@ -113,9 +114,9 @@ class Fetcher:
                 if self.transport:
                     status,raw=self.transport(url,headers)
                 else:
-                    req=urllib.request.Request(url,headers=headers)
-                    with urllib.request.urlopen(req,timeout=10 if job=="breathe_web_reconcile" else 25) as response:
-                        status,raw=response.status,response.read()
+                    status,raw=open_https(url,headers,
+                        timeout=10 if job=="breathe_web_reconcile" else 25,
+                        prefer_curl=source=="tfl")
                 self.last_request=time.monotonic()
                 if status!=200:
                     raise urllib.error.HTTPError(url,status,"upstream error",{},None)
