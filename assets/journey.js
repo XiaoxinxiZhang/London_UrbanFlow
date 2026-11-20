@@ -3,7 +3,7 @@
   const $ = id => document.getElementById(id);
   const city = window.AirWatchCity;
   if (!city || !$('journeyPage')) return;
-  const state = {start:null, end:null, picking:null, result:null, generation:0};
+  const state = {start:null, end:null, picking:null, result:null, request:null};
   const labels = {walk_to_bike:"① 步行取车", cycle:"② 骑行至还车站",
     walk_to_destination:"③ 步行到终点", walk:"步行", personal_bike:"个人自行车骑行"};
   const esc = value => String(value ?? "—").replace(/[&<>"']/g, c =>
@@ -11,6 +11,9 @@
   const km = meters => meters >= 1000 ? (meters/1000).toFixed(2) + " 公里" : Math.round(meters) + " 米";
   const minutes = seconds => Math.max(1, Math.round(seconds/60)) + " 分钟";
   const time = value => window.AirWatchData?.time?.(value) || value || "—";
+  function updatePlanButton() {
+    $("planJourney").disabled = !!state.request || !state.start || !state.end;
+  }
   function setLabels() {
     $("journeyPage").dataset.picking = state.picking || "";
     $("startLabel").textContent = state.start ? state.start.map(v => v.toFixed(5)).join(", ") : "尚未选择";
@@ -20,13 +23,21 @@
     $("pickStart").classList.toggle("active", state.picking === "start");
     $("pickEnd").classList.toggle("active", state.picking === "end");
     $("maxWalkLabel").hidden = $("journeyMode").value !== "shared_bike";
-    $("planJourney").disabled = !state.start || !state.end;
+    updatePlanButton();
     draw();
+  }
+  function resetPlan() {
+    state.request?.abort();
+    state.request = null;
+    state.result = null;
+    const message = state.start && state.end ? "出行设置已更新，请重新规划路线。" : "在地图上依次选择起点和终点。";
+    $("journeyResult").innerHTML = `<p class="muted">${message}</p>`;
+    setLabels();
   }
   function blank() { return {type:"FeatureCollection",features:[]}; }
   function ensureLayers() {
     const map = city.getMap();
-    if (!map || !map.isStyleLoaded?.()) return false;
+    if (!map || (!map.getLayer("journey-point-label") && !map.isStyleLoaded?.())) return false;
     if (!map.getSource("journey-legs")) map.addSource("journey-legs", {type:"geojson",data:blank()});
     if (!map.getSource("journey-points")) map.addSource("journey-points", {type:"geojson",data:blank()});
     if (!map.getLayer("journey-leg-line")) map.addLayer({id:"journey-leg-line",type:"line",source:"journey-legs",
@@ -110,28 +121,34 @@
     }
   }
   async function plan(pair) {
-    if (!state.start || !state.end) return;
-    const generation = ++state.generation;
-    $("planJourney").disabled = true;
+    if (!state.start || !state.end || state.request) return;
+    const request = new AbortController();
+    state.request = request;
+    state.result = null;
+    updatePlanButton();
+    draw();
     $("journeyResult").textContent = "正在检查站点并计算道路路线…";
     try {
       const payload = {start:state.start,end:state.end,mode:$("journeyMode").value,
         max_walk_m:Number($("maxWalk").value)};
       if (pair) { payload.pickup_id = pair[0]; payload.dropoff_id = pair[1]; }
       const response = await fetch("/api/journeys/plan", {method:"POST",cache:"no-store",
-        headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+        headers:{"Content-Type":"application/json"},body:JSON.stringify(payload),signal:request.signal});
       const data = await response.json();
+      if (state.request !== request) return;
       if (!response.ok) throw new Error(data.error || "规划失败");
-      if (generation !== state.generation) return;
       state.result = data;
       render();
     } catch (error) {
-      if (generation !== state.generation) return;
+      if (state.request !== request) return;
       state.result = null;
       draw();
       $("journeyResult").textContent = error.message;
     } finally {
-      if (generation === state.generation) $("planJourney").disabled = false;
+      if (state.request === request) {
+        state.request = null;
+        updatePlanButton();
+      }
     }
   }
   function bindMap() {
@@ -143,18 +160,22 @@
       if ($("journeyPage").hidden || !state.picking) return;
       state[state.picking] = [event.lngLat.lng,event.lngLat.lat];
       state.picking = null;
-      state.result = null;
-      $("journeyResult").innerHTML = "<p class='muted'>选点已更新，请规划路线。</p>";
-      setLabels();
+      resetPlan();
     });
     draw();
   }
   $("pickStart").addEventListener("click", () => {state.picking="start";city.showPage("journey");setLabels();bindMap();});
   $("pickEnd").addEventListener("click", () => {state.picking="end";city.showPage("journey");setLabels();bindMap();});
-  $("swapJourney").addEventListener("click", () => { [state.start,state.end]=[state.end,state.start];state.result=null;setLabels(); });
-  $("clearJourney").addEventListener("click", () => {state.start=state.end=state.result=state.picking=null;$("journeyResult").innerHTML="<p class='muted'>在地图上依次选择起点和终点。</p>";setLabels();});
-  $("journeyMode").addEventListener("change", () => {state.result=null;setLabels();});
-  $("maxWalk").addEventListener("change", () => {state.result=null;draw();});
+  $("swapJourney").addEventListener("click", () => {
+    [state.start, state.end] = [state.end, state.start];
+    resetPlan();
+  });
+  $("clearJourney").addEventListener("click", () => {
+    state.start = state.end = state.picking = null;
+    resetPlan();
+  });
+  $("journeyMode").addEventListener("change", resetPlan);
+  $("maxWalk").addEventListener("change", resetPlan);
   $("planJourney").addEventListener("click", () => plan());
   $("journeyResult").addEventListener("click", event => {
     const button = event.target.closest("[data-pickup]");

@@ -1,6 +1,9 @@
 # Runtime observations and local collector state
 /data/live/
 
+# Local rollback archives
+/backups/
+
 # 2025 observation data and legacy assets
 /data.js
 /data/hourly_v2.csv

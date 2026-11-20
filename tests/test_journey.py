@@ -6,6 +6,7 @@ import sqlite3
 import sys
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from city_analysis import distance
@@ -68,6 +69,19 @@ class FixedDAQI:
 
 
 class JourneyTests(unittest.TestCase):
+    def test_real_transport_uses_verified_curl_post_and_geojson_accept(self):
+        payload = {"features": [{"geometry": {"type": "LineString", "coordinates": [START, END]},
+                   "properties": {"summary": {"distance": 3000, "duration": 2000}}}]}
+        with patch("journey.curl_https", return_value=(200, json.dumps(payload).encode())) as transport:
+            result = OpenRouteService(key="test-only-key").directions("foot-walking", START, END)
+            self.assertEqual(result["distance_m"], 3000)
+            args, kwargs = transport.call_args
+            self.assertIn("application/geo+json", args[1]["Accept"])
+            self.assertEqual(json.loads(kwargs["data"])["coordinates"], [START, END])
+        with patch("journey.curl_https", return_value=(403, b"{}")):
+            with self.assertRaisesRegex(RoutingUnavailable, "认证失败"):
+                OpenRouteService(key="test-only-key").directions("foot-walking", START, END)
+
     def setUp(self):
         self.bikes = [dock("pickup", [-.149, 51.510], 4, 0),
                       dock("dropoff", [-.111, 51.510], 0, 6),

@@ -79,6 +79,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def api_get(self, path):
         params = {key: values[-1] for key, values in parse_qs(urlsplit(self.path).query).items()}
         routes = {"/api/status": lambda: self.server.api.status(),
+                  "/api/health": lambda: self.server.journeys.daqi.current(),
                   "/api/locations": lambda: self.server.api.locations(params),
                   "/api/measurements": lambda: self.server.api.measurements(params),
                   "/api/road-events": lambda: self.server.api.roads(params),
