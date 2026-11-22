@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>london UrbanFlow · 城市数据</title>
+<title>London UrbanFlow · 城市数据</title>
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="assets/live.css">
 <link rel="stylesheet" href="assets/vendor/maplibre-gl-5.6.2.css">
@@ -19,13 +19,23 @@
 <body>
 <noscript><p class="notice">请启用 JavaScript 以查询数据库。</p></noscript>
 <header>
-  <div class="brand"><div class="brandmark" aria-hidden="true">⌁</div><div><span class="wordmark">london <b>UrbanFlow</b></span><h1>伦敦环境与出行观测平台</h1></div></div>
-  <div class="updates"><button id="updateButton" class="primary">更新数据</button><label>自动更新 <select id="autoInterval"><option value="0">关闭</option><option value="1">每 1 分钟</option><option value="5" selected>每 5 分钟</option><option value="15">每 15 分钟</option></select></label></div>
+  <div class="brand"><div class="brandmark" aria-hidden="true">⌁</div><div><span class="wordmark">London <b>UrbanFlow</b></span><h1>伦敦环境与出行观测平台</h1></div></div>
+  <div class="updates">
+    <details class="update-progress" id="updateProgress" hidden>
+      <summary><span id="updateStatus" role="status"></span></summary>
+      <div class="update-progress-panel" role="region" tabindex="0" aria-label="本轮更新明细">
+        <p id="updateMessage" hidden></p>
+        <ul id="updateJobs" hidden></ul>
+        <p id="updateFinished" hidden></p>
+      </div>
+    </details>
+    <button id="updateButton" class="primary">更新数据</button>
+    <label>自动更新 <select id="autoInterval"><option value="0">关闭</option><option value="1">每 1 分钟</option><option value="5" selected>每 5 分钟</option><option value="15">每 15 分钟</option></select></label>
+  </div>
 </header>
 <main>
   <div class="context"><span>伦敦多源观测</span><label>显示时区 <select id="timezone"><option value="Europe/London">伦敦 · GMT / BST</option><option value="UTC">UTC</option><option value="Asia/Shanghai">北京 · UTC+8</option></select></label><span id="readTime"></span></div>
   <div id="startupError" class="notice error" hidden role="alert"></div>
-  <div id="updateProgress" class="notice" hidden role="status" aria-live="polite"></div>
   <nav class="page-tabs" aria-label="页面"><button data-page="overview" class="active" aria-current="page">城市总览</button><button data-page="journey">智慧出行</button><button data-page="analysis">环境与交通分析</button><button data-page="tables">数据中心</button></nav>
   <div id="cityControls" class="panel city-controls">
     <label>污染指标<select id="cityMetric"><option value="PM25">PM₂.₅</option><option value="NO2">NO₂</option><option value="PM10">PM₁₀</option><option value="O3">O₃</option><option value="PM25_INDEX">PM₂.₅ 空气质量指数</option><option value="NO2_INDEX">NO₂ 空气质量指数</option></select></label>

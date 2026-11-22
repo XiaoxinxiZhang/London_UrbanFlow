@@ -123,6 +123,24 @@ class ParserTests(unittest.TestCase):
 
 
 class StoreTests(unittest.TestCase):
+    def test_due_bikes_refresh_before_slow_collection_jobs(self):
+        now = datetime.now(timezone.utc)
+        fetcher = collector.Fetcher(self.db, raw_root=Path(self.temp.name))
+        jobs = {name: lambda db, fetcher, now: (0, None) for name, _, _ in collector.SCHEDULE}
+        progress = []
+
+        def track(job, outcome):
+            if outcome == "running":
+                progress.append(job)
+
+        with patch.dict(collector.JOBS, jobs), patch.object(collector, "credential", return_value="test-key"):
+            collector.run_once(self.db, fetcher, now, on_progress=track)
+            self.assertEqual(progress[0], "tfl_bikes")
+            self.assertIn("met_hourly", progress)
+            progress.clear()
+            collector.run_once(self.db, fetcher, now + timedelta(minutes=1), on_progress=track)
+            self.assertNotIn("tfl_bikes", progress)
+
     def test_breathe_chart_precedence_and_resume_after_reopening_database(self):
         now = datetime(2026,11,17,15,tzinfo=timezone.utc)
         site_ids = ["BL0027","BL0086","BL0180","BL0183","BL0188"]

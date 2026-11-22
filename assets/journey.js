@@ -96,7 +96,10 @@
     if (!result) return;
     let html = "";
     if (result.routing_error) html += `<p class="journey-warning">${esc(result.routing_error)}</p>`;
-    if (result.message) html += `<p class="journey-warning">${esc(result.message)}</p>`;
+    if (result.message) {
+      const fallback = result.mode === "shared_bike" && result.legs?.[0]?.kind === "walk";
+      html += `<p class="journey-warning">${fallback ? "当前显示步行备选路线。" : ""}${esc(result.message)}</p>`;
+    }
     if (result.legs?.length) {
       const totalDistance = result.legs.reduce((sum,leg) => sum+leg.distance_m,0);
       const totalTime = result.legs.reduce((sum,leg) => sum+leg.duration_s,0);

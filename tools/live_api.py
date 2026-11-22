@@ -1,5 +1,7 @@
 """Queries and background collection for the local data browser."""
+from collections import deque
 from contextlib import closing
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
@@ -235,24 +237,27 @@ class UpdateManager:
         self.database = Path(database).resolve()
         self.lock = threading.Lock()
         self.current = None
+        self.recent = deque(maxlen=5)
 
     def start(self):
         with self.lock:
             if self.current and self.current["state"] in ("running","waiting"):
-                return self.snapshot_unlocked()
+                return deepcopy(self.current)
+            if self.current:
+                self.recent.append(self.current)
             self.current = dict(id=uuid.uuid4().hex,state="running",started_at=store.utcnow(),
                                 jobs={},finished_at=None,error=None)
             threading.Thread(target=self.run,daemon=True).start()
-            return self.snapshot_unlocked()
-
-    def snapshot_unlocked(self):
-        return json.loads(json.dumps(self.current))
+            return deepcopy(self.current)
 
     def get(self, identifier):
         with self.lock:
-            if not self.current or self.current["id"] != identifier:
-                raise LookupError("本次更新记录已失效，请重新检查更新")
-            return self.snapshot_unlocked()
+            if self.current and self.current["id"] == identifier:
+                return deepcopy(self.current)
+            for run in reversed(self.recent):
+                if run["id"] == identifier:
+                    return deepcopy(run)
+            raise LookupError("本次更新记录已失效，请重新检查更新")
 
     def run(self):
         try:

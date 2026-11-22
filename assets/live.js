@@ -329,29 +329,51 @@
       if (generation === state.detailGeneration) $("historyTable").style.opacity = "";
     }
   }
+  const updateLabels = {
+    checking: "检查中…", running: "更新中…", waiting: "等待更新…",
+    completed: "更新完成", completed_external: "已有任务完成", partial: "部分失败", error: "更新失败"
+  };
+  function renderUpdate(updateState, jobs = {}, message = "", finishedAt = null) {
+    $("updateProgress").hidden = false;
+    const summary = updateLabels[updateState] || updateState;
+    if ($("updateStatus").textContent !== summary) $("updateStatus").textContent = summary;
+
+    const rows = Object.entries(jobs).map(([name, result]) => {
+      const row = document.createElement("li");
+      row.textContent = (jobNames[name] || name) + " · " + (result === "running" ? "采集中" : result);
+      return row;
+    });
+    $("updateJobs").replaceChildren(...rows);
+    $("updateJobs").hidden = rows.length === 0;
+    const emptyMessages = {
+      checking: "正在检查到期任务…", running: "等待首个任务报告进度…",
+      waiting: "已有采集任务运行，正在等待完成。", completed: "本轮没有到期任务。",
+      completed_external: "已有采集任务已完成。"
+    };
+    errorAt("updateMessage", message || (rows.length === 0 ? emptyMessages[updateState] : ""));
+    errorAt("updateFinished", finishedAt ? "完成时间 " + time(finishedAt) : "");
+  }
   async function update() {
     if (state.updating) return;
     state.updating = true;
     state.lastUpdate = Date.now();
     $("updateButton").disabled = true;
     $("updateButton").textContent = "更新中…";
-    $("updateProgress").hidden = false;
-    $("updateProgress").textContent = "正在检查到期任务…";
+    renderUpdate("checking");
+    let run;
     try {
-      let run = await api("/api/update", {}, { method: "POST" });
+      run = await api("/api/update", {}, { method: "POST" });
       while (run.state === "running" || run.state === "waiting") {
-        const progress = Object.entries(run.jobs).map(([name, result]) => (jobNames[name] || name) + " · " + (result === "running" ? "采集中" : result)).join("\n");
-        $("updateProgress").textContent = (run.state === "waiting" ? "已有采集任务运行，等待完成…" : "正在更新到期数据…") + (progress ? "\n" + progress : "");
+        renderUpdate(run.state, run.jobs);
         await refresh(false);
         await wait(2500);
         run = await api("/api/update/" + run.id);
       }
       await refresh();
       if ($("detail").open && !state.detail.isRoad && !state.detail.isBoundary) await loadHistory();
-      const messages = { completed: "更新检查完成", completed_external: "已有采集任务已完成", partial: "更新完成，部分任务失败", error: "更新失败" };
-      $("updateProgress").textContent = (messages[run.state] || run.state) + (run.error ? " · " + run.error : "") + " · " + time(run.finished_at);
+      renderUpdate(run.state, run.jobs, run.error, run.finished_at);
     } catch (error) {
-      $("updateProgress").textContent = "更新未完成 · " + error.message + "。可重新点击检查更新。";
+      renderUpdate("error", run?.jobs, error.message + "。可重新点击检查更新。", run?.finished_at);
     } finally {
       state.updating = false;
       $("updateButton").disabled = false;

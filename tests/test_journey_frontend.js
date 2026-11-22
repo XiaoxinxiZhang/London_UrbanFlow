@@ -88,6 +88,18 @@ async function testJourney() {
   assert.equal(element("startLabel").innerHTML, "-0.12000, 51.50000");
   assert.match(result.innerHTML, /请重新规划路线/);
   assert.equal(lines(), 0);
+
+  element("journeyMode").value = "shared_bike";
+  element("journeyMode").change();
+  const sharedPlan = plan.click();
+  const {payload, resolve} = requests[3];
+  resolve({ok: true, json: async () => ({
+    mode: "shared_bike", message: "自行车快照缺失或超过 15 分钟", alternatives: [], alerts: [],
+    legs: [{kind: "walk", distance_m: 850, duration_s: 600,
+      geometry: {type: "LineString", coordinates: [payload.start, payload.end]}}]
+  })});
+  await sharedPlan;
+  assert.match(result.innerHTML, /当前显示步行备选路线。自行车快照缺失/);
 }
 
 testJourney().then(() => console.log("PASS journey cancels outdated results, preserves current requests and clears the map"))

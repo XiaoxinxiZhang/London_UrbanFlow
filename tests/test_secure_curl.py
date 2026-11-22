@@ -22,12 +22,35 @@ class SystemProxyTests(unittest.TestCase):
         self.assertIsNone(secure_curl._system_proxy_for("https://api.tfl.gov.uk/BikePoint"))
 
     @mock.patch.object(secure_curl, "curl_https", return_value=(200, b"[]"))
-    @mock.patch.object(secure_curl.urllib.request, "urlopen")
-    def test_prefer_curl_skips_urllib(self, urlopen, curl):
+    @mock.patch.object(secure_curl, "urllib_https")
+    def test_prefer_curl_skips_urllib(self, python_https, curl):
         result = secure_curl.open_https("https://api.tfl.gov.uk/BikePoint", {}, prefer_curl=True)
         self.assertEqual(result, (200, b"[]"))
-        urlopen.assert_not_called()
+        python_https.assert_not_called()
         curl.assert_called_once()
+
+    @mock.patch.object(secure_curl, "curl_https", side_effect=TimeoutError)
+    @mock.patch.object(secure_curl, "urllib_https", return_value=(200, b"[]"))
+    def test_prefer_curl_falls_back_to_python_on_transport_failure(self, python_https, curl):
+        url = "https://api.tfl.gov.uk/BikePoint"
+        self.assertEqual(secure_curl.open_https(url, {}, prefer_curl=True), (200, b"[]"))
+        curl.assert_called_once_with(url, {}, timeout=25)
+        python_https.assert_called_once_with(url, {}, timeout=8)
+
+    @mock.patch.object(secure_curl.urllib.request, "build_opener")
+    def test_python_https_keeps_credentials_on_original_host(self, build_opener):
+        response = build_opener.return_value.open.return_value.__enter__.return_value
+        response.status = 200
+        response.read.return_value = b"{}"
+        url = "https://api.heigit.org/openrouteservice/v2/directions/foot-walking/geojson"
+        result = secure_curl.urllib_https(url, {"Authorization": "test-only-key"}, data=b"{}")
+        self.assertEqual(result, (200, b"{}"))
+        request = build_opener.return_value.open.call_args.args[0]
+        self.assertEqual(request.full_url, url)
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.get_header("Authorization"), "test-only-key")
+        redirect_handler = build_opener.call_args.args[0]
+        self.assertIsNone(redirect_handler.redirect_request(request, None, 302, "Found", {}, "https://example.com"))
 
 
 if __name__ == "__main__":

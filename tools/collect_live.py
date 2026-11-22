@@ -29,10 +29,11 @@ BREATHE = "https://www.breathelondon.org"
 TFL = "https://api.tfl.gov.uk"
 MET = "https://data.hub.api.metoffice.gov.uk/observation-land/1"
 ANCHORS = ((51.51,-0.13),(51.60,-0.35),(51.60,0.05),(51.40,-0.35),(51.40,0.05))
-SCHEDULE = (("laqn_sites","laqn",86400),("breathe_web_hourly","breathe",3600),
+# Refresh short-lived docking availability before slower collection jobs.
+SCHEDULE = (("tfl_bikes","tfl",300),("laqn_sites","laqn",86400),("breathe_web_hourly","breathe",3600),
             ("met_sites","metoffice",86400),("laqn_hourly","laqn",3600),
             ("laqn_15min","laqn",3600),
-            ("met_hourly","metoffice",86400),("tfl_bikes","tfl",300),
+            ("met_hourly","metoffice",86400),
             ("tfl_roads","tfl",300),("breathe_web_reconcile","breathe",300))
 KEYS = {"metoffice":"MET_OFFICE_API_KEY"}
 CREDENTIALS_FILE = Path(os.environ.get("APPDATA") or (Path.home()/".config"))/"LondonAirWatch"/"credentials.txt"

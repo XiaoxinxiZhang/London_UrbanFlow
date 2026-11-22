@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 import unittest
 from unittest.mock import patch
+from urllib.error import URLError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from city_analysis import distance
@@ -78,9 +79,38 @@ class JourneyTests(unittest.TestCase):
             args, kwargs = transport.call_args
             self.assertIn("application/geo+json", args[1]["Accept"])
             self.assertEqual(json.loads(kwargs["data"])["coordinates"], [START, END])
-        with patch("journey.curl_https", return_value=(403, b"{}")):
-            with self.assertRaisesRegex(RoutingUnavailable, "认证失败"):
-                OpenRouteService(key="test-only-key").directions("foot-walking", START, END)
+        for status, message in [(403, "认证失败"), (429, "频率已达上限")]:
+            with self.subTest(status=status), patch("journey.curl_https", return_value=(status, b"{}")), \
+                    patch("journey.urllib_https") as fallback:
+                with self.assertRaisesRegex(RoutingUnavailable, message):
+                    OpenRouteService(key="test-only-key").directions("foot-walking", START, END)
+                fallback.assert_not_called()
+
+    def test_ors_transport_failure_retries_the_same_request_once(self):
+        with patch("journey.curl_https", side_effect=OSError("test-only-key")) as curl, \
+                patch("journey.urllib_https", return_value=(200, b'{"distances":[[100]],"durations":[[80]]}')) as fallback, \
+                self.assertLogs("journey", level="WARNING") as logs:
+            result = OpenRouteService(key="test-only-key").matrix("foot-walking", [START], [END])
+        self.assertEqual(result, ([[100]], [[80]]))
+        curl.assert_called_once()
+        fallback.assert_called_once_with(*curl.call_args.args, timeout=8, data=curl.call_args.kwargs["data"])
+        self.assertNotIn("test-only-key", "\n".join(logs.output))
+
+    def test_ors_reports_timeout_network_and_invalid_response_separately(self):
+        router = OpenRouteService(key="test-only-key")
+        for reason, message in [(TimeoutError(), "连接超时"), (ConnectionResetError(), "网络连接失败")]:
+            with self.subTest(reason=type(reason).__name__), \
+                    patch("journey.curl_https", side_effect=TimeoutError), \
+                    patch("journey.urllib_https", side_effect=URLError(reason)) as fallback, \
+                    self.assertLogs("journey", level="WARNING"):
+                with self.assertRaisesRegex(RoutingUnavailable, message):
+                    router.directions("cycling-regular", START, END)
+                fallback.assert_called_once()
+        with patch("journey.curl_https", return_value=(200, b"<html>invalid</html>")), \
+                patch("journey.urllib_https") as fallback, self.assertLogs("journey", level="WARNING"):
+            with self.assertRaisesRegex(RoutingUnavailable, "无法读取的响应"):
+                router.directions("foot-walking", START, END)
+            fallback.assert_not_called()
 
     def setUp(self):
         self.bikes = [dock("pickup", [-.149, 51.510], 4, 0),

@@ -165,6 +165,14 @@ class LiveAPITests(unittest.TestCase):
         result = manager.get(first["id"])
         self.assertEqual(result["state"],"partial")
         self.assertEqual(result["jobs"]["tfl_bikes"],"error: offline")
+        with patch("live_api.threading.Thread"):
+            second = manager.start()
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual(manager.get(second["id"])["state"], "running")
+        previous = manager.get(first["id"])
+        self.assertEqual(previous, result)
+        previous["jobs"].clear()
+        self.assertEqual(manager.get(first["id"]), result)
 
     def test_update_manager_waits_for_scheduled_collector(self):
         lock = CollectorLock(self.path)

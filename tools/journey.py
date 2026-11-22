@@ -2,22 +2,25 @@
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from http.client import HTTPException
 import json
+import logging
 import math
 import os
 import re
 import threading
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 import xml.etree.ElementTree as ET
 
 from city_analysis import distance, dt, geometry_distance, valid_coordinate
-from secure_curl import open_https, curl_https
+from secure_curl import curl_https, open_https, urllib_https
 
 UTC = timezone.utc
 ORS_BASE = "https://api.heigit.org/openrouteservice/v2"
 DAQI_FEED = "https://uk-air.defra.gov.uk/assets/rss/current_region_levels.xml"
 METRICS = ("PM25", "PM10", "NO2", "O3")
+LOGGER = logging.getLogger(__name__)
 
 
 class RoutingUnavailable(Exception):
@@ -32,21 +35,12 @@ class OpenRouteService:
     def request(self, endpoint, body):
         if not self.key:
             raise RoutingUnavailable("尚未配置 ORS_API_KEY，无法生成道路导航")
-        request = Request(ORS_BASE + endpoint, data=json.dumps(body).encode("utf-8"),
-                          headers={"Authorization": self.key, "Content-Type": "application/json",
-                                   "Accept": "application/geo+json, application/json"},
-                          method="POST")
+        url = ORS_BASE + endpoint
+        headers = {"Authorization": self.key, "Content-Type": "application/json",
+                   "Accept": "application/geo+json, application/json"}
+        data = json.dumps(body).encode("utf-8")
         try:
-            if self.opener is not None:
-                with self.opener(request, timeout=25) as response:
-                    return json.load(response)
-            status, raw = curl_https(ORS_BASE + endpoint,
-                {"Authorization": self.key, "Content-Type": "application/json",
-                 "Accept": "application/geo+json, application/json"},
-                timeout=25, data=request.data)
-            if status != 200:
-                raise HTTPError(ORS_BASE + endpoint, status, "routing upstream error", {}, None)
-            return json.loads(raw)
+            return json.loads(self._post(url, headers, data))
         except HTTPError as exc:
             if exc.code == 429:
                 raise RoutingUnavailable("路线服务请求频率已达上限，请稍后重试") from exc
@@ -55,8 +49,32 @@ class OpenRouteService:
             if exc.code in (400, 404, 406, 413):
                 raise RoutingUnavailable("路线服务无法处理该路线请求（HTTP " + str(exc.code) + "），请调整起终点后重试") from exc
             raise RoutingUnavailable("路线服务暂不可用（HTTP " + str(exc.code) + "），请稍后重试") from exc
-        except (URLError, TimeoutError, OSError, ValueError) as exc:
-            raise RoutingUnavailable("路线服务连接失败，请稍后重试") from exc
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            LOGGER.warning("openrouteservice %s returned unreadable data (%s)", endpoint, type(exc).__name__)
+            raise RoutingUnavailable("路线服务返回了无法读取的响应，请稍后重试") from exc
+        except (OSError, HTTPException) as exc:
+            reason = getattr(exc, "reason", exc)
+            LOGGER.warning("openrouteservice %s transport failed (%s)", endpoint, type(reason).__name__)
+            if isinstance(reason, TimeoutError):
+                raise RoutingUnavailable("路线服务连接超时，请稍后重试") from exc
+            raise RoutingUnavailable("路线服务网络连接失败，请检查本机网络后重试") from exc
+        except ValueError as exc:
+            LOGGER.warning("openrouteservice %s request configuration failed (%s)", endpoint, type(exc).__name__)
+            raise RoutingUnavailable("路线服务请求配置无效，请检查本机 ORS 密钥") from exc
+
+    def _post(self, url, headers, data):
+        if self.opener is not None:
+            request = Request(url, data=data, headers=headers, method="POST")
+            with self.opener(request, timeout=25) as response:
+                return response.read()
+        try:
+            status, raw = curl_https(url, headers, timeout=25, data=data)
+        except OSError as exc:
+            LOGGER.warning("openrouteservice curl transport failed (%s), trying Python HTTPS", type(exc).__name__)
+            status, raw = urllib_https(url, headers, timeout=8, data=data)
+        if status != 200:
+            raise HTTPError(url, status, "routing upstream error", {}, None)
+        return raw
 
     def matrix(self, profile, sources, destinations):
         locations = sources + destinations

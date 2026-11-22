@@ -119,10 +119,27 @@ def curl_https(url, headers, timeout=25, data=None):
         return int(code), dst.read_bytes()
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def urllib_https(url, headers, timeout=25, data=None):
+    """Return an HTTPS response using Python's verified TLS, without redirects."""
+    if not isinstance(url, str) or not url.lower().startswith("https://"):
+        raise ValueError("Python HTTPS transport only accepts HTTPS URLs")
+    request = urllib.request.Request(url, data=data, headers=headers)
+    with urllib.request.build_opener(_NoRedirects()).open(request, timeout=timeout) as response:
+        return response.status, response.read()
+
+
 def open_https(url, headers, timeout=25, prefer_curl=False):
     """Open an HTTPS URL, optionally preferring curl for compatibility."""
     if prefer_curl:
-        return curl_https(url, headers, timeout=timeout)
+        try:
+            return curl_https(url, headers, timeout=timeout)
+        except OSError:
+            return urllib_https(url, headers, timeout=min(timeout, 8))
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
