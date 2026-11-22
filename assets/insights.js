@@ -8,8 +8,11 @@
     const airFresh = Number.isFinite(observation) && observation <= referenceMillis && referenceMillis - observation <= 3 * HOUR;
     const bikeTime = Date.parse(nearby?.bike_info?.captured_at || "");
     const roadTime = Date.parse(nearby?.road_info?.captured_at || "");
-    const bikeFresh = !nearby?.bike_info?.gap && Number.isFinite(bikeTime) && bikeTime <= referenceMillis && referenceMillis - bikeTime <= 15 * 60000;
-    const roadFresh = !nearby?.road_info?.gap && Number.isFinite(roadTime) && roadTime <= referenceMillis && referenceMillis - roadTime <= 15 * 60000;
+    const bikeLimit = replay ? 120 * 60000 : 15 * 60000;
+    const bikeFresh = !nearby?.bike_info?.gap && Number.isFinite(bikeTime) && bikeTime <= referenceMillis && referenceMillis - bikeTime <= bikeLimit;
+    const roadFresh = !nearby?.road_info?.gap &&
+      (nearby?.road_info?.reconstructed ||
+       (Number.isFinite(roadTime) && roadTime <= referenceMillis && referenceMillis - roadTime <= 15 * 60000));
     const points = (hourlyPoints || []).filter(point => valid(point.value_num) && Number.isFinite(Date.parse(point.time)) && Date.parse(point.time) <= referenceMillis)
       .sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
     let threeHourChange = null;

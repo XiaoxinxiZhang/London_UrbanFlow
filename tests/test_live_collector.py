@@ -125,8 +125,18 @@ class ParserTests(unittest.TestCase):
                                      "wind_gust":6.0,"visibility":38710,"mslp":1015,
                                      "wind_speed":3.3,"pressure_tendency":"F"}],"gcpvj0")
         self.assertEqual(len(obs),9)
-        self.assertEqual(next(x for x in obs if x["metric"]=="WIND_DIRECTION")["value_text"],"NW")
-        self.assertEqual(next(x for x in obs if x["metric"]=="TEMPERATURE")["value_num"],-1.5)
+        by_metric={x["metric"]:x for x in obs}
+        self.assertEqual(by_metric["WIND_DIRECTION"]["value_text"],"NW")
+        self.assertEqual(by_metric["TEMPERATURE"]["value_num"],-1.5)
+        self.assertEqual(by_metric["TEMPERATURE"]["unit"],"°C")
+        self.assertEqual(by_metric["HUMIDITY"]["unit"],"%")
+        self.assertEqual(by_metric["MSLP"]["unit"],"hPa")
+        self.assertEqual(by_metric["WIND_SPEED"]["unit"],"m/s")
+        self.assertEqual(by_metric["WIND_GUST"]["unit"],"m/s")
+        self.assertEqual(by_metric["VISIBILITY"]["unit"],"m")
+        self.assertIsNone(by_metric["WIND_DIRECTION"]["unit"])
+        self.assertIsNone(by_metric["WEATHER_CODE"]["unit"])
+        self.assertIsNone(by_metric["PRESSURE_TENDENCY"]["unit"])
 
 
 class StoreTests(unittest.TestCase):

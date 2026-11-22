@@ -18,6 +18,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import live_sources as parsers
+import bike_archive
+import road_archive
 from secure_curl import open_https
 import live_store as store
 import traffic_history
@@ -34,7 +36,9 @@ SCHEDULE = (("tfl_bikes","tfl",300),("laqn_sites","laqn",86400),("breathe_web_ho
             ("met_sites","metoffice",86400),("laqn_hourly","laqn",3600),
             ("laqn_15min","laqn",3600),
             ("met_hourly","metoffice",86400),
-            ("tfl_roads","tfl",300),("breathe_web_reconcile","breathe",300))
+            ("tfl_roads","tfl",300),("breathe_web_reconcile","breathe",300),
+            ("tfl_bike_archive","public_archive",3600),
+            ("tfl_road_archive","public_road_archive",10800))
 KEYS = {"metoffice":"MET_OFFICE_API_KEY"}
 CREDENTIALS_FILE = Path(os.environ.get("APPDATA") or (Path.home()/".config"))/"LondonAirWatch"/"credentials.txt"
 MIN_REQUEST_GAP = 1.25  # At most 48 requests/minute from this process.
@@ -410,14 +414,26 @@ def met_hourly(db,fetcher,now):
     return count,last
 
 
+def tfl_bike_archive(db, fetcher, now):
+    traffic_history.recover(db, fetcher.raw_root, now, kind="bikes")
+    return bike_archive.backfill(db, now)
+
+
+def tfl_road_archive(db, fetcher, now):
+    traffic_history.recover(db, fetcher.raw_root, now, kind="roads")
+    return road_archive.backfill(db, now)
+
+
 JOBS={name:globals()[name] for name,_,_ in SCHEDULE}
 
 
-def run_once(db,fetcher=None,now=None,force=False,on_progress=None):
+def run_once(db,fetcher=None,now=None,force=False,on_progress=None,only_job=None):
     now=now or datetime.now(timezone.utc)
     fetcher=fetcher or Fetcher(db)
     results={}
     for name,source,interval in SCHEDULE:
+        if only_job is not None and name != only_job:
+            continue
         if not force and not store.job_due(db,name,interval,now):
             continue
         if on_progress:
@@ -449,7 +465,8 @@ def run_once(db,fetcher=None,now=None,force=False,on_progress=None):
         db.commit()
         if on_progress:
             on_progress(name,results[name])
-    store.prune_raw(fetcher.raw_root,days=90,now=now)
+    if only_job is None:
+        store.prune_raw(fetcher.raw_root,days=90,now=now)
     return results
 
 
@@ -466,7 +483,7 @@ def status(db,now=None):
                 state="credentials_error"
         elif row and row["last_success_utc"] and now-datetime.fromisoformat(row["last_success_utc"]) > timedelta(seconds=interval*2+300):
             state="stale" if state=="success" else state+"; stale"
-        if row and row["latest_observation_utc"] and name not in ("tfl_roads",):
+        if row and row["latest_observation_utc"] and name not in ("tfl_roads","tfl_bike_archive","tfl_road_archive"):
             age=now-datetime.fromisoformat(row["latest_observation_utc"])
             limit=(timedelta(minutes=15) if name=="tfl_bikes" else
                    timedelta(hours=27) if name=="met_hourly" else timedelta(hours=3))
@@ -501,13 +518,14 @@ def status(db,now=None):
 
 def main(argv=None):
     ap=argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("command",choices=("run-once","status","prune"))
+    backfill_jobs = {"backfill-bikes":"tfl_bike_archive", "backfill-roads":"tfl_road_archive"}
+    ap.add_argument("command",choices=("run-once",*backfill_jobs,"status","prune"))
     ap.add_argument("--force",action="store_true",help="run all configured feeds even if not due")
     ap.add_argument("--db",default=str(store.DB),help="SQLite path (for tests or separate workspace)")
     ap.add_argument("--json-progress",action="store_true",help="emit one JSON object per job transition")
     args=ap.parse_args(argv)
     lock=CollectorLock(args.db)
-    if args.command=="run-once" and not lock.acquire():
+    if (args.command=="run-once" or args.command in backfill_jobs) and not lock.acquire():
         print("Collector already running",flush=True)
         return 75
     db=None
@@ -518,7 +536,9 @@ def main(argv=None):
         else:
             def report(job,outcome):
                 print(json.dumps({"job":job,"outcome":outcome},ensure_ascii=False),flush=True)
-            result=run_once(db,force=args.force,on_progress=report if args.json_progress else None)
+            only_job = backfill_jobs.get(args.command)
+            result=run_once(db,force=args.force or only_job is not None,on_progress=report if args.json_progress else None,
+                            only_job=only_job)
             for name,outcome in result.items():print(f"{name}: {outcome}")
             if any(v.startswith("error") for v in result.values()):return 1
     finally:

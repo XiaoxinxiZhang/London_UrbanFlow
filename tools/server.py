@@ -12,12 +12,14 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import webbrowser
 
 from live_api import LiveAPI, UpdateManager
+import live_sources as parsers
 import live_store as store
 import traffic_history
 from journey import JourneyPlanner
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = {"/index.html", "/assets/live.css", "/assets/live.js", "/assets/city.css", "/assets/city.js", "/assets/journey.js", "/assets/insights.js",
+          "/assets/bike-analysis.js",
           "/assets/vendor/maplibre-gl-5.6.2.js", "/assets/vendor/maplibre-gl-5.6.2.css",
           "/assets/vendor/supercluster-8.0.1.min.js",
           "/assets/vendor/echarts-5.6.0.min.js",
@@ -85,6 +87,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                   "/api/road-events": lambda: self.server.api.roads(params),
                   "/api/map": lambda: self.server.api.analysis.map(params),
                   "/api/analysis/series": lambda: self.server.api.analysis.series(params),
+                  "/api/analysis/bikes/timeline": lambda: self.server.api.analysis.bike_timeline(params),
+                  "/api/analysis/bikes/frame": lambda: self.server.api.analysis.bike_frame(params),
+                  "/api/analysis/bikes/station": lambda: self.server.api.analysis.bike_station(params),
                   "/api/analysis/nearby": lambda: self.server.api.analysis.nearby(params),
                   "/api/analysis/weather": lambda: self.server.api.analysis.weather(params)}
         try:
@@ -142,6 +147,7 @@ def create_server(port=8765, database=store.DB):
     with closing(store.connect(database)) as db:
         db.commit()
         traffic_history.recover(db)
+        store.backfill_met_units(db, parsers.WEATHER_UNITS)
     server = LocalServer(("127.0.0.1", port),
         lambda *args, **kwargs: Handler(*args, directory=str(ROOT), **kwargs))
     server.api = LiveAPI(database)

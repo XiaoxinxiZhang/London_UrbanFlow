@@ -44,7 +44,7 @@ powershell -ExecutionPolicy Bypass -File tools\install_live_task.ps1 -Python 'C:
 
 旧版写入的 PM₂.₅ 和 NO₂ 指数留存于 SQLite，数据中心查询会滤掉这两项。上游原始响应按现有保留期归档。
 - TfL：[统一 API](https://api.tfl.gov.uk/) 与 [API 产品说明](https://api-portal.tfl.gov.uk/products)。匿名访问目前限每分钟 50 次，本项目每 5 分钟仅请求自行车和道路各一次，因此无需密钥。Windows 上优先使用系统 `curl.exe`；若 Internet Settings 配置了不含账号密码的代理，采集器会让 curl 显式复用该代理（curl 本身不会自动读取此设置）。TLS 证书验证保持开启。采集停靠站状态与当前道路扰动；事件不是交通流量。道路接口失败时不会把旧事件误判为已结束。
-- 英国气象局：[地面观测](https://datahub.metoffice.gov.uk/docs/o/category/observations/overview)。首次全国采集运行 `python tools/collect_met_all.py`：通过英国范围坐标及每次最多五个邻近 geohash 发现站点，去重后逐站获取最近 48 小时的小时观测；进度保存在 `data/live/metoffice_national_bootstrap.json`，中断后可重跑。已发现且有观测的站点进入常规每日采集；中心与四方锚点仍每日检查伦敦附近站点。九项天气字段按官方样本解析；响应不含单位时，数据库单位留空，不做假定。
+- 英国气象局：[地面观测](https://datahub.metoffice.gov.uk/docs/o/category/observations/overview)。首次全国采集运行 `python tools/collect_met_all.py`：通过英国范围坐标及每次最多五个邻近 geohash 发现站点，去重后逐站获取最近 48 小时的小时观测；进度保存在 `data/live/metoffice_national_bootstrap.json`，中断后可重跑。已发现且有观测的站点进入常规每日采集；中心与四方锚点仍每日检查伦敦附近站点。九项天气字段按官方样本解析；数值单位按 Met Office Land Observations 产品 Glossary 固定写入（温度 °C、湿度 %、气压 hPa、风速与阵风 m/s、能见度 m），风向、天气代码和气压倾向属于代码值，单位留空。启动服务时会把历史气象记录中缺失的单位补齐一次。
 
 气象局 Land Observations 免费套餐目前允许每天 360 次请求（UTC 日重置）。全国约 150 个站点每天各请求一次，加上 5 次每日伦敦站点查询，通常约 155 次/天；同一响应已包含最近 48 小时，不需要为每个小时单独请求。为给重试和人工检查留余量，常规采集器对自身气象局请求设置每天 300 次的本地上限；首次全国发现脚本的临时上限为每天 350 次，以便在免费额度内完成站点发现和下载。失败的网络尝试也计入，`status` 会显示当天用量。最近站点接口可能返回英国以外地点：这些响应保留在原始归档中，但境外站点不加入常规采集。观测接口返回 404 的站点保留元数据并标为不活动。人工从别的程序使用同一密钥不会出现在本地计数中，仍需留意平台总额度。
 
@@ -80,15 +80,17 @@ curl.exe -L --retry 3 --retry-all-errors -o data\live\imports\westminster_2026.z
 
 城市总览采用本地固定版本 MapLibre GL JS 5.6.2 与 OpenFreeMap 浅色 Positron 底图，图表采用 ECharts 5.6.0。伦敦行政边界使用项目提供的 GeoJSON 叠加；河流专题图层已从当前页面移除。自行车使用本地 Supercluster 8.0.1 生成聚合标记：缩放级别小于 13 时以可点击的数字圆圈展示，数字为站点数；放大后显示全部原始站点，可查看车辆与空位。聚合标记通过 DOM 绘制；聚合组件加载失败时直接显示原始点位。更新数据、历史回放和图层开关均同步更新标记。第三方代码及许可证在 `assets/vendor/`。底图需要网络连接；底图资源失败时仍可查询业务数据、图表与表格。
 
-地图和分析使用最近 48 小时的观测。进入历史回放时固定查询窗口，按所选小时的结束时刻取值，窗口末端以进入回放时的时间为上限。LAQN 小时值优先采用来源小时数据，缺少小时值时至少使用 3 个不同的 15 分钟观测求均值。返回的 `sample_count` 与 `aggregation` 保留计算依据。地图最新状态使用 LAQN 的 15 分钟浓度及 Breathe London 官网观测。地图圆点为 LAQN、菱形为 Breathe London。浓度按窗口内的数据分级，灰色代表缺测。
+城市总览与污染分析使用最近 48 小时的观测，自行车时空分析使用最近 7 天的库存快照。进入历史回放时固定查询窗口，按所选小时的结束时刻取值，窗口末端以进入回放时的时间为上限。LAQN 小时值优先采用来源小时数据，缺少小时值时至少使用 3 个不同的 15 分钟观测求均值。返回的 `sample_count` 与 `aggregation` 保留计算依据。地图最新状态使用 LAQN 的 15 分钟浓度及 Breathe London 官网观测。地图圆点为 LAQN、菱形为 Breathe London。浓度按窗口内的数据分级，灰色代表缺测。
 
-自行车每次成功采集都会写入 `bike_snapshots`，记录获取时间、来源修改时间、车辆、空位和容量。启动服务时从过去 48 小时的成功原始响应补回历史快照，恢复进度保存在 `traffic_archive_imports`。道路列表同样保留成功快照，以准确恢复某次列表中的事件范围和状态，并继续保存原有事件版本。回放采用游标之前最近一次完整快照，超过 10 分钟显示间断。原始档案缺失的区间保持缺测。
+自行车每次成功采集都会写入 `bike_snapshots`，记录获取时间、来源修改时间、车辆、空位和容量。启动服务时从过去 7 天的自行车及过去 48 小时的道路成功原始响应补回历史快照，恢复进度保存在 `traffic_archive_imports`。道路列表同样保留成功快照，以准确恢复某次列表中的事件范围和状态，并继续保存原有事件版本。城市总览历史回放优先使用游标之前 10 分钟内的本地快照。自行车可以采用 20 分钟内、比本地快照更新的公开归档，并标注来源和采集时间。仍无可用归档时，允许向前沿用 2 小时内的本地快照并标注时间差。超过 2 小时或无快照时，道路事件可按前后两次完整列表的交集重建并标注「重建」。重建只包含中断前后两次完整列表中都在列的事件；只在单侧出现的事件无法确认，保持未知。原始档案缺失的区间不插值、不补零。
 
-选择监测站后显示周围 500 米自行车站和 1 公里道路事件，可切换为 500 米、1 公里或 2 公里。自行车站关联 1 公里内最近的有值污染监测点。道路范围距离使用实际几何；区域气象仅采用 `area=London / Greater London` 的有效站点，默认选择所选时间范围有效观测最多者。气象缺少精确站点坐标和来源单位，界面显示区域、geohash 和单位缺失状态。同 UTC 小时配对至少 24 对且两列均有变化时计算 Pearson 相关系数，作为观察性分析。
+自行车时空分析使用 [london-cycles 公开归档](https://huggingface.co/datasets/feregrino/london-cycles)补录最近 7 天。归档由 feregrino 收集，基于 TfL Open Data，数据许可为 CC BY-SA 3.0。现有采集流程在末尾每小时检查一次，首次部署可运行 `python tools/collect_live.py backfill-bikes`。归档按实际采集时间存储，记录源文件版本和 SHA256。回放优先使用 10 分钟内的本地快照，公开归档最多回看 20 分钟，实际断档显示缺测。实时地图与共享单车路线继续读取本地 TfL 快照。
 
-分析接口为 `/api/map`、`/api/analysis/series`、`/api/analysis/nearby`、`/api/analysis/weather`。共同参数 `start`、`end`、`cursor` 使用带时区 ISO 时间，`start <= t < end`，回放数据满足 `t <= cursor`。`source` 可选 `laqn`、`breathe`、`breathe_wcc`。`metric` 支持 `PM25`、`NO2`、`PM10`、`O3` 四种浓度指标。附近查询通过 `kind=air / bike / road` 与 `site` 指定对象，或通过 `kind=point` 与 `lon`、`lat` 指定坐标。`radius`、`road_radius` 控制资源统计范围，`local_air` 返回地点实测、估算、最近站点读数或缺测状态。气象接口使用 `weather_site` 指定伦敦站点，series 接口使用逗号分隔的 `sites` 对比最多 4 站。
+选择监测站后显示周围 500 米自行车站和 1 公里道路事件，可切换为 500 米、1 公里或 2 公里。自行车站关联 1 公里内最近的有值污染监测点。道路范围距离使用实际几何；区域气象仅采用 `area=London / Greater London` 的有效站点。总览首行的气象卡片对全部有效伦敦站做逐小时平均（当前 3 站），每项只用有值的站；分析页仍按下拉选择单个背景站。气象站只有 geohash 和区域名，没有精确坐标。同 UTC 小时配对至少 24 对且两列均有变化时计算 Pearson 相关系数，作为观察性分析。
 
-附近查询设置 `include_air_metrics=1` 时，`local_air_by_metric` 按污染物返回四项地点读数。气象查询设置 `context_only=1` 时，返回伦敦站点编号 `station`、站名 `station_name` 及时间窗口内最新的一组气象观测 `latest`。
+分析接口为 `/api/map`、`/api/analysis/series`、`/api/analysis/nearby`、`/api/analysis/weather`。共同参数 `start`、`end`、`cursor` 使用带时区 ISO 时间，`start <= t < end`，回放数据满足 `t <= cursor`。`source` 可选 `laqn`、`breathe`、`breathe_wcc`。`metric` 支持 `PM25`、`NO2`、`PM10`、`O3` 四种浓度指标。附近查询通过 `kind=air / bike / road` 与 `site` 指定对象，或通过 `kind=point` 与 `lon`、`lat` 指定坐标。`radius`、`road_radius` 控制资源统计范围，`local_air` 返回地点实测、估算、最近站点读数或缺测状态。气象接口使用 `weather_site` 指定伦敦站点，`aggregate=mean` 改为返回全部伦敦站的逐小时平均；series 接口使用逗号分隔的 `sites` 对比最多 4 站。
+
+附近查询设置 `include_air_metrics=1` 时，`local_air_by_metric` 按污染物返回四项地点读数。气象查询设置 `context_only=1` 时，返回站点编号 `station`、站名 `station_name` 及时间窗口内最新的一组气象观测 `latest`；同时设置 `aggregate=mean` 时，`station_name` 为「伦敦 N 站平均」，`latest` 中温度、湿度、风速、气压按各项可用站点平均，并带 `samples` 站数与单位。
 
 智慧出行使用 `POST /api/journeys/plan`，请求体含 `[经度,纬度]` 的 `start`、`end`，`mode=shared_bike / walk / personal_bike`，以及 `max_walk_m=1000 / 2000`。服务器只读取最新 TfL BikePoint 快照，超过 15 分钟时不推荐取还车站。取车站需要至少 1 辆车，还车站需要至少 1 个空位。道路路线由 openrouteservice 的步行与骑行服务计算，需在启动服务的进程中设置 `ORS_API_KEY`。密钥保存在服务端。
 

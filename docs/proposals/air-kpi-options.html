@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>有值空气监测点卡片 · 改版对比</title>
+<style>
+  :root { color-scheme: dark; --bg:#0b131e; --line:#283b4e; --muted:#98aabd; --ink:#e9f0f8; --accent:#63dfc6;
+    --panel-heading-background: linear-gradient(125deg, #1b3c40, #172b3b); }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-size:14px; line-height:1.6;
+    font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  .wrap { width:1878px; padding:10px 6px 18px; }
+  .variant-label { display:flex; align-items:baseline; gap:10px; margin:6px 2px 6px; }
+  .variant-label b { font-size:13px; color:var(--ink); font-weight:600; letter-spacing:.2px; }
+  .variant-label span { font-size:12px; color:var(--muted); }
+  .city-kpis { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:14px; }
+  .city-kpi { --kpi-padding-block:7px; --kpi-padding-inline:14px; height:140px; display:flex;
+    flex-direction:column; align-items:center; text-align:center; border:1px solid var(--line);
+    border-radius:9px; background:linear-gradient(130deg,#19343b80,#12202e);
+    padding:0 var(--kpi-padding-inline) var(--kpi-padding-block); overflow:hidden; }
+  .city-kpi > h2 { align-self:stretch; margin:0 calc(-1 * var(--kpi-padding-inline)) 8px;
+    padding:var(--kpi-padding-block) var(--kpi-padding-inline) 2px; font-size:18px; font-weight:700;
+    line-height:1.25; background:var(--panel-heading-background); }
+  .city-kpi strong { display:block; font-size:29px; font-weight:550; color:var(--accent);
+    font-variant-numeric:tabular-nums; line-height:1.15; }
+  .city-kpi small { display:block; font-size:11px; color:var(--muted); max-width:100%;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .city-kpi-metrics { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(0,1fr);
+    align-items:end; gap:4px; width:100%; max-width:24rem; }
+  .city-kpi-metrics small { font-size:11px; }
+  .weather-note { margin-top:2px; }
+  /* ---- proposed matrix ---- */
+  .air-matrix { display:grid; width:100%; max-width:24rem; align-items:center;
+    grid-template-columns:minmax(0,1.1fr) minmax(0,.95fr) minmax(0,1.15fr); row-gap:2px; }
+  .air-matrix .col { font-size:11px; color:var(--muted); line-height:1.35; padding-bottom:1px; }
+  .air-matrix .rowlab { font-size:12px; color:var(--muted); line-height:1; text-align:left; padding-left:3px; }
+  .air-matrix strong { font-size:23px; }
+  .air-matrix .na { font-size:20px; color:#5e7286; }
+  .air-foot { margin-top:auto; }
+  .current-metric { margin-top:auto; }
+  /* variant C: keep big network numbers, add two pollutant sub-counts */
+  .air-subs { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(0,1fr); gap:8px;
+    width:100%; max-width:24rem; margin-top:2px; font-size:11px; color:var(--muted); line-height:1.3; }
+  .air-subs b { color:var(--ink); font-weight:500; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="variant-label"><b>现状</b><span>每个网络只有一个数，看不出对应哪种污染物</span></div>
+  <div class="city-kpis">
+    <section class="city-kpi">
+      <h2>伦敦气象背景</h2>
+      <div class="city-kpi-metrics">
+        <div><small>温度 ℃</small><strong>5.9</strong></div>
+        <div><small>湿度 %</small><strong>91</strong></div>
+        <div><small>风速 m/s</small><strong>3.2</strong></div>
+        <div><small>气压 hPa</small><strong>1011</strong></div>
+      </div>
+      <small class="weather-note">Greater London · 2026/11/22 10:00 GMT+8</small>
+    </section>
+    <section class="city-kpi">
+      <h2>有值空气监测点</h2>
+      <div class="city-kpi-metrics">
+        <div><small>LAQN</small><strong>26</strong></div>
+        <div><small>Breathe London</small><strong>137</strong></div>
+      </div>
+      <small class="current-metric">采集于 2026/11/22 19:19 GMT+8</small>
+    </section>
+    <section class="city-kpi">
+      <h2>自行车资源</h2>
+      <div class="city-kpi-metrics">
+        <div><small>空站数量</small><strong>43</strong></div>
+        <div><small>满站数量</small><strong>24</strong></div>
+        <div><small>有车有空位</small><strong>733</strong></div>
+      </div>
+      <small>采集于 2026/11/22 19:19 GMT+8</small>
+    </section>
+    <section class="city-kpi">
+      <h2>道路事件</h2>
+      <strong>112</strong>
+      <small>采集于 2026/11/22 19:19 GMT+8</small>
+    </section>
+  </div>
+
+  <div class="variant-label"><b>方案 A（推荐）</b><span>污染物做行、网络做列；同一个数字终于能读出“哪个网络、哪种污染物”</span></div>
+  <div class="city-kpis">
+    <section class="city-kpi">
+      <h2>伦敦气象背景</h2>
+      <div class="city-kpi-metrics">
+        <div><small>温度 ℃</small><strong>5.9</strong></div>
+        <div><small>湿度 %</small><strong>91</strong></div>
+        <div><small>风速 m/s</small><strong>3.2</strong></div>
+        <div><small>气压 hPa</small><strong>1011</strong></div>
+      </div>
+      <small class="weather-note">Greater London · 2026/11/22 10:00 GMT+8</small>
+    </section>
+    <section class="city-kpi">
+      <h2>有值空气监测点</h2>
+      <div class="air-matrix" role="table" aria-label="各污染物有值站点数">
+        <span></span><span class="col">LAQN</span><span class="col">Breathe London</span>
+        <span class="rowlab">PM₂.₅</span><strong>26</strong><strong>137</strong>
+        <span class="rowlab">NO₂</span><strong>47</strong><strong>129</strong>
+      </div>
+      <small class="air-foot">有值站点数 · 采集于 2026/11/22 19:19 GMT+8</small>
+    </section>
+    <section class="city-kpi">
+      <h2>自行车资源</h2>
+      <div class="city-kpi-metrics">
+        <div><small>空站数量</small><strong>43</strong></div>
+        <div><small>满站数量</small><strong>24</strong></div>
+        <div><small>有车有空位</small><strong>733</strong></div>
+      </div>
+      <small>采集于 2026/11/22 19:19 GMT+8</small>
+    </section>
+    <section class="city-kpi">
+      <h2>道路事件</h2>
+      <strong>112</strong>
+      <small>采集于 2026/11/22 19:19 GMT+8</small>
+    </section>
+  </div>
+
+  <div class="variant-label"><b>方案 B</b><span>行列互换：先看污染物，再横向比较两个网络</span></div>
+  <div class="city-kpis">
+    <section class="city-kpi">
+      <h2>伦敦气象背景</h2>
+      <div class="city-kpi-metrics">
+        <div><small>温度 ℃</small><strong>5.9</strong></div>
+        <div><small>湿度 %</small><strong>91</strong></div>
+        <div><small>风速 m/s</small><strong>3.2</strong></div>
+        <div><small>气压 hPa</small><strong>1011</strong></div>
+      </div>
+      <small class="weather-note">Greater London · 2026/11/22 10:00 GMT+8</small>
+    </section>
+    <section class="city-kpi">
+      <h2>有值空气监测点</h2>
+      <div class="air-matrix" role="table" aria-label="各污染物有值站点数">
+        <span></span><span class="col">PM₂.₅</span><span class="col">NO₂</span>
+        <span class="rowlab">LAQN</span><strong>26</strong><strong>47</strong>
+        <span class="rowlab">Breathe London</span><strong>137</strong><strong>129</strong>
+      </div>
+      <small class="air-foot">有值站点数 · 采集于 2026/11/22 19:19 GMT+8</small>
+    </section>
+    <section class="city-kpi">
+      <h2>自行车资源</h2>
+      <div class="city-kpi-metrics">
+        <div><small>空站数量</small><strong>43</strong></div>
+        <div><small>满站数量</small><strong>24</strong></div>
+        <div><small>有车有空位</small><strong>733</strong></div>
+      </div>
+      <small>采集于 2026/11/22 19:19 GMT+8</small>
+    </section>
+    <section class="city-kpi">
+      <h2>道路事件</h2>
+      <strong>112</strong>
+      <small>采集于 2026/11/22 19:19 GMT+8</small>
+    </section>
+  </div>
+
+  <div class="variant-label"><b>方案 C（最小改动）</b><span>保留两个网络的大数字，只在下方补两行污染物数值</span></div>
+  <div class="city-kpis">
+    <section class="city-kpi">
+      <h2>伦敦气象背景</h2>
+      <div class="city-kpi-metrics">
+        <div><small>温度 ℃</small><strong>5.9</strong></div>
+        <div><small>湿度 %</small><strong>91</strong></div>
+        <div><small>风速 m/s</small><strong>3.2</strong></div>
+        <div><small>气压 hPa</small><strong>1011</strong></div>
+      </div>
+      <small class="weather-note">Greater London · 2026/11/22 10:00 GMT+8</small>
+    </section>
+    <section class="city-kpi">
+      <h2>有值空气监测点</h2>
+      <div class="city-kpi-metrics" style="max-width:24rem">
+        <div><small>LAQN</small><strong>26</strong></div>
+        <div><small>Breathe London</small><strong>137</strong></div>
+      </div>
+      <div class="air-subs">
+        <span>PM₂.₅ <b>26</b> · NO₂ <b>47</b></span>
+        <span>PM₂.₅ <b>137</b> · NO₂ <b>129</b></span>
+      </div>
+      <small class="air-foot">采集于 2026/11/22 19:19 GMT+8</small>
+    </section>
+    <section class="city-kpi">
+      <h2>自行车资源</h2>
+      <div class="city-kpi-metrics">
+        <div><small>空站数量</small><strong>43</strong></div>
+        <div><small>满站数量</small><strong>24</strong></div>
+        <div><small>有车有空位</small><strong>733</strong></div>
+      </div>
+      <small>采集于 2026/11/22 19:19 GMT+8</small>
+    </section>
+    <section class="city-kpi">
+      <h2>道路事件</h2>
+      <strong>112</strong>
+      <small>采集于 2026/11/22 19:19 GMT+8</small>
+    </section>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,182 @@
+"""Import public Santander Cycles snapshots for gaps in the local archive."""
+
+from collections import defaultdict
+import csv
+from datetime import date, datetime, timedelta, timezone
+import hashlib
+import io
+import json
+import math
+import re
+import sys
+from urllib.error import HTTPError
+
+import live_store as store
+from secure_curl import open_https
+from traffic_history import BIKE_HISTORY_DAYS, BIKE_LIVE_FRESH_SECONDS
+
+
+DATASET = "https://huggingface.co/datasets/feregrino/london-cycles"
+DATASET_API = DATASET.replace("/datasets/", "/api/datasets/")
+ARCHIVE_SOURCE = "public_archive"
+ARCHIVE_FRESH_SECONDS = 20 * 60
+OBSERVATION_COLUMNS = ("query_time", "place_id", "bikes", "empty_docks", "docks")
+STATION_COLUMNS = ("place_id", "common_name", "lat", "lon", "valid_from", "valid_to")
+
+
+def read_url(url):
+    status, payload = open_https(url, {"User-Agent": "LondonUrbanFlow/1.0"}, timeout=12,
+                                 prefer_curl=sys.platform == "win32")
+    if status != 200:
+        raise HTTPError(url, status, "archive request failed", None, None)
+    return payload
+
+
+def csv_rows(payload, columns):
+    rows = csv.DictReader(io.StringIO(payload.decode("utf-8-sig"), newline=""), strict=True)
+    if not set(columns).issubset(rows.fieldnames or []):
+        raise ValueError("missing archive CSV columns")
+    for row in rows:
+        if None in row or any(row[column] is None for column in columns):
+            raise ValueError("incomplete archive CSV record")
+        yield row
+
+
+def station_versions(payload):
+    versions = defaultdict(list)
+    for row in csv_rows(payload, STATION_COLUMNS):
+        start = date.fromisoformat(row["valid_from"])
+        end = date.fromisoformat(row["valid_to"]) if row["valid_to"] else date.max
+        coords = (None, None)
+        if row["lon"] and row["lat"]:
+            lon, lat = float(row["lon"]), float(row["lat"])
+            if math.isfinite(lon) and math.isfinite(lat) and (-180 <= lon <= 180) and (-90 <= lat <= 90) and (lon, lat) != (0, 0):
+                coords = (lon, lat)
+        versions[row["place_id"]].append((start, end, (row["common_name"] or row["place_id"], *coords)))
+    if not versions:
+        raise ValueError("empty archive station directory")
+    for entries in versions.values():
+        entries.sort(key=lambda entry: entry[0], reverse=True)
+    return versions
+
+
+def archive_count(value):
+    if not value:
+        return None
+    if not re.fullmatch(r"[0-9]{1,9}", value):
+        raise ValueError("invalid archive inventory count")
+    return int(value)
+
+
+def parse_snapshots(payload, day, versions, start, end):
+    batches = defaultdict(dict)
+    seen = False
+    future = False
+    for row in csv_rows(payload, OBSERVATION_COLUMNS):
+        captured = datetime.fromisoformat(row["query_time"])
+        captured = captured.replace(tzinfo=captured.tzinfo or timezone.utc).astimezone(timezone.utc)
+        site = row["place_id"]
+        if captured.date() != day or not re.fullmatch(r"BikePoints_[0-9]+", site):
+            raise ValueError("invalid archive capture date or station ID")
+        counts = tuple(archive_count(row[key]) for key in ("bikes", "empty_docks", "docks"))
+        seen = True
+        future |= captured > end
+        if not start <= captured <= end:
+            continue
+        stamp = captured.isoformat(timespec="seconds")
+        stations = batches[stamp]
+        details = next((info for since, until, info in versions.get(site, []) if since <= day < until),
+                       (site, None, None))
+        record = (*details, *counts)
+        if site in stations and stations[site] != record:
+            raise ValueError("conflicting archive records for a station and capture time")
+        stations[site] = record
+    if not seen:
+        raise ValueError("empty archive snapshot file")
+    return batches, future
+
+
+def days_with_gaps(db, start, end):
+    stamps = db.execute("""SELECT captured_at_utc FROM traffic_batches
+      WHERE kind='bikes' AND captured_at_utc BETWEEN ? AND ? ORDER BY captured_at_utc""",
+                        (start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")))
+    days = set()
+    covered_until = start
+    for next_stamp in [*(datetime.fromisoformat(row[0]) for row in stamps), end]:
+        if covered_until < next_stamp:
+            day = covered_until.date()
+            while datetime.combine(day, datetime.min.time(), timezone.utc) < next_stamp:
+                days.add(day)
+                day += timedelta(days=1)
+        covered_until = next_stamp + timedelta(seconds=BIKE_LIVE_FRESH_SECONDS)
+    return sorted(days)
+
+
+def day_files(read, revision, day):
+    folder = day.strftime("data/year=%Y/month=%m/day=%d")
+    entries = json.loads(read(f"{DATASET_API}/tree/{revision}/{folder}"))
+    if not isinstance(entries, list):
+        raise ValueError("invalid archive file listing")
+    for entry in entries:
+        path = entry["path"]
+        prefix, _, name = path.rpartition("/")
+        if entry["type"] == "file" and prefix == folder and re.fullmatch(r"(part|[0-9]{6})\.csv", name):
+            yield path, entry["oid"], int(entry["size"])
+
+
+def save_file(db, path, version, payload, batches):
+    added = 0
+    with db:
+        inserted = db.execute("INSERT OR IGNORE INTO bike_archive_files VALUES(?,?,?,?)",
+                              (path, version, hashlib.sha256(payload).hexdigest(), store.utcnow()))
+        if not inserted.rowcount:
+            return 0
+        for stamp, stations in batches.items():
+            inserted = db.execute("INSERT OR IGNORE INTO bike_archive_batches VALUES(?,?,?,?)",
+                                  (stamp, path, version, len(stations)))
+            if not inserted.rowcount:
+                continue
+            db.executemany("INSERT INTO bike_archive_snapshots VALUES(?,?,?,?,?,?,?,?)",
+                           ((stamp, site, *entry) for site, entry in stations.items()))
+            added += 1
+    return added
+
+
+def backfill(db, now, read=read_url):
+    now = now.astimezone(timezone.utc).replace(microsecond=0)
+    start = now - timedelta(days=BIKE_HISTORY_DAYS)
+    days = days_with_gaps(db, start, now)
+    if not days:
+        return 0, None
+    revision = json.loads(read(DATASET_API+"?expand%5B%5D=sha"))["sha"]
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("invalid archive repository revision")
+    download = f"{DATASET}/resolve/{revision}/"
+    pending, errors = [], []
+    for day in days:
+        try:
+            for path, version, size in day_files(read, revision, day):
+                if not db.execute("SELECT 1 FROM bike_archive_files WHERE path=? AND version=?",
+                                  (path, version)).fetchone():
+                    pending.append((day, path, version, size))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            # Today's directory can be absent until the first snapshot is published.
+            if day != now.date() or getattr(error, "code", None) != 404:
+                errors.append(f"{day}: {error}")
+    added = 0
+    if pending:
+        versions = station_versions(read(download+"stations.csv"))
+        for day, path, version, size in pending:
+            try:
+                payload = read(download+path)
+                if len(payload) != size:
+                    raise ValueError("incomplete archive file download")
+                batches, future = parse_snapshots(payload, day, versions, start, now)
+                if not future:
+                    added += save_file(db, path, version, payload, batches)
+            except (OSError, ValueError, csv.Error, KeyError) as error:
+                errors.append(f"{path}: {error}")
+    if errors:
+        raise RuntimeError(f"archive added {added} batches; {len(errors)} failures; first: {errors[0]}")
+    latest = db.execute("SELECT MAX(captured_at_utc) FROM bike_archive_batches").fetchone()[0]
+    return added, latest

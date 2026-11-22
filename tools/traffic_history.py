@@ -6,6 +6,9 @@ from pathlib import Path
 import live_sources as parsers
 import live_store as store
 
+BIKE_HISTORY_DAYS = 7
+BIKE_LIVE_FRESH_SECONDS = 600
+
 
 def save_bikes(db, rows, captured_at, sha):
     db.execute("INSERT OR IGNORE INTO traffic_batches VALUES(?,?,?,?,NULL)",
@@ -26,15 +29,17 @@ def save_roads(db, payload, captured_at, sha):
                ("roads",captured_at,sha,len(payload),json.dumps(payload,ensure_ascii=False)))
 
 
-def recover(db, root=store.LIVE, now=None):
-    """Import available complete responses in the last 48h, once per fetch run."""
+def recover(db, root=store.LIVE, now=None, *, kind=None):
+    """Recover complete traffic responses from the last seven days."""
     now = now or datetime.now(timezone.utc)
-    cutoff = (now-timedelta(hours=48)).isoformat(timespec="seconds")
+    cutoff = (now-timedelta(days=7)).isoformat(timespec="seconds")
+    job = f"tfl_{kind}" if kind else None
     runs = db.execute("""SELECT f.id,f.job,f.ended_at_utc,f.raw_sha256 FROM fetch_runs f
       LEFT JOIN traffic_archive_imports i ON i.fetch_id=f.id
-      WHERE f.job IN ('tfl_bikes','tfl_roads') AND f.status='success'
-        AND f.raw_sha256 IS NOT NULL AND f.ended_at_utc>=? AND i.fetch_id IS NULL
-      ORDER BY f.id""",(cutoff,)).fetchall()
+      WHERE f.job IN ('tfl_bikes','tfl_roads') AND (? IS NULL OR f.job=?)
+        AND f.status='success' AND f.raw_sha256 IS NOT NULL
+        AND i.fetch_id IS NULL AND f.ended_at_utc>=?
+      ORDER BY f.id""",(job,job,cutoff)).fetchall()
     imported = 0
     for row in runs:
         sha = row["raw_sha256"]
@@ -55,7 +60,7 @@ def recover(db, root=store.LIVE, now=None):
                     save_bikes(db,rows,row["ended_at_utc"],sha)
                 else:
                     save_roads(db,parsers.tfl_events(payload),row["ended_at_utc"],sha)
-                db.execute("INSERT INTO traffic_archive_imports VALUES(?,'success',NULL)",(row["id"],))
+                db.execute("INSERT OR IGNORE INTO traffic_archive_imports VALUES(?,'success',NULL)",(row["id"],))
             imported += 1
         except (OSError,ValueError,KeyError) as exc:
             with db:

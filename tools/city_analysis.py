@@ -4,13 +4,48 @@ from datetime import datetime, timedelta, timezone
 import json
 import math
 
-from live_sources import POLLUTANTS
+from bike_archive import ARCHIVE_FRESH_SECONDS, ARCHIVE_SOURCE
+from live_sources import POLLUTANTS, WEATHER_UNITS
+from road_archive import SOURCE as ROAD_ARCHIVE_SOURCE
+from traffic_history import BIKE_HISTORY_DAYS, BIKE_LIVE_FRESH_SECONDS
 
 UTC = timezone.utc
 LONDON = (-.55, 51.28, .34, 51.72)
 AIR_SOURCES = ("laqn", "breathe", "breathe_wcc")
+KPI_AIR_METRICS = ("PM25", "NO2")
+# Breathe London sensors report PM2.5 and NO2 only. LAQN reference stations
+# cover all four pollutants, but each species is measured at a subset of sites.
+SOURCE_AIR_METRICS = {"laqn": ("PM25", "PM10", "NO2", "O3"),
+                      "breathe": ("PM25", "NO2"),
+                      "breathe_wcc": ("PM25", "NO2")}
 AIR_ESTIMATE_RADIUS_M = 2000
 AIR_ESTIMATE_NEAREST_M = 1000
+TRAFFIC_FRESH_SECONDS = BIKE_LIVE_FRESH_SECONDS
+TRAFFIC_HOLD_SECONDS = 7200
+TRAFFIC_STALE_SECONDS = 900
+EARTH_RADIUS_M = 6371008.8
+BIKE_RADIUS_M = 500
+BIKE_TIGHT_MAX = 2
+BIKE_SNAPSHOT_TABLES = {"tfl": "bike_snapshots", ARCHIVE_SOURCE: "bike_archive_snapshots"}
+BIKE_BATCH_SELECTION = """
+    WITH selected_bike_batches AS (
+        SELECT captured_at_utc, 'tfl' AS source
+        FROM traffic_batches WHERE kind='bikes' AND captured_at_utc BETWEEN :start AND :end
+        UNION ALL
+        SELECT archive.captured_at_utc, 'public_archive' AS source
+        FROM bike_archive_batches AS archive
+        WHERE archive.captured_at_utc BETWEEN :start AND :end
+          AND NOT EXISTS (
+            SELECT 1 FROM traffic_batches AS local
+            WHERE local.kind='bikes'
+              AND local.captured_at_utc BETWEEN
+                MAX(:start, strftime('%Y-%m-%dT%H:%M:%S+00:00', archive.captured_at_utc, :lookback))
+                AND archive.captured_at_utc
+          )
+    )
+"""
+WEATHER_MEAN_FIELDS = ("TEMPERATURE", "HUMIDITY", "WIND_SPEED", "MSLP")
+WEATHER_MEAN_PRECISION = {"TEMPERATURE": 1, "HUMIDITY": 0, "WIND_SPEED": 1, "MSLP": 0}
 
 
 def dt(value):
@@ -24,10 +59,10 @@ def iso(value):
     return value.astimezone(UTC).isoformat(timespec="seconds")
 
 
-def window(params):
+def window(params, *, default_span=timedelta(hours=48)):
     now = datetime.now(UTC)
     end = dt(params["end"]) if params.get("end") else now
-    start = dt(params["start"]) if params.get("start") else end-timedelta(hours=48)
+    start = dt(params["start"]) if params.get("start") else end-default_span
     if start >= end or end-start > timedelta(days=367):
         raise ValueError("时间范围须为正且不超过 367 天")
     if end > now+timedelta(seconds=5):
@@ -56,7 +91,61 @@ def distance(a, b):
     """Great-circle distance in metres, coordinates in longitude/latitude order."""
     lon1,lat1,lon2,lat2 = map(math.radians, (*a,*b))
     h = math.sin((lat2-lat1)/2)**2+math.cos(lat1)*math.cos(lat2)*math.sin((lon2-lon1)/2)**2
-    return 6371008.8*2*math.asin(min(1,math.sqrt(h)))
+    return EARTH_RADIUS_M*2*math.asin(min(1,math.sqrt(h)))
+
+
+def bike_window(params):
+    span = timedelta(days=BIKE_HISTORY_DAYS)
+    start, end, _ = window(params, default_span=span)
+    if end - start > span:
+        raise ValueError("自行车分析时间范围最长为 7 天")
+    return iso(start), iso(end)
+
+
+def bike_batch_params(start, end):
+    return dict(start=start, end=end, lookback=f"-{BIKE_LIVE_FRESH_SECONDS} seconds")
+
+
+def bike_batch_sources(db, params):
+    return {row["captured_at_utc"]: row["source"] for row in db.execute(
+        BIKE_BATCH_SELECTION + "SELECT * FROM selected_bike_batches ORDER BY captured_at_utc", params)}
+
+
+def bike_batch_metadata(source):
+    return dict(source=source, freshness_seconds=ARCHIVE_FRESH_SECONDS
+                if source == ARCHIVE_SOURCE else BIKE_LIVE_FRESH_SECONDS)
+
+
+def bike_station_catalog(db, batches):
+    catalog = {}
+    for source, table in BIKE_SNAPSHOT_TABLES.items():
+        selected = {stamp for stamp, origin in batches.items() if origin == source}
+        if not selected:
+            continue
+        start, end = min(selected), max(selected)
+        # Check times using the covering site index, then read only the chosen name.
+        for (site,) in db.execute(f"SELECT DISTINCT source_id FROM {table}"):
+            captures = db.execute(f"""SELECT captured_at_utc FROM {table}
+                WHERE source_id=? AND captured_at_utc BETWEEN ? AND ?
+                ORDER BY captured_at_utc DESC""", (site, start, end))
+            stamp = next((row[0] for row in captures if row[0] in selected), None)
+            if stamp and (site not in catalog or stamp > catalog[site][0]):
+                name = db.execute(f"SELECT name FROM {table} WHERE captured_at_utc=? AND source_id=?",
+                                  (stamp, site)).fetchone()[0]
+                catalog[site] = (stamp, name or site)
+    return sorted((dict(id=site, name=name) for site, (_, name) in catalog.items()),
+                  key=lambda station: (station["name"].casefold(), station["id"]))
+
+
+def bike_count(value):
+    if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0 or value % 1:
+        return None
+    return int(value)
+
+
+def bike_coordinates(row):
+    lon, lat = row["longitude"], row["latitude"]
+    return [lon, lat] if valid_coordinate(lon, lat) else None
 
 
 def weighted_air_value(readings):
@@ -262,23 +351,118 @@ class CityAnalysis:
             features.append(feature(dict(type="Point",coordinates=[location["longitude"],location["latitude"]]),properties))
         return features,quantiles(all_values)
 
-    def traffic(self, db, kind, cursor=None):
+    def reconstructed_roads(self, db, at):
+        """Replay events present in both complete lists around a collection gap.
+
+        The two neighbouring successful road lists are the only evidence for a
+        missing hour. Their intersection is the conservative set: events that
+        were listed before and after the gap. Events visible on only one side
+        may have started or ended inside the gap and stay unknown instead of
+        being guessed. Properties and geometries come from the earlier list.
+        """
+        stamp = iso(at)
+        before = db.execute("""SELECT captured_at_utc,payload_json FROM traffic_batches
+          WHERE kind='roads' AND captured_at_utc<=? ORDER BY captured_at_utc DESC LIMIT 1""",(stamp,)).fetchone()
+        after = db.execute("""SELECT captured_at_utc,payload_json FROM traffic_batches
+          WHERE kind='roads' AND captured_at_utc>? ORDER BY captured_at_utc LIMIT 1""",(stamp,)).fetchone()
+        archive_before = db.execute("""SELECT captured_at_utc,payload_json FROM road_archive_batches
+          WHERE captured_at_utc<=? ORDER BY captured_at_utc DESC LIMIT 1""", (stamp,)).fetchone()
+        archive_after = db.execute("""SELECT captured_at_utc,payload_json FROM road_archive_batches
+          WHERE captured_at_utc>? ORDER BY captured_at_utc LIMIT 1""", (stamp,)).fetchone()
+        before_source, after_source = "tfl", "tfl"
+        if archive_before and (before is None or archive_before["captured_at_utc"] > before["captured_at_utc"]):
+            before, before_source = archive_before, ROAD_ARCHIVE_SOURCE
+        if archive_after and (after is None or archive_after["captured_at_utc"] < after["captured_at_utc"]):
+            after, after_source = archive_after, ROAD_ARCHIVE_SOURCE
+        if before is None or after is None:
+            return [],None
+        earlier = {event["id"]:event for event in json.loads(before["payload_json"] or "[]") if event.get("id")}
+        later = {event["id"] for event in json.loads(after["payload_json"] or "[]") if event.get("id")}
+        features = []
+        for event_id in sorted(earlier.keys() & later):
+            event = earlier[event_id]
+            geometry = geometry_from_payload(event)
+            if geometry is None:
+                continue
+            features.append(feature(geometry,dict(
+                id=event_id,name=event.get("location") or event_id,
+                category=event.get("category"),severity=event.get("severity"),status=event.get("status"),
+                captured_at=None,modified_at=event.get("lastModifiedTime"),
+                starts_at=event.get("startDateTime"),ends_at=event.get("endDateTime"),
+                reconstructed=True,snapshot_source=before_source)))
+        return features,dict(before=before["captured_at_utc"],after=after["captured_at_utc"],
+                             before_source=before_source,after_source=after_source,
+                             only_before=len(earlier.keys()-later),only_after=len(later-earlier.keys()))
+
+    def traffic(self, db, kind, cursor=None, *, include_bike_archive=False):
         time_limit = iso(cursor or datetime.now(UTC))
         row = db.execute("""SELECT * FROM traffic_batches WHERE kind=? AND captured_at_utc<=?
           ORDER BY captured_at_utc DESC LIMIT 1""",(kind,time_limit)).fetchone()
-        bounds = db.execute("SELECT MIN(captured_at_utc),MAX(captured_at_utc) FROM traffic_batches WHERE kind=?",(kind,)).fetchone()
-        info = dict(captured_at=row["captured_at_utc"] if row else None,bounds=list(bounds),gap=False)
+        bounds = list(db.execute("SELECT MIN(captured_at_utc),MAX(captured_at_utc) FROM traffic_batches WHERE kind=?",
+                                 (kind,)).fetchone())
+        source = "tfl"
+        freshness = TRAFFIC_FRESH_SECONDS
+        if kind == "bikes" and cursor and include_bike_archive:
+            first, last = db.execute("SELECT MIN(captured_at_utc),MAX(captured_at_utc) FROM bike_archive_batches").fetchone()
+            if first is not None:
+                bounds = [min(bounds[0] or first, first), max(bounds[1] or last, last)]
+            local_stamp = row["captured_at_utc"] if row else None
+            if not local_stamp or (cursor - dt(local_stamp)).total_seconds() > BIKE_LIVE_FRESH_SECONDS:
+                cutoff = iso(cursor - timedelta(seconds=ARCHIVE_FRESH_SECONDS))
+                archive = db.execute("""SELECT captured_at_utc FROM bike_archive_batches
+                    WHERE captured_at_utc BETWEEN ? AND ? ORDER BY captured_at_utc DESC LIMIT 1""",
+                                     (cutoff, time_limit)).fetchone()
+                if archive and (not local_stamp or archive["captured_at_utc"] > local_stamp):
+                    row, source, freshness = archive, ARCHIVE_SOURCE, ARCHIVE_FRESH_SECONDS
+        if kind == "roads" and cursor:
+            first, last = db.execute("SELECT MIN(captured_at_utc),MAX(captured_at_utc) FROM road_archive_batches").fetchone()
+            if first is not None:
+                bounds = [min(bounds[0] or first, first), max(bounds[1] or last, last)]
+            local_stamp = row["captured_at_utc"] if row else None
+            if not local_stamp or (cursor - dt(local_stamp)).total_seconds() > TRAFFIC_FRESH_SECONDS:
+                cutoff = iso(cursor - timedelta(seconds=TRAFFIC_HOLD_SECONDS))
+                archive = db.execute("""SELECT captured_at_utc,payload_json FROM road_archive_batches
+                    WHERE captured_at_utc BETWEEN ? AND ? ORDER BY captured_at_utc DESC LIMIT 1""",
+                                     (cutoff, time_limit)).fetchone()
+                if archive and (not local_stamp or archive["captured_at_utc"] > local_stamp):
+                    row, source = archive, ROAD_ARCHIVE_SOURCE
+        info = dict(captured_at=row["captured_at_utc"] if row else None,bounds=bounds,
+                    gap=False,mode="live" if not cursor else "snapshot")
+        if kind == "bikes" and row:
+            info.update(source=source, freshness_seconds=freshness)
+        if kind == "roads" and row:
+            info["source"] = source
         if not row:
+            if cursor and kind=="roads":
+                features,replay = self.reconstructed_roads(db,cursor)
+                if features:
+                    info.update(captured_at=None,gap=False,mode="reconstructed",
+                                reconstructed=True,event_count=len(features),replay_window=replay)
+                    return features,info
+            info.update(gap=True,mode="missing")
             return [],info
         age = (dt(time_limit)-dt(row["captured_at_utc"])).total_seconds()
         info["age_minutes"] = round(age/60,1)
-        info["stale"] = age>900
-        if cursor and age>600:
-            info["gap"]=True
-            return [],info
+        info["stale"] = age > (freshness if source == ARCHIVE_SOURCE else TRAFFIC_STALE_SECONDS)
+        if cursor and age>freshness:
+            if age<=TRAFFIC_HOLD_SECONDS:
+                # A real snapshot from a little earlier is still attributable;
+                # the page labels the exact capture time and the offset.
+                info.update(mode="nearest",degraded=True)
+            else:
+                if kind=="roads":
+                    features,replay = self.reconstructed_roads(db,cursor)
+                    if features:
+                        info.update(captured_at=None,gap=False,mode="reconstructed",
+                                    reconstructed=True,event_count=len(features),
+                                    source_captured_at=row["captured_at_utc"],replay_window=replay)
+                        return features,info
+                info.update(gap=True,mode="missing")
+                return [],info
         features = []
         if kind=="bikes":
-            for bike in db.execute("SELECT * FROM bike_snapshots WHERE captured_at_utc=?",(row["captured_at_utc"],)):
+            table = BIKE_SNAPSHOT_TABLES[source]
+            for bike in db.execute(f"SELECT * FROM {table} WHERE captured_at_utc=?", (row["captured_at_utc"],)):
                 if not valid_coordinate(bike["longitude"],bike["latitude"]):
                     continue
                 bikes,empty = bike["bikes"],bike["empty_docks"]
@@ -286,7 +470,7 @@ class CityAnalysis:
                 features.append(feature(dict(type="Point",coordinates=[bike["longitude"],bike["latitude"]]),
                     dict(id=bike["source_id"],name=bike["name"],bikes=bikes,empty_docks=empty,
                          capacity=bike["capacity"],state=state,captured_at=bike["captured_at_utc"],
-                         source_modified=bike["source_modified_utc"],
+                         snapshot_source=source, source_modified=bike["source_modified_utc"] if source == "tfl" else None,
                          ratio=bikes/bike["capacity"] if bikes is not None and bike["capacity"] else None)))
         else:
             for event in json.loads(row["payload_json"] or "[]"):
@@ -294,8 +478,9 @@ class CityAnalysis:
                 if geometry:
                     features.append(feature(geometry,dict(id=event["id"],name=event.get("location") or event["id"],
                         category=event.get("category"),severity=event.get("severity"),status=event.get("status"),
-                        captured_at=row["captured_at_utc"],modified_at=event.get("lastModifiedTime"),
+                        captured_at=row["captured_at_utc"],modified_at=event.get("lastModifiedTime"),snapshot_source=source,
                         starts_at=event.get("startDateTime"),ends_at=event.get("endDateTime"))))
+            info["event_count"] = len(features)
         return features,info
 
     def map(self, params):
@@ -304,11 +489,21 @@ class CityAnalysis:
         if len(bbox)!=4 or not all(math.isfinite(value) for value in bbox) or bbox[0]>=bbox[2] or bbox[1]>=bbox[3]:
             raise ValueError("地图范围无效")
         layers = set(params.get("layers","air,bikes,roads").split(","))
+        metric = pollutant(params)
+        # KPI counts always cover both networks, even when the map filters a source.
+        kpi_params = {key:value for key,value in params.items() if key != "source"}
         with closing(self.connect()) as db:
             db.execute("BEGIN")
             air,breaks = self.air_features(db,params,start,end,cursor)
-            bikes,bike_info = self.traffic(db,"bikes",cursor)
+            bikes,bike_info = self.traffic(db,"bikes",cursor,include_bike_archive=True)
             roads,road_info = self.traffic(db,"roads",cursor)
+            kpi_features = {}
+            for current in KPI_AIR_METRICS:
+                if current == metric and not params.get("source"):
+                    kpi_features[current] = air
+                else:
+                    kpi_features[current] = self.air_features(
+                        db,{**kpi_params,"metric":current},start,end,cursor)[0]
         result = {}
         for name,features in (("air",air),("bikes",bikes),("roads",roads)):
             result[name] = dict(type="FeatureCollection",features=[
@@ -318,14 +513,108 @@ class CityAnalysis:
         for source in sorted({f["properties"]["source"] for f in air}):
             subset = [f for f in valid if f["properties"]["source"]==source]
             source_stats[source]=dict(valid=len(subset),mean=sum(f["properties"]["value"] for f in subset)/len(subset) if subset else None)
+        air_counts = {source:{} for source in ("laqn","breathe")}
+        observed = []
+        for current,features in kpi_features.items():
+            for source in air_counts:
+                air_counts[source][current] = sum(
+                    1 for item in features
+                    if item["properties"]["source"]==source and item["properties"]["value"] is not None)
+            observed.extend(item["properties"]["observed_at"] for item in features
+                            if item["properties"]["value"] is not None and item["properties"]["observed_at"])
         result.update(start=iso(start),end=iso(end),cursor=iso(cursor) if cursor else None,
-                      breaks=breaks,metric=pollutant(params),bike_info=bike_info,road_info=road_info,
-                      source_stats=source_stats,
+                      breaks=breaks,metric=metric,bike_info=bike_info,road_info=road_info,
+                      source_stats=source_stats,air_metrics=list(KPI_AIR_METRICS),
+                      air_counts=air_counts,air_info=dict(observed_at=max(observed) if observed else None),
                       coverage=dict(total=len(air),valid=len(valid),fresh=sum(not f["properties"]["stale"] for f in valid)),
                       counts=dict(bikes=len(bikes),empty=sum(f["properties"]["state"]=="empty" for f in bikes),
                                   full=sum(f["properties"]["state"]=="full" for f in bikes),
                                   available=sum(f["properties"]["state"]=="available" for f in bikes),roads=len(roads)))
         return result
+
+    def bike_timeline(self, params):
+        start, end = bike_window(params)
+        query = bike_batch_params(start, end)
+        with closing(self.connect()) as db:
+            db.execute("BEGIN")
+            batches = bike_batch_sources(db, query)
+            stations = bike_station_catalog(db, batches)
+        return dict(start=start, end=end, batches=list(batches), stations=stations,
+                    batch_meta={stamp: bike_batch_metadata(source) for stamp, source in batches.items()},
+                    radius_m=BIKE_RADIUS_M, tight_max=BIKE_TIGHT_MAX,
+                    freshness_seconds=TRAFFIC_FRESH_SECONDS)
+
+    def bike_frame(self, params):
+        if not params.get("captured_at"):
+            raise ValueError("请选择自行车快照时间")
+        captured_at = iso(dt(params["captured_at"]))
+        with closing(self.connect()) as db:
+            db.execute("BEGIN")
+            sources = bike_batch_sources(db, bike_batch_params(captured_at, captured_at))
+            source = sources.get(captured_at)
+            if source is None:
+                raise LookupError("没有该时刻的自行车快照")
+            table = BIKE_SNAPSHOT_TABLES[source]
+            stations = [dict(id=row["source_id"], name=row["name"] or row["source_id"],
+                             coordinates=bike_coordinates(row), bikes=bike_count(row["bikes"]),
+                             empty_docks=bike_count(row["empty_docks"]), capacity=bike_count(row["capacity"]))
+                        for row in db.execute(f"""
+                SELECT source_id,name,longitude,latitude,bikes,empty_docks,capacity
+                FROM {table} WHERE captured_at_utc=? ORDER BY source_id""", (captured_at,))]
+        return dict(captured_at=captured_at, stations=stations, **bike_batch_metadata(source))
+
+    def bike_station(self, params):
+        start, end = bike_window(params)
+        site = params.get("site")
+        if not site:
+            raise ValueError("请选择自行车站")
+        with closing(self.connect()) as db:
+            db.execute("BEGIN")
+            sources = bike_batch_sources(db, bike_batch_params(start, end))
+            points = {stamp: {"captured_at": stamp, "bikes": None, "empty_docks": None,
+                              "neighbors": [], "borrow": None, "return": None} for stamp in sources}
+            centers = {}
+            # Latitude bounds prune candidates before measuring great-circle distance.
+            latitude_span = math.degrees(BIKE_RADIUS_M / EARTH_RADIUS_M) + 1e-9
+            for source in set(sources.values()):
+                table = BIKE_SNAPSHOT_TABLES[source]
+                for row in db.execute(f"""
+                    SELECT captured_at_utc,longitude,latitude,bikes,empty_docks
+                    FROM {table} WHERE source_id=? AND captured_at_utc BETWEEN ? AND ?""", (site, start, end)):
+                    stamp = row["captured_at_utc"]
+                    if sources.get(stamp) != source:
+                        continue
+                    coordinates = bike_coordinates(row)
+                    if coordinates is not None:
+                        centers[stamp] = coordinates
+                    points[stamp].update(bikes=bike_count(row["bikes"]), empty_docks=bike_count(row["empty_docks"]))
+                for row in db.execute(f"""
+                    SELECT n.captured_at_utc,n.source_id,n.longitude,n.latitude,n.bikes,n.empty_docks
+                    FROM {table} AS c JOIN {table} AS n
+                      ON n.captured_at_utc=c.captured_at_utc AND n.source_id<>c.source_id
+                    WHERE c.source_id=? AND c.captured_at_utc BETWEEN ? AND ?
+                      AND n.latitude BETWEEN c.latitude-? AND c.latitude+?""",
+                                      (site, start, end, latitude_span, latitude_span)):
+                    stamp = row["captured_at_utc"]
+                    if sources.get(stamp) != source:
+                        continue
+                    center, coordinates = centers.get(stamp), bike_coordinates(row)
+                    if center is None or coordinates is None:
+                        continue
+                    meters = distance(center, coordinates)
+                    # Allow floating-point rounding at the 500 m boundary.
+                    if meters <= BIKE_RADIUS_M + 1e-6:
+                        points[stamp]["neighbors"].append((meters, row["source_id"],
+                                                           bike_count(row["bikes"]), bike_count(row["empty_docks"])))
+        for stamp in centers:
+            point = points[stamp]
+            neighbors = sorted(point["neighbors"])
+            for mode, field, column in (("borrow", "bikes", 2), ("return", "empty_docks", 3)):
+                if point[field] is not None:
+                    counts = [row[column] for row in neighbors if row[column] is not None]
+                    point[mode] = dict(tight=sum(count <= BIKE_TIGHT_MAX for count in counts), valid=len(counts))
+            point["neighbors"] = [dict(id=row[1], distance_m=round(row[0])) for row in neighbors]
+        return dict(site=site, points=list(points.values()))
 
     def series(self, params):
         start,end,cursor = window(params)
@@ -333,22 +622,33 @@ class CityAnalysis:
         source = params.get("source","laqn")
         if source not in AIR_SOURCES:
             raise ValueError("未知来源")
+        if metric not in SOURCE_AIR_METRICS[source]:
+            raise ValueError("所选数据来源不提供 "+metric+" 观测")
         sites = [site for site in params.get("sites",params.get("site","")).split(",") if site]
         if len(sites)>4:
             raise ValueError("最多对比 4 个站点")
         with closing(self.connect()) as db:
             db.execute("BEGIN")
             rows = self.air_rows(db,source,metric,start,end)
-            if cursor:
-                rows = [row for row in rows if dt(row["valid_at_utc"])<=cursor]
             locations = self.locations(db,source,source=="breathe_wcc")
             valid_ids = {item["source_id"] for item in locations}
+            # Only stations that actually observed this pollutant in the window
+            # can be compared: LAQN sites report different species, and Breathe
+            # London sensors have no PM10 or O3 at all. Capability ignores the
+            # replay cursor so the comparable list stays stable while replaying.
+            observed = {row["source_id"] for row in rows
+                        if row["value_num"] is not None and row["source_id"] in valid_ids}
+            if cursor:
+                rows = [row for row in rows if dt(row["valid_at_utc"])<=cursor]
             groups = {}
             for row in rows:
                 if row["source_id"] in valid_ids:
                     groups.setdefault(row["source_id"],[]).append(row)
+            capable = [item for item in locations if item["source_id"] in observed]
+            capable_ids = {item["source_id"] for item in capable}
+            sites = [site for site in sites if site in capable_ids]
             if not sites:
-                sites = [min(groups)] if groups else [locations[0]["source_id"]] if locations else []
+                sites = [capable[0]["source_id"]] if capable else []
             names = {item["source_id"]:item["name"] for item in locations}
             station_series = []
             for site in sites:
@@ -368,7 +668,7 @@ class CityAnalysis:
               WHERE source=? AND metric=?""",(source,metric+"_CONCENTRATION")).fetchone()
             hourly_total = max(1,math.ceil(((cursor or end)-start).total_seconds()/3600))
             boroughs = {}
-            for location in locations:
+            for location in capable:
                 borough = json.loads(location["metadata_json"]).get("Borough") or "行政区未提供"
                 item = boroughs.setdefault(borough,dict(name=borough,stations=0,valid_hours=0))
                 item["stations"]+=1
@@ -382,8 +682,8 @@ class CityAnalysis:
                   ORDER BY captured_at_utc""",(bike_site,iso(start),bike_end))]
         return dict(source=source,metric=metric,start=iso(start),end=iso(end),bounds=list(bounds),
                     stations=station_series,
-                    available_sites=[dict(id=item["source_id"],name=item["name"],kind=item["kind"]) for item in locations],
-                    coverage=[dict(time=time,count=count,total=len(locations)) for time,count in sorted(coverage.items())],
+                    available_sites=[dict(id=item["source_id"],name=item["name"],kind=item["kind"]) for item in capable],
+                    coverage=[dict(time=time,count=count,total=len(capable)) for time,count in sorted(coverage.items())],
                     boroughs=[{**item,"coverage":min(1,item["valid_hours"]/(item["stations"]*hourly_total))}
                               for item in boroughs.values()],bike_series=bike_series)
 
@@ -500,7 +800,7 @@ class CityAnalysis:
         with closing(self.connect()) as db:
             db.execute("BEGIN")
             air,_ = self.air_features(db,air_params,start,end,cursor)
-            bikes,bike_info = self.traffic(db,"bikes",cursor)
+            bikes,bike_info = self.traffic(db,"bikes",cursor,include_bike_archive=True)
             roads,road_info = self.traffic(db,"roads",cursor)
             if kind == "point":
                 anchor = feature(dict(type="Point", coordinates=center), {})
@@ -563,6 +863,54 @@ class CityAnalysis:
             result["local_air_by_metric"] = local_readings
         return result
 
+    def london_weather_mean(self, db, candidates, start, end, cursor):
+        """Hourly arithmetic mean of the London-area Met Office stations.
+
+        Each of the four display metrics is averaged over the stations that
+        actually reported it for that hour; missing values are never treated as
+        zero and non-numeric codes are not averaged. ``samples`` records how many
+        stations contributed.
+        """
+        ids = [row["source_id"] for row in candidates]
+        if not ids:
+            return dict(station="london-mean", station_name=None, latest=None, station_count=0)
+        placeholders = ",".join("?" * len(ids))
+        rows = db.execute(
+            f"""SELECT * FROM measurements WHERE source='metoffice'
+            AND source_id IN ({placeholders}) AND valid_at_utc>=? AND valid_at_utc<?
+            ORDER BY valid_at_utc""", (*ids, iso(start), iso(end))).fetchall()
+        hours, reporting = {}, set()
+        for row in rows:
+            observed = dt(row["valid_at_utc"])
+            if cursor and observed > cursor:
+                continue
+            reporting.add(row["source_id"])
+            hour = iso(observed.replace(minute=0, second=0, microsecond=0))
+            hours.setdefault(hour, {}).setdefault(row["metric"], []).append(row)
+        latest = None
+        for hour in sorted(hours, reverse=True):
+            metrics = hours[hour]
+            if not any(any(r["value_num"] is not None for r in metrics.get(field, []))
+                       for field in WEATHER_MEAN_FIELDS):
+                continue
+            point = dict(time=hour)
+            for metric in WEATHER_MEAN_FIELDS:
+                readings = metrics.get(metric, [])
+                values = [r["value_num"] for r in readings if r["value_num"] is not None]
+                if not values:
+                    continue
+                unit = next((r["unit"] for r in readings if r["unit"]), None) \
+                    or WEATHER_UNITS.get(metric.lower())
+                point[metric] = dict(value_num=round(sum(values) / len(values),
+                                                    WEATHER_MEAN_PRECISION.get(metric, 1)),
+                                     unit=unit, quality="U", samples=len(values))
+            latest = point
+            break
+        count = len(reporting)
+        return dict(station="london-mean",
+                    station_name=f"伦敦 {count} 站平均" if count else None,
+                    latest=latest, station_count=count)
+
     def weather(self, params):
         start,end,cursor = window(params)
         source = params.get("source","laqn")
@@ -578,6 +926,8 @@ class CityAnalysis:
                 AND (lower(json_extract(l.metadata_json,'$.area')) IN ('greater london','london')
                      OR lower(json_extract(l.metadata_json,'$.region'))='london')
               GROUP BY l.source_id ORDER BY count DESC,l.source_id""",(iso(start),iso(selection_end)))]
+            if params.get("aggregate") == "mean":
+                return self.london_weather_mean(db, candidates, start, selection_end, cursor)
             station = params.get("weather_site") or (candidates[0]["source_id"] if candidates else None)
             if station and station not in {item["source_id"] for item in candidates}:
                 raise ValueError("请选择伦敦区域气象站")
@@ -591,7 +941,7 @@ class CityAnalysis:
                     time = iso(observed.replace(minute=0,second=0,microsecond=0))
                     weather_points.setdefault(time,dict(time=time))[row["metric"]] = dict(row)
             if params.get("context_only") == "1":
-                fields = ("TEMPERATURE", "RELATIVE_HUMIDITY", "WIND_SPEED")
+                fields = ("TEMPERATURE", "HUMIDITY", "WIND_SPEED")
                 latest = next((point for point in reversed(weather_points.values())
                                if any(point.get(field, {}).get("value_num") is not None for field in fields)), None)
                 station_name = next((item["name"] for item in candidates if item["source_id"] == station), None)
@@ -614,4 +964,4 @@ class CityAnalysis:
                 correlation = sum((x-mx)*(y-my) for x,y in zip(xs,ys))/denominator
         return dict(station=station,candidates=[dict(id=row["source_id"],name=row["name"],count=row["count"]) for row in candidates],
                     points=list(weather_points.values()),pairs=pairs,sample_count=len(pairs),correlation=correlation,
-                    unit_note="气象接口未提供单位，沿用来源数值",minimum_pairs=24)
+                    unit_note="风速 m/s · 温度 °C · 湿度 %",minimum_pairs=24)

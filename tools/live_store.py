@@ -94,6 +94,26 @@ def connect(path=DB):
       PRIMARY KEY(captured_at_utc,source_id));
     CREATE INDEX IF NOT EXISTS idx_bike_snapshots_site_time
       ON bike_snapshots(source_id,captured_at_utc);
+    CREATE TABLE IF NOT EXISTS bike_archive_files (
+      path TEXT NOT NULL, version TEXT NOT NULL, sha256 TEXT NOT NULL,
+      imported_at_utc TEXT NOT NULL, PRIMARY KEY(path,version));
+    CREATE TABLE IF NOT EXISTS bike_archive_batches (
+      captured_at_utc TEXT PRIMARY KEY, file_path TEXT NOT NULL,
+      file_version TEXT NOT NULL, record_count INTEGER NOT NULL,
+      FOREIGN KEY(file_path,file_version) REFERENCES bike_archive_files(path,version));
+    CREATE TABLE IF NOT EXISTS bike_archive_snapshots (
+      captured_at_utc TEXT NOT NULL REFERENCES bike_archive_batches(captured_at_utc),
+      source_id TEXT NOT NULL, name TEXT, longitude REAL, latitude REAL,
+      bikes INTEGER, empty_docks INTEGER, capacity INTEGER,
+      PRIMARY KEY(captured_at_utc,source_id));
+    CREATE INDEX IF NOT EXISTS idx_bike_archive_snapshots_site_time
+      ON bike_archive_snapshots(source_id,captured_at_utc);
+    CREATE TABLE IF NOT EXISTS road_archive_imports (
+      revision TEXT PRIMARY KEY, sha256 TEXT NOT NULL, imported_at_utc TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS road_archive_batches (
+      captured_at_utc TEXT PRIMARY KEY,
+      revision TEXT NOT NULL REFERENCES road_archive_imports(revision),
+      record_count INTEGER NOT NULL, payload_json TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS traffic_archive_imports (
       fetch_id INTEGER PRIMARY KEY, status TEXT NOT NULL, error TEXT);
     CREATE INDEX IF NOT EXISTS idx_measurements_time ON measurements(metric,valid_at_utc);
@@ -197,6 +217,22 @@ def measurement(db, source, sid, metric, source_time, valid_at, period, basis,
       raw_sha256=excluded.raw_sha256,revision=measurements.revision+1""",
       key[:3] + (str(source_time),valid_at,int(period),basis,value_num,value_text,unit,quality,fetched_at or utcnow(),sha,1))
     return True
+
+
+def backfill_met_units(db, units):
+    """Fill units for Met Office numeric observations recorded before unit mapping.
+
+    Units come from the upstream product glossary; codes keep no unit. Idempotent:
+    only rows with a numeric value and a NULL unit are touched.
+    """
+    changed = 0
+    for metric, unit in units.items():
+        changed += db.execute(
+            "UPDATE measurements SET unit=? WHERE source='metoffice' AND metric=? "
+            "AND unit IS NULL AND value_num IS NOT NULL",
+            (unit, metric.upper())).rowcount
+    db.commit()
+    return changed
 
 
 def road_event(db, event_id, payload, seen_at=None):

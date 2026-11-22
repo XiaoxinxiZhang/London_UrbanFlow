@@ -16,6 +16,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"tools"))
 import live_store as store
 from collector_lock import CollectorLock
 from live_api import LiveAPI, UpdateManager
+from live_sources import WEATHER_UNITS
 from server import create_server
 
 
@@ -123,6 +124,24 @@ class LiveAPITests(unittest.TestCase):
         self.assertEqual(len(road["versions"]),1)
         self.assertEqual(json.loads(road["geometry_json"])["type"],"Point")
         self.assertEqual(self.api.roads({})["total"],1)
+
+    def test_backfill_met_units_fills_numeric_rows_only(self):
+        stamp = "2026-11-18T02:00:00+00:00"
+        with closing(store.connect(self.path)) as db:
+            store.measurement(db,"metoffice","abc","MSLP",stamp,stamp,3600,"hourly_report",value_num=1011)
+            store.measurement(db,"metoffice","abc","TEMPERATURE",stamp,stamp,3600,"hourly_report",
+                              value_num=6.5,unit="C")
+            store.measurement(db,"metoffice","abc","WIND_DIRECTION",stamp,stamp,3600,
+                              "hourly_report",value_text="NW")
+            db.commit()
+            self.assertEqual(store.backfill_met_units(db, WEATHER_UNITS), 1)
+            units = {row["metric"]: row["unit"] for row in db.execute(
+                "SELECT metric,unit FROM measurements WHERE source='metoffice' "
+                "AND source_id='abc' AND valid_at_utc=?", (stamp,))}
+            self.assertEqual(units["MSLP"], "hPa")
+            self.assertEqual(units["TEMPERATURE"], "C")
+            self.assertIsNone(units["WIND_DIRECTION"])
+            self.assertEqual(store.backfill_met_units(db, WEATHER_UNITS), 0)
 
     def test_lock_blocks_another_collector_process(self):
         lock = CollectorLock(self.path)

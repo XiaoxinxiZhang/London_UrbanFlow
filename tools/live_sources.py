@@ -15,6 +15,10 @@ BREATHE_MAP_BASIS = "breathe_website_map"
 BREATHE_CHART_BASIS = "breathe_website_chart"
 WEATHER_FIELDS = {"weather_code", "wind_direction", "wind_gust", "visibility", "humidity",
                   "mslp", "temperature", "wind_speed", "pressure_tendency"}
+# Units are defined by the Met Office Land Observations product glossary, not the
+# response payload. Codes (weather code, wind direction, pressure tendency) have no unit.
+WEATHER_UNITS = {"temperature": "°C", "humidity": "%", "mslp": "hPa",
+                 "wind_speed": "m/s", "wind_gust": "m/s", "visibility": "m"}
 
 
 def many(value):
@@ -306,5 +310,5 @@ def weather_measurements(payload,geohash):
             out.append(dict(sid=geohash,metric=metric.upper(),source_time=t,
                             valid_at=utc(t),period=3600,basis="hourly_report",
                             value_num=numeric,value_text=None if numeric is not None else str(v),
-                            unit=None,quality="U"))
+                            unit=WEATHER_UNITS.get(metric),quality="U"))
     return out

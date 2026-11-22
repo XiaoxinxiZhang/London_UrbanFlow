@@ -17,6 +17,7 @@ import live_store as store
 from collector_lock import collector_running
 from city_analysis import CityAnalysis
 from live_sources import EXCLUDED_INDEX_METRICS, breathe_site_metadata
+from road_archive import SOURCE as ROAD_ARCHIVE_SOURCE
 
 SOURCES = {"laqn", "breathe", "breathe_wcc", "tfl", "metoffice"}
 VISIBLE_MEASUREMENT = "m.metric NOT IN (" + ",".join("?" for _ in EXCLUDED_INDEX_METRICS) + ")"
@@ -166,9 +167,9 @@ class LiveAPI:
             if params.get("id"):
                 row = db.execute("SELECT * FROM road_events WHERE source='tfl' AND event_id=?",
                                  (params["id"],)).fetchone()
-                if row is None:
+                if row is None and not params.get("at"):
                     raise LookupError("道路事件不存在")
-                result = dict(row)
+                result = dict(row) if row else {"event_id": params["id"], "source": "tfl"}
                 if params.get("at"):
                     at = timestamp(params["at"])
                     cutoff = datetime.fromisoformat(at)
@@ -177,12 +178,24 @@ class LiveAPI:
                     if event is None:
                         raise LookupError("该回放时刻没有可用的事件快照")
                     properties = event["properties"]
+                    archived = properties.get("snapshot_source") == ROAD_ARCHIVE_SOURCE
+                    if archived:
+                        result = {"event_id": params["id"], "source": "tfl", "snapshot_source": ROAD_ARCHIVE_SOURCE}
                     result.update(location_text=properties["name"],category=properties["category"],
                                   severity=properties["severity"],status=properties["status"],
                                   starts_at_utc=properties["starts_at"],ends_at_utc=properties["ends_at"],
-                                  modified_at_utc=properties["modified_at"],last_seen_utc=info["captured_at"],
+                                  modified_at_utc=properties["modified_at"],
                                   geometry_json=json.dumps(event["geometry"]),is_active=1)
-                    versions = db.execute("""SELECT * FROM event_versions WHERE source='tfl' AND event_id=?
+                    if info.get("reconstructed"):
+                        # The event list itself was not observed at this hour; keep
+                        # its real last sighting and expose how the replay was built.
+                        result["replay_mode"] = "reconstructed"
+                        result["replayed_at_utc"] = at
+                        if archived:
+                            result["last_seen_utc"] = info["replay_window"]["before"]
+                    else:
+                        result["last_seen_utc"] = info["captured_at"]
+                    versions = [] if archived else db.execute("""SELECT * FROM event_versions WHERE source='tfl' AND event_id=?
                       AND replaced_at_utc<=? ORDER BY old_revision DESC""",(params["id"],at))
                 else:
                     versions = db.execute("SELECT * FROM event_versions WHERE source='tfl' AND event_id=? ORDER BY old_revision DESC",
@@ -221,7 +234,7 @@ class LiveAPI:
                 row["stale_run"] = bool(success and now-datetime.fromisoformat(success)>timedelta(seconds=2*interval+300))
                 last = row.get("latest_observation_utc")
                 threshold = 15*60 if name=="tfl_bikes" else 27*3600 if name=="met_hourly" else 3*3600
-                row["stale_data"] = bool(last and name!="tfl_roads" and
+                row["stale_data"] = bool(last and name not in ("tfl_roads","tfl_bike_archive","tfl_road_archive") and
                                          now-datetime.fromisoformat(last)>timedelta(seconds=threshold))
                 jobs.append(row)
             jobs.extend(row for row in saved.values() if row["source"]=="breathe_wcc")

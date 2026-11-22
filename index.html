@@ -13,7 +13,8 @@
 <script src="assets/vendor/echarts-5.6.0.min.js" defer></script>
 <script src="assets/live.js" defer></script>
 <script src="assets/insights.js?v=20261118" defer></script>
-<script src="assets/city.js?v=20261118" defer></script>
+<script src="assets/bike-analysis.js" defer></script>
+<script src="assets/city.js?v=20261122" defer></script>
 <script src="assets/journey.js?v=20261118" defer></script>
 </head>
 <body>
@@ -39,7 +40,13 @@
   <nav class="page-tabs" aria-label="页面"><button data-page="overview" class="active" aria-current="page">城市总览</button><button data-page="journey">智慧出行</button><button data-page="analysis">环境与交通分析</button><button data-page="tables">数据中心</button></nav>
   <div id="cityError" class="notice error" hidden role="alert"></div>
   <section id="cityOverview">
-    <div id="cityKpis" class="city-kpis"></div>
+    <div class="city-kpis">
+      <section class="city-kpi city-kpi-weather" aria-labelledby="weatherKpiTitle">
+        <h2 id="weatherKpiTitle">伦敦气象背景</h2>
+        <div id="outlookWeather" class="city-kpi-weather-body" aria-live="polite"><div class="city-kpi-body"><p class="muted">选点后查看气象观测。</p></div><small class="city-kpi-foot">&nbsp;</small></div>
+      </section>
+      <div id="cityKpis" class="city-kpi-cards"></div>
+    </div>
     <div class="city-grid">
       <section class="panel geo-panel">
         <div class="panel-title">
@@ -53,7 +60,12 @@
               <button id="pickOverviewLocation" type="button" aria-pressed="false" disabled>选点</button>
             </div>
           </div>
-          <div class="replay" id="replayControls" hidden><button id="replayPlay" type="button">播放</button><input id="replayHour" type="range" min="0" max="47" value="47" aria-label="回放小时" aria-describedby="replayLabel"><output id="replayLabel" for="replayHour"></output></div>
+          <div class="replay" id="replayControls" hidden>
+            <button id="replayPlay" type="button">播放</button>
+            <select id="replayRange" aria-label="回放范围"><option value="48h">最近 48 小时</option><option value="7d">最近 7 天</option></select>
+            <input id="replayHour" type="range" min="0" max="47" value="47" aria-label="回放小时" aria-describedby="replayLabel">
+            <output id="replayLabel" for="replayHour"></output>
+          </div>
         </div>
         <div class="map-workspace">
           <details class="gis-sidebar" open>
@@ -145,17 +157,32 @@
         <section id="outlookPanel-advice" class="outlook-section" role="tabpanel" aria-labelledby="outlookTab-advice">
           <div class="outlook-heading"><label>关注人群<select id="healthGroup"><option value="general">健康人群</option><option value="older">老年人</option><option value="children">儿童与照护者</option><option value="asthma">哮喘人群</option><option value="heartlung">其他心肺疾病人群</option></select></label></div>
           <div id="citizenCard" class="citizen-card" role="status"></div>
-          <div class="outlook-weather"><h3>伦敦气象背景</h3><div id="outlookWeather" aria-live="polite"><p class="muted">选点后查看气象观测。</p></div></div>
         </section>
         <section id="outlookPanel-air" class="outlook-section" role="tabpanel" aria-labelledby="outlookTab-air" tabindex="0" hidden>
           <div id="localAir" aria-live="polite"><p class="muted">选点后查看附近的污染物浓度。</p></div>
         </section>
         <section id="outlookPanel-nearby" class="outlook-section nearby-panel" role="tabpanel" aria-labelledby="outlookTab-nearby" hidden>
-          <p id="nearbySummary" aria-live="polite"></p>
-          <div class="link-controls"><label><span class="range-key">自行车 / 监测点范围</span><select id="nearRadius"><option value="500">500 米</option><option value="1000">1 公里</option><option value="2000">2 公里</option></select></label><label><span class="range-key road-range">道路事件范围</span><select id="roadRadius"><option value="500">500 米</option><option value="1000" selected>1 公里</option><option value="2000">2 公里</option></select></label></div>
-          <div id="nearbyContent" class="nearby-content" aria-live="polite"><p class="muted">选点后查看周边资源。</p></div>
-          <p id="miniTrendLabel" class="mini-trend-label muted"></p>
-          <div id="miniTrend" class="chart compact-chart" aria-label="监测站污染物观测趋势" hidden></div>
+          <div class="link-controls"><label><span class="range-key">自行车 / 监测点范围</span><select id="nearRadius"><option value="500">500 米</option><option value="1000" selected>1 公里</option><option value="2000">2 公里</option></select></label><label><span class="range-key road-range">道路事件范围</span><select id="roadRadius"><option value="500">500 米</option><option value="1000" selected>1 公里</option><option value="2000">2 公里</option></select></label></div>
+          <div id="nearbyContent" class="nearby-content" aria-live="polite">
+            <p id="nearbyStatus" class="muted">选点后查看周边资源。</p>
+            <div id="nearbyDetails" hidden>
+              <div id="nearbyStat" class="nearby-stat"></div>
+              <div class="nearby-tabs" role="tablist" aria-label="周边明细">
+                <button id="nearbyTab-bikes" type="button" role="tab" aria-selected="true" aria-controls="nearbyPanel-bikes">自行车站 <span id="nearbyBikesCount" class="nearby-tab-count"></span></button>
+                <button id="nearbyTab-roads" type="button" role="tab" aria-selected="false" aria-controls="nearbyPanel-roads" tabindex="-1">道路事件 <span id="nearbyRoadsCount" class="nearby-tab-count"></span></button>
+                <button id="nearbyTab-air" type="button" role="tab" aria-selected="false" aria-controls="nearbyPanel-air" tabindex="-1">监测点 <span id="nearbyAirCount" class="nearby-tab-count"></span></button>
+              </div>
+              <div id="nearbyPanel-bikes" class="nearby-detail" role="tabpanel" aria-labelledby="nearbyTab-bikes" tabindex="0">
+                <ul id="nearbyBikesList" class="nearby-list"></ul>
+              </div>
+              <div id="nearbyPanel-roads" class="nearby-detail" role="tabpanel" aria-labelledby="nearbyTab-roads" tabindex="0" hidden>
+                <ul id="nearbyRoadsList" class="nearby-list"></ul>
+              </div>
+              <div id="nearbyPanel-air" class="nearby-detail" role="tabpanel" aria-labelledby="nearbyTab-air" tabindex="0" hidden>
+                <ul id="nearbyAirList" class="nearby-list"></ul>
+              </div>
+            </div>
+          </div>
           <div id="selectedActions" class="link-buttons" hidden><button id="openSelected" type="button">元数据与原始记录</button><button id="analyseSelected" type="button">分析此站</button></div>
         </section>
       </aside>
@@ -221,10 +248,11 @@
     </aside>
   </section>
   <section id="cityAnalysis" hidden>
-    <div class="panel analysis-selection">
-      <label>分析来源<select id="analysisSource"><option value="laqn">LAQN 参考站</option><option value="breathe">Breathe London 传感器</option></select></label>
-      <label>污染指标<select id="analysisMetric"></select></label>
-      <div class="compare-select">
+    <nav class="analysis-tabs" aria-label="分析模块"><button type="button" data-analysis-tab="series" class="active" aria-pressed="true">污染趋势</button><button type="button" data-analysis-tab="heatmap" aria-pressed="false">小时热力</button><button type="button" data-analysis-tab="coverage" aria-pressed="false">覆盖与缺测</button><button type="button" data-analysis-tab="weather" aria-pressed="false">气象关联</button><button type="button" data-analysis-tab="bike" aria-pressed="false">自行车时空分析</button><button type="button" data-analysis-tab="borough" aria-pressed="false">行政区覆盖</button></nav>
+    <div id="analysisSelection" class="panel analysis-selection" role="group" aria-label="当前分析模块参数">
+      <label data-analysis-control="source">分析来源<select id="analysisSource"><option value="laqn">LAQN 参考站</option><option value="breathe">Breathe London 传感器</option></select></label>
+      <label data-analysis-control="metric">污染指标<select id="analysisMetric"></select></label>
+      <div class="compare-select" data-analysis-control="compare">
         <span id="compareStationsLabel">对比站点（最多 4 站）</span>
         <details id="compareStationsPicker">
           <summary id="compareStationsToggle" aria-labelledby="compareStationsLabel compareStationsSummary"><span id="compareStationsSummary" aria-live="polite">请选择站点</span></summary>
@@ -233,22 +261,130 @@
           </div>
         </details>
       </div>
-      <label>时间粒度<select id="analysisInterval"><option value="3600">小时（优先来源小时值）</option><option value="900">15 分钟（LAQN）</option></select></label>
-      <label>伦敦气象背景站<select id="weatherStation"><option value="">按有效观测数选择</option></select></label>
+      <label data-analysis-control="interval">时间粒度<select id="analysisInterval"><option value="3600">小时（优先来源小时值）</option><option value="900">15 分钟（LAQN）</option></select></label>
+      <label data-analysis-control="weather" hidden>伦敦气象背景站<select id="weatherStation"><option value="">按有效观测数选择</option></select></label>
       <button id="analysisApply" class="primary">更新分析</button>
     </div>
-    <div id="analysisNote" class="notice"></div>
-    <nav class="analysis-tabs" aria-label="分析图表"><button type="button" data-analysis-tab="series" class="active">污染趋势</button><button type="button" data-analysis-tab="heatmap">小时热力</button><button type="button" data-analysis-tab="coverage">覆盖与缺测</button><button type="button" data-analysis-tab="weather">气象关联</button><button type="button" data-analysis-tab="bike">自行车时序</button><button type="button" data-analysis-tab="borough">行政区覆盖</button></nav>
     <section class="panel" data-analysis-section="series"><div class="panel-title"><h2>污染变化与站点对比</h2><span id="seriesSummary"></span></div><div id="pollutionChart" class="chart" aria-label="污染时间序列"></div></section>
-    <div class="analysis-grid">
+    <div class="analysis-grid" id="analysisGrid">
       <section class="panel" data-analysis-section="heatmap" hidden><div class="panel-title"><h2>日期 × 小时污染变化</h2></div><p id="heatmapNote" class="chart-note" role="status"></p><div id="pollutionHeatmap" class="chart" aria-label="污染小时热力图"></div></section>
       <section class="panel" data-analysis-section="coverage" hidden><div class="panel-title"><h2>有效监测站覆盖</h2></div><div id="coverageChart" class="chart" aria-label="逐小时覆盖率"></div></section>
       <section class="panel" data-analysis-section="coverage" hidden><div class="panel-title"><h2>缺测时段分布</h2></div><div id="missingHeatmap" class="chart" aria-label="缺测小时热力图"></div></section>
       <section class="panel" data-analysis-section="weather" hidden><div class="panel-title"><h2>污染与气象同步变化</h2></div><div id="weatherChart" class="chart" aria-label="污染与气象时序"></div><p id="weatherNote" class="chart-note"></p></section>
       <section class="panel" data-analysis-section="weather" hidden><div class="panel-title"><h2>风速与污染的小时配对</h2></div><div id="weatherScatter" class="chart" aria-label="风速污染散点图"></div><p id="correlationNote" class="chart-note"></p></section>
-      <section class="panel" data-analysis-section="bike" hidden><div class="panel-title"><h2>自行车车辆与空位变化</h2></div><div class="bike-choice"><label>自行车站<select id="bikeStation"></select></label></div><div id="bikeChart" class="chart" aria-label="自行车快照时序"></div><p id="bikeNote" class="chart-note"></p></section>
+      <div id="bikeAnalysis" data-analysis-section="bike" hidden>
+        <div class="panel bike-analysis-toolbar">
+          <div class="panel-title bike-analysis-title">
+            <h2>自行车站点分析</h2>
+            <div class="bike-analysis-modes" role="group" aria-label="借还车指标">
+              <button id="bikeBorrow" type="button" aria-pressed="true">借车</button>
+              <button id="bikeReturn" type="button" aria-pressed="false">还车</button>
+            </div>
+            <div class="bike-analysis-tools">
+              <select id="bikeStation" aria-label="自行车站" disabled><option value="">选择自行车站</option></select>
+              <button id="bikeApply" class="primary" type="button">更新分析</button>
+            </div>
+            <nav class="bike-analysis-views" aria-label="自行车分析视图">
+              <button id="bikeShowMap" type="button" aria-controls="bikeMapView" aria-pressed="true">地图与回放</button>
+              <button id="bikeShowTrends" type="button" aria-controls="bikeTrends" aria-pressed="false">趋势</button>
+            </nav>
+          </div>
+        </div>
+        <div id="bikeMapView" class="bike-analysis-workspace">
+          <section class="panel bike-analysis-map-panel" aria-label="自行车地图与回放">
+            <div class="bike-analysis-legend">
+              <strong id="bikeLegendMetric">可用车辆</strong>
+              <span class="bike-zero">0</span><span class="bike-low">1–2</span>
+              <span class="bike-available">≥3</span><span class="bike-unknown">未知</span>
+              <span class="bike-cluster-key">聚合显示紧张站数 / 有效站数</span>
+            </div>
+            <div id="bikeMap" aria-label="伦敦自行车站点地图"></div>
+            <p id="bikeMapNotice" class="bike-analysis-message" role="status" hidden></p>
+            <div class="bike-replay">
+              <div class="bike-replay-header">
+                <div class="bike-replay-actions">
+                  <button id="bikePrevious" type="button" disabled>上一批</button>
+                  <button id="bikePlay" type="button" disabled>播放</button>
+                  <button id="bikeNext" type="button" disabled>下一批</button>
+                </div>
+                <div class="bike-replay-time">
+                  <output id="bikeTime" for="bikeTimeSlider" aria-live="off"></output>
+                  <div class="bike-capture-details">
+                    <p id="bikeCapture" class="bike-analysis-message">正在读取批次…</p>
+                    <a id="bikeArchiveCredit" href="https://huggingface.co/datasets/feregrino/london-cycles" target="_blank" rel="noopener" hidden>归档来源</a>
+                  </div>
+                </div>
+              </div>
+              <input id="bikeTimeSlider" type="range" step="1" disabled aria-label="自行车回放时间" aria-describedby="bikeCapture">
+              <div id="bikeGaps" class="bike-replay-gaps" aria-hidden="true"></div>
+              <div class="bike-replay-range"><span id="bikeTimeStart"></span><span id="bikeTimeEnd"></span></div>
+            </div>
+          </section>
+          <section class="panel bike-analysis-nearby" aria-labelledby="bikeNearbyTitle">
+            <div class="panel-title"><h2 id="bikeNearbyTitle">500 米内的邻站</h2></div>
+            <div class="bike-analysis-nearby-body">
+              <div id="bikeCurrent" class="bike-current" hidden>
+                <h3 id="bikeCurrentName"></h3>
+                <dl>
+                  <div><dt>可用车辆</dt><dd id="bikeCurrentBikes">—</dd></div>
+                  <div><dt>空位</dt><dd id="bikeCurrentDocks">—</dd></div>
+                  <div><dt>容量</dt><dd id="bikeCurrentCapacity">—</dd></div>
+                </dl>
+              </div>
+              <p id="bikeNearbyStatus" class="bike-analysis-message">选择站点后显示邻站。</p>
+              <table id="bikeNeighborTable" class="bike-neighbors" hidden>
+                <thead><tr><th scope="col">邻站</th><th scope="col">车辆</th><th scope="col">空位</th><th scope="col">容量</th></tr></thead>
+                <tbody id="bikeNeighbors"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+        <div id="bikeTrends" hidden>
+          <p id="bikeTrendStatus" class="bike-analysis-message" role="status" hidden></p>
+          <p id="bikeTrendEmpty" class="bike-analysis-message" role="status">请选择自行车站查看趋势。</p>
+          <div id="bikeTrendCharts" class="bike-analysis-trends" hidden>
+            <section class="panel">
+              <div class="panel-title"><h2>本站车辆与空位变化</h2></div>
+              <div id="bikeChart" class="chart" aria-label="本站车辆与空位阶梯线"></div>
+              <p id="bikeNote" class="chart-note" role="status"></p>
+            </section>
+            <section class="panel">
+              <div class="panel-title"><h2>周边紧张站点占比</h2><span id="bikePressureMode">借车</span></div>
+              <div id="bikePressureChart" class="chart" aria-label="周边紧张站点占比时间序列"></div>
+              <p id="bikePressureNote" class="chart-note"></p>
+            </section>
+          </div>
+        </div>
+      </div>
     </div>
-    <section class="panel" data-analysis-section="borough" hidden><div class="panel-title"><h2>行政区监测覆盖</h2></div><div id="boroughCoverage" class="borough-list"></div></section>
+    <section class="panel borough-panel" data-analysis-section="borough" hidden>
+      <div class="panel-title borough-heading">
+        <h2>行政区监测覆盖</h2>
+        <div class="borough-summary">
+          <span id="boroughSummary"></span>
+          <span id="boroughRange"></span>
+        </div>
+        <details class="borough-method">
+          <summary>统计口径</summary>
+          <p>有效时段占比为有效站点小时数除以应有站点小时数。分母纳入查询窗口内至少有一条所选指标有效读数的站点。回放时，时段统计截至回放时刻。全市覆盖率按站点数加权。</p>
+        </details>
+      </div>
+      <div class="borough-workspace" id="boroughWorkspace">
+        <div class="borough-map-column">
+          <div id="boroughLegend" class="borough-legend" hidden></div>
+          <div id="boroughMap" class="borough-map" role="img" aria-label="伦敦行政区较全市覆盖率的百分点差及站点数地图"></div>
+          <div class="borough-selection">
+            <span id="boroughSelectionText" role="status">点击地图或右侧列表查看行政区</span>
+            <button id="boroughViewOnMap" type="button" hidden>在总览地图查看</button>
+          </div>
+        </div>
+        <aside class="borough-ranking" aria-label="行政区覆盖率排名">
+          <div class="borough-ranking-head"><span>行政区</span><span>站点数</span><span>有效时段占比</span><span>较全市<small>百分点</small></span></div>
+          <div id="boroughCoverage" class="borough-list"></div>
+        </aside>
+      </div>
+      <p id="boroughMapNote" class="chart-note borough-map-note" role="status"></p>
+    </section>
   </section>
   <div id="tablesPage" hidden>
   <nav id="sources" class="sources" aria-label="数据来源">
@@ -258,21 +394,23 @@
     <button class="source" data-source="metoffice"><strong>Met Office</strong><span>地面气象观测</span><small id="badge-metoffice">读取中</small></button>
     <button class="source" data-source="boundaries"><strong>伦敦行政区划</strong><span>大伦敦与 33 个行政区</span><small>2025 年边界</small></button>
   </nav>
-  <section class="panel">
-    <div class="panel-title"><div><h2 id="tableTitle">LAQN 最新浓度</h2><p id="tableDescription">每项读数显示各自的观测时间</p></div><span id="rowCount"></span></div>
+  <section id="collectionStatus" class="panel status-panel"><details><summary>采集状态 <span id="statusSummary"></span></summary><div id="sourceStatus"></div></details></section>
+  <section class="panel data-results" aria-labelledby="tableTitle">
+    <div class="panel-title">
+      <div><h2 id="tableTitle">LAQN 最新浓度</h2><p id="tableDescription">每项读数显示各自的观测时间</p></div>
+      <nav class="pagination" aria-label="数据分页"><span id="pageInfo"></span><button id="previous" type="button" disabled>上一页</button><button id="next" type="button" disabled>下一页</button></nav>
+    </div>
     <div class="filters">
+      <label class="search"><span id="searchLabel">搜索站名或编号</span><input id="search" type="search" placeholder="输入名称或编号" autocomplete="off"></label>
       <label id="laqnFilter">观测类型<select id="laqnMode"><option value="900">15 分钟浓度</option><option value="3600">小时浓度</option><option value="index">小时空气质量指数</option></select></label>
       <label id="tflFilter" hidden>交通数据<select id="tflMode"><option value="bikes">自行车停靠站</option><option value="roads">道路事件</option></select></label>
       <label id="weatherFilter" hidden>区域<select id="region"><option value="">全部区域</option></select></label>
-      <label class="search"><span id="searchLabel">搜索站名或编号</span><input id="search" type="search" placeholder="输入名称或编号" autocomplete="off"></label>
       <label id="showAllFilter" class="check"><input id="showAll" type="checkbox"> <span id="showAllLabel">包括停用站点</span></label>
       <label>每页<select id="pageSize"><option selected>8</option><option>25</option><option>50</option><option>100</option></select></label>
     </div>
     <div id="tableError" class="notice error" hidden role="alert"></div>
-    <div id="dataTable" class="table-wrap" aria-live="polite" aria-busy="true"></div>
-    <div class="pagination"><span id="pageInfo"></span><button id="previous">上一页</button><button id="next">下一页</button></div>
+    <div id="dataTable" class="table-wrap data-center-table-wrap" aria-live="polite" aria-busy="true"></div>
   </section>
-  <section id="collectionStatus" class="panel status-panel"><details open><summary>采集状态 <span id="statusSummary"></span></summary><div id="sourceStatus"></div></details></section>
   </div>
   <footer id="sourceFooter" hidden>
     <span class="footer-source-summary">
@@ -333,20 +471,22 @@
 </template>
 <dialog id="gisTableDialog" class="workspace-dialog"><div class="dialog-header"><h2>图层属性表</h2><button id="closeGisTable" type="button">关闭 ×</button></div></dialog>
 <dialog id="linkageDialog" class="workspace-dialog"><div class="dialog-header"><h2>周边详情</h2><button id="closeLinkage" type="button">关闭 ×</button></div></dialog>
-<dialog id="detail">
-  <div class="dialog-header"><div><h2 id="detailTitle">站点详情</h2><p id="detailSubtitle"></p></div><button id="closeDetail" aria-label="关闭详情">关闭 ×</button></div>
+<dialog id="detail" aria-labelledby="detailTitle">
+  <div class="dialog-header"><div><h2 id="detailTitle">站点详情</h2><p id="detailSubtitle"></p></div><button id="closeDetail" type="button" aria-label="关闭详情">关闭 ×</button></div>
   <div id="detailError" class="notice error" hidden role="alert"></div>
   <div id="stationDetail">
-    <details class="metadata-section" open><summary>站点元数据</summary><div id="metadata" class="metadata"></div></details>
+    <details id="stationMetadata" class="metadata-section"><summary>站点元数据</summary><div id="metadata" class="metadata"></div></details>
     <h3>最近 48 小时观测</h3>
     <div class="filters">
       <label>指标<select id="historyMetric"><option value="">全部指标</option></select></label>
       <label>观测时长<select id="historyPeriod"><option value="">全部时长</option><option value="900">15 分钟</option><option value="3600">1 小时</option><option value="0">快照</option></select></label>
       <button id="queryHistory" class="primary">查询</button>
     </div>
-    <p id="historyBounds" class="muted"></p>
-    <div id="historyTable" class="table-wrap"></div>
-    <div class="pagination"><span id="historyPageInfo"></span><button id="historyPrevious">上一页</button><button id="historyNext">下一页</button></div>
+    <div class="history-toolbar">
+      <p id="historyBounds" class="muted"></p>
+      <nav class="pagination" aria-label="历史观测分页"><span id="historyPageInfo" aria-live="polite"></span><button id="historyPrevious" type="button" disabled>上一页</button><button id="historyNext" type="button" disabled>下一页</button></nav>
+    </div>
+    <div id="historyTable" class="table-wrap data-center-table-wrap"></div>
   </div>
   <div id="boundaryDetail" hidden></div>
   <div id="roadDetail" hidden></div>

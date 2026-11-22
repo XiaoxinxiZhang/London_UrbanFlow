@@ -5,10 +5,43 @@
     H = window.AirWatchData;
   if (!H) return;
   const { api, time, calendarDate, recentWindow } = H;
+  const shortTime = (value) => time(value).replace(/^\d{4}\//, "");
   const HOUR_MS = 3600000;
   const MAX_COMPARE_STATIONS = 4;
   const OUTLOOK_TABS = ["advice", "air", "nearby"];
+  const NEARBY_TABS = ["bikes", "roads", "air"];
   const OUTLOOK_AIR_METRICS = ["PM25", "PM10", "NO2", "O3"];
+  const AIR_KPI_METRICS = ["PM25", "NO2"];
+  // Breathe London sensors report PM2.5 and NO2 only; LAQN stations cover all
+  // four pollutants, each species at its own subset of sites.
+  const ANALYSIS_SOURCE_METRICS = {laqn: ["PM25", "PM10", "NO2", "O3"], breathe: ["PM25", "NO2"]};
+  const ANALYSIS_SECTIONS = ["series", "heatmap", "coverage", "weather", "bike", "borough"];
+  // Heatmaps, coverage and weather read a single station, while series keeps
+  // the multi-station comparison list.
+  const ANALYSIS_SINGLE_SITE_SECTIONS = ["heatmap", "coverage", "weather"];
+  // The second row only shows the controls the active module reads. Values are
+  // shared across modules; single-station modules trim the comparison list and
+  // refetch only when the loaded sites no longer match that selection.
+  const ANALYSIS_CONTROL_MODULES = {
+    source: ["series", "heatmap", "coverage", "weather", "borough"],
+    metric: ["series", "heatmap", "coverage", "weather", "borough"],
+    compare: ["series", "heatmap", "coverage", "weather"],
+    interval: ["series", "weather"],
+    weather: ["weather"],
+  };
+  const ANALYSIS_STATION_LABELS = {
+    series: "对比站点（最多 4 站）",
+    heatmap: "站点（单选）",
+    coverage: "站点（单选）",
+    weather: "污染站点（单选）",
+  };
+  const BOROUGH_MAP_NAME = "london-boroughs-coverage";
+  const BIKE_ARCHIVE_DATASET = "https://huggingface.co/datasets/feregrino/london-cycles";
+  const BOROUGH_DELTA_LIMIT = 2;
+  const BOROUGH_DELTA_COLORS = ["#de9560", "#40586d", "#70c2e8"];
+  const BOROUGH_MISSING_COLOR = "#282e36";
+  const BOROUGH_BUBBLE_FILL = "#102131b8";
+  const BOROUGH_BUBBLE_OUTLINE = "#e0edf6";
   const colors = ["#55c7a5", "#9bcf80", "#e9cf6e", "#ed9867", "#e96a72"];
   const missingAirColor = "#758290";
   const roadSeverityColors = { Serious: "#ef7b84", Severe: "#ef7b84", Moderate: "#e9bc70", Minimal: "#8bbddd" };
@@ -31,6 +64,7 @@
     charts: {},
     selected: null,
     outlookTab: "advice",
+    nearbyTab: "bikes",
     pickingLocation: false,
     start: null,
     end: null,
@@ -41,7 +75,16 @@
     compareRevision: 0,
     comparePrefill: null,
     series: null,
+    analysisSeriesCursor: null,
     weather: null,
+    overviewWeather: null,
+    overviewWeatherState: null,
+    overviewWeatherHtml: "",
+    overviewWeatherKey: null,
+    localAirHtml: "",
+    localAirHasData: false,
+    airRefOpen: {},
+    nearbySelectionKey: null,
     playback: null,
     lastRefresh: 0,
     selectedBoundary: null,
@@ -50,6 +93,15 @@
     gisPage: 1,
     gisSelected: null,
     spatial: {},
+    boroughGeo: null,
+    boroughMapReady: false,
+    boroughMapPromise: null,
+    boroughMapBound: false,
+    boroughMapHasData: false,
+    boroughGeneration: 0,
+    boroughItems: [],
+    boroughSelectedPoint: null,
+    boroughSelection: null,
     pointGroups: {},
   };
   const esc = (v) =>
@@ -124,8 +176,11 @@
       return [p[region ? "RGN25NM" : "LAD25NM"], p[region ? "RGN25CD" : "LAD25CD"], n(p.Shape__Area / 1e6), n(p.Shape__Length / 1000), region ? "大伦敦" : "行政区"];
     }
     if (layer === "laqn" || layer === "breathe") return [p.name, sourceNames[p.source] || p.source, p.kind, p.value === null ? "缺测" : n(p.value) + (p.unit ? " " + p.unit : ""), time(p.observed_at), p.quality || "—", p.borough || f.geometry.coordinates.map(v => n(v, 4)).join(", ")];
-    if (layer === "bikes") return [p.name, n(p.bikes, 0), n(p.empty_docks, 0), n(p.capacity, 0), time(p.captured_at), f.geometry.coordinates.map(v => n(v, 4)).join(", ")];
-    return [p.name, p.id, p.category, p.severity, p.status, time(p.starts_at), time(p.modified_at)];
+    if (layer === "bikes") return [p.name, n(p.bikes, 0), n(p.empty_docks, 0), n(p.capacity, 0),
+      time(p.captured_at) + (p.snapshot_source === "public_archive" ? " · 公开归档" : ""),
+      f.geometry.coordinates.map(v => n(v, 4)).join(", ")];
+    const recordLabel = p.reconstructed ? "（重建）" : p.snapshot_source === "public_road_archive" ? "（公开归档）" : "";
+    return [p.name, p.id, p.category, p.severity, (p.status || "—") + recordLabel, time(p.starts_at), time(p.modified_at)];
   }
   function renderGisTable() {
     const layer = S.gisLayer, all = gisFeatures(layer), search = $("gisTableSearch").value.trim().toLocaleLowerCase();
@@ -237,8 +292,9 @@
   }
   function resetWindow() {
     const { start, end } = recentWindow();
-    S.start = new Date(start);
     S.end = new Date(end);
+    const week = $("cityMode").value === "history" && $("replayRange").value === "7d";
+    S.start = week ? new Date(S.end.getTime() - 7 * 24 * HOUR_MS) : new Date(start);
     const firstHour = Math.ceil(S.start.getTime() / HOUR_MS) * HOUR_MS;
     const endMs = S.end.getTime();
     S.hours = [];
@@ -258,22 +314,62 @@
     S.playback = null;
     $("replayPlay").textContent = "播放";
   }
-  function showAnalysisSection(section) {
+  function syncAnalysisControls(section) {
+    $("analysisSelection").hidden = section === "bike";
+    for (const node of document.querySelectorAll("[data-analysis-control]")) {
+      const modules = ANALYSIS_CONTROL_MODULES[node.dataset?.analysisControl];
+      if (!modules) continue;
+      node.hidden = !modules.includes(section);
+    }
+    const label = $("compareStationsLabel");
+    if (label)
+      label.textContent =
+        ANALYSIS_STATION_LABELS[section] || ANALYSIS_STATION_LABELS.series;
+    if (!ANALYSIS_CONTROL_MODULES.compare.includes(section) &&
+        $("compareStationsPicker").open)
+      $("compareStationsPicker").open = false;
+  }
+  function showAnalysisSection(section, {reload = true} = {}) {
+    if (!ANALYSIS_SECTIONS.includes(section)) section = "series";
+    const previous = S.analysisSection;
     S.analysisSection = section;
     Array.from(document.querySelectorAll("[data-analysis-section]"))
       .filter(node => node.dataset?.analysisSection)
       .forEach(node => { node.hidden = node.dataset.analysisSection !== section; });
     Array.from(document.querySelectorAll("[data-analysis-tab]"))
       .filter(node => node.dataset?.analysisTab)
-      .forEach(node => node.classList.toggle("active", node.dataset.analysisTab === section));
+      .forEach(node => {
+        const active = node.dataset.analysisTab === section;
+        node.classList.toggle("active", active);
+        node.setAttribute?.("aria-pressed", String(active));
+      });
+    syncAnalysisControls(section);
+    $("analysisGrid").classList.toggle("analysis-grid-weather", section === "weather");
+    if (section === "bike") {
+      S.analysisGeneration++;
+      if (S.page === "analysis") window.AirWatchBikeAnalysis?.show();
+      return;
+    }
+    window.AirWatchBikeAnalysis?.hide();
+    let needsReload = previous === "bike" || (section === "borough" && !S.series && !window.echarts);
+    if (isSingleSiteSection(section)) {
+      const trimmed = keepSingleCompareStation();
+      if (trimmed) S.compareRevision++;
+      if (trimmed || !analysisSitesMatchSelection()) {
+        updateCompareSummary();
+        needsReload = true;
+      }
+    }
+    if (reload && needsReload) loadAnalysis();
     requestAnimationFrame(() => {
       Object.values(S.charts).forEach(chart => chart.resize());
-      if (S.series && S.weather) drawAnalysis();
+      drawAnalysis();
     });
   }
   function showPage(page) {
     const previousPage = S.page;
     S.page = page;
+    if (page !== "analysis") window.AirWatchBikeAnalysis?.hide();
     if (page !== "analysis") $("compareStationsPicker").open = false;
     if (S.map?.getLayer?.("pollution-fill")) S.map.setLayoutProperty("pollution-fill", "visibility", page === "overview" && $("pollutionZones")?.checked ? "visible" : "none");
     for (const id of ["journey-leg-line", "journey-point-dot", "journey-point-label"]) {
@@ -317,9 +413,11 @@
       Object.values(S.charts).forEach((c) => c.resize());
     });
     if (page === "analysis") {
-      showAnalysisSection(S.analysisSection || "series");
-      if ($("cityMode").value === "latest") refreshCity();
-      else loadAnalysis();
+      showAnalysisSection(S.analysisSection || "series", {reload: false});
+      if (S.analysisSection !== "bike") {
+        if ($("cityMode").value === "latest") refreshCity();
+        else loadAnalysis();
+      }
     }
     if (page === "journey" && $("cityMode").value !== "latest") {
       $("cityMode").value = "latest";
@@ -954,19 +1052,58 @@
         : [[missingAirColor, "暂无有效浓度"]];
     airLegend.innerHTML = entries.map(([color, label]) => legendSwatch(color, label)).join("");
   }
+  function archiveSnapshotLabel(info) {
+    const age = Number(info.age_minutes);
+    return "公开归档 · " + shortTime(info.captured_at) +
+      (Number.isFinite(age) && age > 0 ? " · 距所选 " + Math.round(age) + " 分钟" : "");
+  }
   function summaries() {
     const d = S.data;
     const renderCounts = (counts) => counts
       .map(([label, value]) => `<div><small>${esc(label)}</small><strong>${esc(value)}</strong></div>`)
       .join("");
     const snapshotStatus = (info) => {
+      if (info?.reconstructed)
+        return { available: true, reconstructed: true, label: "按前后快照交集重建 · 无原始快照" };
       if (!info?.captured_at || info.gap)
-        return { available: false, label: d.cursor ? "所选小时无可用快照" : "暂无采集快照" };
+        return {
+          available: false,
+          label: d.cursor ? "所选小时无可用快照" : "暂无采集快照",
+          detail: info?.captured_at ? "最近一次快照 " + time(info.captured_at) : "",
+        };
+      if (info.source === "public_archive" || info.source === "public_road_archive")
+        return { available: true, archived: true, label: archiveSnapshotLabel(info) };
+      const age = Number(info.age_minutes);
+      if (d.cursor && Number.isFinite(age) && (info.mode === "nearest" || age > 10))
+        return {
+          available: true,
+          nearest: true,
+          label: "最近快照 " + shortTime(info.captured_at) + " · 距所选 " + Math.round(age) + " 分钟",
+        };
       return { available: true, label: (info.stale ? "快照已过期 · " : "采集于 ") + time(info.captured_at) };
     };
     const airCounts = Object.entries(sourceNames).map(([source, name]) => [
       name, d.source_stats?.[source]?.valid ?? 0,
     ]);
+    const airMetrics = d.air_counts ? (d.air_metrics || AIR_KPI_METRICS) : [];
+    const airValue = (source, pollutant) => {
+      const value = d.air_counts?.[source]?.[pollutant];
+      return value == null ? "—" : value;
+    };
+    const airMatrix = airMetrics.length
+      ? `<div class="city-kpi-body">
+          <table class="city-kpi-air" aria-label="各污染物有值站点数">
+            <thead><tr><td aria-hidden="true"></td>${Object.values(sourceNames).map((name) => `<th scope="col">${esc(name)}</th>`).join("")}</tr></thead>
+            <tbody>${airMetrics.map((pollutant) => `<tr><th scope="row">${esc(metric(pollutant))}</th>${Object.keys(sourceNames).map((source) => `<td><strong>${esc(airValue(source, pollutant))}</strong></td>`).join("")}</tr>`).join("")}</tbody>
+          </table>
+        </div>`
+      : "";
+    const airDetail = d.cursor
+      ? "所选小时"
+      : d.air_info?.observed_at
+        ? "最新观测 " + time(d.air_info.observed_at)
+        : "各站最新观测";
+    const airFoot = airMatrix ? `有值站点数 · ${airDetail}` : `有值站点数 · ${metric(d.metric)}`;
     const bikes = snapshotStatus(d.bike_info);
     const roads = snapshotStatus(d.road_info);
     const bikeCounts = [
@@ -974,39 +1111,30 @@
       ["满站数量", bikes.available ? d.counts.full : "—"],
       ["有车有空位", bikes.available ? d.counts.available : "—"],
     ];
+    const footAttrs = (status) => {
+      const classes = ["city-kpi-foot"].concat(
+        status.nearest || status.reconstructed || status.archived ? ["kpi-note"] : [],
+      );
+      return ` class="${classes.join(" ")}"` + (status.detail ? ` title="${esc(status.detail)}"` : "");
+    };
     $("cityKpis").innerHTML = `
       <div class="city-kpi">
         <h2>有值空气监测点</h2>
-        <div class="city-kpi-metrics">${renderCounts(airCounts)}</div>
-        ${d.cursor ? `<small>所选小时 · ${esc(metric(d.metric))}</small>` : ""}
+        ${airMatrix || `<div class="city-kpi-body"><div class="city-kpi-metrics">${renderCounts(airCounts)}</div></div>`}
+        <small class="city-kpi-foot" title="${esc(airFoot)}">${esc(airFoot)}</small>
       </div>
       <div class="city-kpi">
         <h2>自行车资源</h2>
-        <div class="city-kpi-metrics">${renderCounts(bikeCounts)}</div>
-        <small>${esc(bikes.label)}</small>
+        <div class="city-kpi-body"><div class="city-kpi-metrics">${renderCounts(bikeCounts)}</div></div>
+        <small${footAttrs(bikes)}>${esc(bikes.label)}</small>
       </div>
       <div class="city-kpi">
         <h2>道路事件</h2>
-        <strong>${esc(roads.available ? d.counts.roads : "—")}</strong>
-        <small>${esc(roads.label)}</small>
+        <div class="city-kpi-body"><strong>${esc(roads.available ? d.counts.roads : "—")}</strong></div>
+        <small${footAttrs(roads)}>${esc(roads.label)}</small>
       </div>`;
     $("mapWindow").textContent = "时间范围：" + time(d.start) + " 至 " + time(d.end);
     if ($("changeLocation").getAttribute?.("aria-expanded") === "true") renderLocationSearch();
-    const bike = $("bikeStation").value;
-    $("bikeStation").innerHTML =
-      "<option value=''>选择自行车站</option>" +
-      d.bikes.features
-        .map(
-          (f) =>
-            "<option value='" +
-            esc(f.properties.id) +
-            "'>" +
-            esc(f.properties.name) +
-            "</option>",
-        )
-        .join("");
-    if ([...$("bikeStation").options].some((o) => o.value === bike))
-      $("bikeStation").value = bike;
     legend();
     fitInitialMap();
   }
@@ -1061,16 +1189,16 @@
           S.detailGeneration++;
           S.selected = null;
           S.comparePrefill = null;
+          S.airRefOpen = {};
           $("selectedActions").hidden = true;
           $("linkTitle").textContent = "尚未选择地点";
           $("linkSubtitle").textContent = "在地图上选点或搜索监测站";
-          $("nearbyContent").textContent = "所选对象在该时刻没有有效记录，请选择其他对象。";
-          $("nearbySummary").textContent = "";
+          $("nearbyStatus").textContent = "所选对象在该时刻没有有效记录，请选择其他对象。";
+          $("nearbyDetails").hidden = true;
           $("citizenCard").textContent = "";
-          $("localAir").textContent = "选点后查看附近的污染物浓度。";
+          setLocalAirMessage("选点后查看附近的污染物浓度。");
           S.overviewWeatherKey = null;
-          $("outlookWeather").textContent = "选点后查看气象观测。";
-          renderNearbyTrend(null);
+          setWeatherMessage("选点后查看气象观测。");
           drawOverviewLocation();
         }
       }
@@ -1079,9 +1207,18 @@
       if (generation === S.generation) error(e.message);
     }
   }
+  const analysisChartObserver = typeof window.ResizeObserver === "function"
+    ? new window.ResizeObserver(entries => {
+      for (const {target, contentRect} of entries) {
+        if (contentRect.width > 0 && contentRect.height > 0) S.charts[target.id]?.resize();
+      }
+    }) : null;
   function chart(id) {
-    if (!S.charts[id])
-      S.charts[id] = echarts.init($(id), null, { renderer: "canvas" });
+    if (!S.charts[id]) {
+      const element = $(id);
+      S.charts[id] = echarts.init(element, null, { renderer: "canvas" });
+      if (element.closest?.("#cityAnalysis")) analysisChartObserver?.observe(element);
+    }
     return S.charts[id];
   }
   function base(extra = {}) {
@@ -1174,29 +1311,25 @@
         (p.period_seconds / 60 || "—") +
         " 分钟 · 获取 " +
         time(p.fetched_at);
+    const archivedBike = kind === "bike" && p.snapshot_source === "public_archive";
     if (kind === "bike")
       text.textContent =
         "车辆 " +
         (p.bikes ?? "—") +
         " · 空位 " +
         (p.empty_docks ?? "—") +
-        "\n获取 " +
+        (archivedBike ? "\n公开归档 · 采集 " : "\n获取 ") +
         time(p.captured_at) +
-        "\n来源修改 " +
-        time(p.source_modified);
-    if (kind === "road")
-      text.textContent = [
-        p.category,
-        p.severity,
-        p.status,
-        "修改 " + time(p.modified_at),
-        "列表 " + time(p.captured_at),
-      ]
-        .filter(Boolean)
-        .join("\n");
+        (archivedBike ? "" : "\n来源修改 " + time(p.source_modified));
+    if (kind === "road") {
+      const lines = [p.category, p.severity, p.status, "修改 " + time(p.modified_at)];
+      lines.push(p.reconstructed ? "重建 · 无原始快照" :
+        (p.snapshot_source === "public_road_archive" ? "公开归档 · " : "列表 ") + time(p.captured_at));
+      text.textContent = lines.filter(Boolean).join("\n");
+    }
     content.append(text);
     const button = document.createElement("button");
-    button.textContent = "查看元数据与原始记录";
+    button.textContent = archivedBike ? "查看归档来源" : "查看元数据与原始记录";
     button.className = "map-popup-button";
     button.addEventListener("click", openSelected);
     content.append(button);
@@ -1311,9 +1444,17 @@
     }
     drawOverviewLocation();
     if (tab === "advice" && S.selected && S.start) void refreshOverviewWeather(query());
-    if (tab === "nearby" && S.nearbyTrend) requestAnimationFrame(() => {
-      if (S.outlookTab === "nearby" && S.nearbyTrend) renderNearbyTrend(S.nearbyTrend);
-    });
+  }
+  function showNearbyTab(tab, focus = false) {
+    S.nearbyTab = tab;
+    for (const name of NEARBY_TABS) {
+      const selected = name === tab;
+      const button = $("nearbyTab-" + name);
+      button.setAttribute("aria-selected", String(selected));
+      button.tabIndex = selected ? 0 : -1;
+      $("nearbyPanel-" + name).hidden = !selected;
+      if (selected && focus) button.focus();
+    }
   }
   async function selectFeature(kind, f, lngLat = null, withPopup = true) {
     const previous = S.selected;
@@ -1337,16 +1478,18 @@
         : kind === "point" ? `${center[1].toFixed(5)}°, ${center[0].toFixed(5)}°`
           : p.id + " · " + (kind === "bike" ? "自行车停靠站" : "道路事件");
     $("selectedActions").hidden = kind === "point";
+    $("openSelected").textContent = kind === "bike" && p.snapshot_source === "public_archive"
+      ? "查看归档来源" : "元数据与原始记录";
     $("analyseSelected").textContent = kind === "air" ? "分析此站" : "查看环境与交通分析";
     if (kind === "point") S.comparePrefill = null;
     else if (S.page !== "analysis" && (changed || withPopup)) {
       if (kind === "air" && (changed || $("analysisSource").value !== p.source)) {
-        $("analysisSource").value = p.source;
+        // "分析此站" carries the map's pollutant into the analysis page.
+        setAnalysisSource(p.source, $("cityMetric").value);
         resetCompareStations();
       }
       S.comparePrefill = { site: kind === "air" ? p.id : null };
     }
-    if (kind === "bike") $("bikeStation").value = p.id;
     if (withPopup) popup(kind, f, lngLat);
     else if (S.popup) {
       S.popup.remove();
@@ -1372,6 +1515,33 @@
     for (const input of inputs)
       input.disabled = !input.checked && selected.length >= MAX_COMPARE_STATIONS;
   }
+  function isSingleSiteSection(section = S.analysisSection) {
+    return ANALYSIS_SINGLE_SITE_SECTIONS.includes(section);
+  }
+  function analysisSitesMatchSelection() {
+    if (!S.series) return true;
+    const loaded = S.series.stations.map((station) => station.id),
+      selected = selectedCompareStations();
+    return loaded.length === selected.length &&
+      loaded.every((id, index) => id === selected[index]);
+  }
+  // Single-station modules expose the shared comparison list as a radio group:
+  // keep exactly one station, preferring the one the user just interacted with.
+  function keepSingleCompareStation(preferred) {
+    const inputs = compareStationInputs();
+    if (!inputs.length) return false;
+    const selected = inputs.filter((input) => input.checked),
+      keep = preferred && inputs.includes(preferred) ? preferred : selected[0] || inputs[0];
+    let changed = false;
+    for (const input of inputs) {
+      const checked = input === keep;
+      if (input.checked !== checked) {
+        input.checked = checked;
+        changed = true;
+      }
+    }
+    return changed;
+  }
   function populateStations(options, selected, useDefault = true) {
     const markup = options.map(({ id, name, kind }) =>
       "<label><input type='checkbox' value='" + esc(id) + "' data-name='" + esc(name) +
@@ -1393,6 +1563,24 @@
     S.comparePrefill = null;
     $("compareStationsPicker").open = false;
     populateStations([], []);
+  }
+  function metricForSource(source, value = $("analysisMetric").value) {
+    const allowed = ANALYSIS_SOURCE_METRICS[source] || OUTLOOK_AIR_METRICS;
+    return allowed.includes(value) ? value : allowed[0];
+  }
+  function syncAnalysisMetrics(source = $("analysisSource").value,
+                               prefer = $("analysisMetric").value) {
+    const select = $("analysisMetric"),
+      allowed = ANALYSIS_SOURCE_METRICS[source] || OUTLOOK_AIR_METRICS,
+      markup = allowed
+        .map((code) => `<option value="${code}">${esc(metric(code))}</option>`)
+        .join("");
+    if (select.innerHTML !== markup) select.innerHTML = markup;
+    select.value = metricForSource(source, prefer);
+  }
+  function setAnalysisSource(source, prefer) {
+    $("analysisSource").value = source;
+    syncAnalysisMetrics(source, prefer);
   }
   function renderCitizen() {
     if (!S.selected) return;
@@ -1416,13 +1604,22 @@
   function airUnit(unit) {
     return unit === "ug/m3" ? "µg/m³" : unit;
   }
+  function paintLocalAir(markup) {
+    if (markup === S.localAirHtml) return;
+    S.localAirHtml = markup;
+    $("localAir").innerHTML = markup;
+  }
+  function setLocalAirMessage(message) {
+    S.localAirHasData = false;
+    paintLocalAir(`<p class="muted">${esc(message)}</p>`);
+  }
   function renderLocalAir(readings) {
     const items = OUTLOOK_AIR_METRICS.map(pollutant => {
       const label = metric(pollutant);
       const reading = readings[pollutant];
       if (!reading || reading.status === "insufficient") {
-        return `<li><span class="local-air-label">${esc(label)}</span>
-          <p class="muted">${reading ? "附近观测不足" : "读数暂不可用"}</p></li>`;
+        return `<li><p class="local-air-value"><span class="local-air-label">${esc(label)}</span> <strong>—</strong></p>
+          <p class="muted">${reading ? "附近观测不足" : "读数暂不可用"}</p><p class="muted">&nbsp;</p></li>`;
       }
       const {status, value, unit, observed_at, period_seconds, stations} = reading;
       const source = stations[0];
@@ -1431,39 +1628,86 @@
         status === "nearest" ? `最近站点读数 · ${network} · ${source.name} · ${source.distance_m} 米` :
           `附近站点估算 · ${network} · ${stations.length} 个参考站`;
       const duration = period_seconds === 3600 ? "小时值" : period_seconds === 900 ? "15 分钟值" : "";
-      const contributors = status === "estimated" ? `<details class="air-contributors"><summary>查看 ${esc(label)} 参考站</summary>
-        <ul class="nearby-list">${stations.map(station => `<li><span>${esc(station.name)}<small>${esc(station.id)} · ${esc(station.distance_m)} 米</small></span>
-          <span>${esc(station.value)} ${esc(airUnit(station.unit))}</span></li>`).join("")}</ul></details>` : "";
-      return `<li><p class="local-air-value"><span class="local-air-label">${esc(label)}</span> <strong>${esc(value)}</strong> ${esc(airUnit(unit))}</p>
-        <p>${esc(basis)}</p><p class="muted">${esc(time(observed_at))}${duration ? ` · ${duration}` : ""}</p>${contributors}</li>`;
+      const referenceId = `air-ref-${pollutant}`;
+      const references = status === "estimated"
+        ? `<button type="button" class="air-ref-toggle" aria-expanded="${S.airRefOpen[pollutant] ? "true" : "false"}" aria-controls="${referenceId}">参考站</button>` : "";
+      const referenceList = status === "estimated"
+        ? `<ul id="${referenceId}" class="nearby-list air-ref-list"${S.airRefOpen[pollutant] ? "" : " hidden"}>${stations.map(station => `<li><span>${esc(station.name)}<small>${esc(station.id)} · ${esc(station.distance_m)} 米</small></span>
+          <span>${esc(station.value)} ${esc(airUnit(station.unit))}</span></li>`).join("")}</ul>` : "";
+      return `<li><p class="local-air-value"><span class="local-air-label">${esc(label)}</span> <strong>${esc(value)}</strong> ${esc(airUnit(unit))}${references ? " " + references : ""}</p>
+        <p title="${esc(basis)}">${esc(basis)}</p><p class="muted" title="${esc(time(observed_at))}${duration ? ` · ${duration}` : ""}">${esc(time(observed_at))}${duration ? ` · ${duration}` : ""}</p>${referenceList}</li>`;
     });
-    $("localAir").innerHTML = `<ul class="outlook-air-list">${items.join("")}</ul>`;
+    S.localAirHasData = true;
+    paintLocalAir(`<ul class="outlook-air-list">${items.join("")}</ul>`);
+  }
+  function toggleAirReferences(event) {
+    const button = event.target?.closest?.("button.air-ref-toggle");
+    if (!button) return;
+    const referenceId = button.getAttribute("aria-controls");
+    const list = document.getElementById(referenceId);
+    if (!list) return;
+    const pollutant = referenceId.replace(/^air-ref-/, "");
+    const open = !S.airRefOpen[pollutant];
+    S.airRefOpen[pollutant] = open;
+    button.setAttribute("aria-expanded", String(open));
+    list.hidden = !open;
+  }
+  const WEATHER_FIELDS = [["温度", "TEMPERATURE"], ["湿度", "HUMIDITY"], ["风速", "WIND_SPEED"], ["气压", "MSLP"]];
+  function weatherMarkup({latest = null, station = "", observedAt = "", note = "", unitNote = ""} = {}) {
+    const readings = WEATHER_FIELDS.map(([label, field]) => {
+      const reading = latest?.[field];
+      const value = reading?.value_num != null ? String(reading.value_num) : "—";
+      const unit = reading?.unit ? ` ${reading.unit}` : "";
+      const samples = reading?.samples ? ` title="${esc(reading.samples)} 站平均"` : "";
+      return `<div${samples}><small>${label}${esc(unit)}</small><strong>${esc(value)}</strong></div>`;
+    }).join("");
+    const source = station && observedAt ? `${station} · ${time(observedAt)}` : note;
+    return `<div class="city-kpi-body"><div class="city-kpi-metrics">${readings}</div></div>
+      <small class="city-kpi-foot" title="${esc(source)}"><span class="city-kpi-weather-source">${source ? esc(source) : "&nbsp;"}</span>${unitNote ? `<span class="city-kpi-weather-note">${esc(unitNote)}</span>` : ""}</small>`;
+  }
+  function paintOverviewWeather(markup) {
+    if (markup === S.overviewWeatherHtml) return;
+    S.overviewWeatherHtml = markup;
+    $("outlookWeather").innerHTML = markup;
+  }
+  // Weather timestamps are formatted at paint time, so the card keeps the state
+  // it was last rendered from and can be repainted when the display timezone changes.
+  function paintOverviewWeatherState(state) {
+    S.overviewWeatherState = state;
+    paintOverviewWeather(weatherMarkup(state));
+  }
+  function repaintOverviewWeather() {
+    if (S.overviewWeatherState) paintOverviewWeatherState(S.overviewWeatherState);
+  }
+  function setWeatherMessage(message) {
+    S.overviewWeather = null;
+    paintOverviewWeatherState({note:message});
   }
   async function refreshOverviewWeather({start, end, cursor}) {
-    const params = {start, end, ...(cursor ? {cursor} : {}), weather_site:$("weatherStation").value, context_only:"1"};
+    const params = {start, end, ...(cursor ? {cursor} : {}), aggregate:"mean", context_only:"1"};
     const key = JSON.stringify(params);
     if (S.overviewWeatherKey === key) return;
     S.overviewWeatherKey = key;
-    $("outlookWeather").textContent = "正在查询气象观测…";
+    if (!S.overviewWeatherHtml) paintOverviewWeatherState({note:"正在查询气象观测…"});
     try {
       const weather = await api("/api/analysis/weather", params);
       if (S.overviewWeatherKey !== key) return;
       const latest = weather.latest ?? weather.points?.at(-1);
       if (!latest) {
-        $("outlookWeather").textContent = "所选时段暂无伦敦气象观测。";
+        setWeatherMessage("所选时段暂无伦敦气象观测。");
         return;
       }
-      const fields = [["温度", latest.TEMPERATURE], ["湿度", latest.RELATIVE_HUMIDITY], ["风速", latest.WIND_SPEED]];
-      const readings = fields.map(([label, reading]) => {
-        const value = reading?.value_num != null ? `${reading.value_num}${reading.unit ? " " + reading.unit : ""}` : "—";
-        return `<div><dt>${label}</dt><dd>${esc(value)}</dd></div>`;
-      }).join("");
-      $("outlookWeather").innerHTML = `<p class="muted">${esc(weather.station_name || weather.station)} · ${esc(time(latest.time))}</p>
-        <dl>${readings}</dl>${fields.some(([, reading]) => reading?.value_num != null && !reading.unit) ? '<p class="muted">部分观测未提供单位。</p>' : ""}`;
+      const unitNote = WEATHER_FIELDS.some(([, field]) => {
+        const reading = latest[field];
+        return reading?.value_num != null && !reading.unit;
+      }) ? "部分观测未提供单位。" : "";
+      const station = weather.station_name || weather.station || "";
+      S.overviewWeather = {latest, station, observedAt: latest.time, unitNote};
+      paintOverviewWeatherState(S.overviewWeather);
     } catch (_) {
       if (S.overviewWeatherKey !== key) return;
       S.overviewWeatherKey = null;
-      $("outlookWeather").textContent = "伦敦气象观测暂不可用。";
+      if (!S.overviewWeather) paintOverviewWeatherState({note:"伦敦气象观测暂不可用。"});
     }
   }
   function renderNearbyResources(data, cursor) {
@@ -1476,58 +1720,48 @@
     };
     const bikes = bikeTotal("bikes", data.available_bikes);
     const docks = bikeTotal("empty_docks", data.empty_docks);
-    $("nearbySummary").textContent = `${bikes === "暂无数据" ? "车辆暂无数据" : "可用车辆 " + bikes} · ${roadFresh ? "道路事件 " + data.roads.length : "道路暂无数据"}`;
     const count = (label, value) => `<div><b>${esc(value)}</b><span>${label}</span></div>`;
-    const list = (label, items, empty) =>
-      `<h4>${label}</h4><ul class="nearby-list">${items || `<li class="muted">${empty}</li>`}</ul>`;
+    const items = (rows, empty) => rows || `<li class="muted">${empty}</li>`;
     const bikeItems = bikeFresh ? data.bikes.map(b => `<li><span>${esc(b.name)}<small>${esc(b.distance_m)} 米</small></span>
       <span>${esc(b.bikes)} 辆 / ${esc(b.empty_docks)} 空位</span></li>`).join("") : "";
     const roadItems = roadFresh ? data.roads.map(r => `<li><span>${esc(r.name)}<small>${esc(r.severity)} · ${esc(r.distance_m)} 米</small></span></li>`).join("") : "";
     const airItems = data.air.map(a => `<li><span>${esc(a.name)}<small>${esc(sourceNames[a.source] || a.source)} · ${esc(a.distance_m)} 米</small></span>
       <span>${a.value == null || a.stale ? "暂无有效读数" : `${esc(a.value)} ${esc(airUnit(a.unit || ""))}`}</span></li>`).join("");
-    const snapshots = [bikeFresh ? `自行车采集于 ${time(snapshot.bikeTime)}` : "",
-      roadFresh ? `道路事件采集于 ${time(snapshot.roadTime)}` : ""].filter(Boolean);
-    $("nearbyContent").innerHTML = `<div class="nearby-stat">
-      ${count("可用车辆", bikes)}${count("空车位", docks)}${count("自行车站", bikeFresh ? data.bikes.length : "暂无数据")}
-      ${count("道路事件", roadFresh ? data.roads.length : "暂无数据")}${count("监测点", data.air.length)}</div>
-      ${snapshots.length ? `<p class="muted">${esc(snapshots.join(" · "))}</p>` : ""}
-      ${list("自行车站", bikeItems, bikeFresh ? "范围内没有自行车站。" : "自行车快照暂无数据。")}
-      ${list("道路事件", roadItems, roadFresh ? "范围内没有道路事件。" : "道路事件快照暂无数据。")}
-      ${list("监测点", airItems, "范围内没有监测点。")}`;
-  }
-  function renderNearbyTrend(trend, missing = "") {
-    S.nearbyTrend = trend;
-    $("miniTrend").hidden = !trend || !window.echarts;
-    $("miniTrendLabel").textContent = trend
-      ? `${trend.name} · ${trend.distance_m ? `距选点 ${trend.distance_m} 米 · ` : ""}${metric()} 小时观测（${airUnit(trend.unit)}）`
-      : missing;
-    if (!trend || !window.echarts) {
-      S.charts.miniTrend?.clear();
-      return;
-    }
-    if (S.outlookTab !== "nearby") return;
-    const [series] = lines([trend]);
-    if (trend.points.length === 1) series.symbol = "circle";
-    chart("miniTrend").setOption(base({
-      grid:{left:45,right:15,top:20,bottom:40},
-      legend:{show:false},
-      series:[series],
-    }), true);
-    S.charts.miniTrend.resize();
+    $("nearbyStat").innerHTML = `${count("可用车辆", bikes)}${count("空车位", docks)}${count("自行车站", bikeFresh ? data.bikes.length : "暂无数据")}
+      ${count("道路事件", roadFresh ? data.roads.length : "暂无数据")}${count("监测点", data.air.length)}`;
+    $("nearbyBikesCount").textContent = String(bikeFresh ? data.bikes.length : "—");
+    $("nearbyRoadsCount").textContent = String(roadFresh ? data.roads.length : "—");
+    $("nearbyAirCount").textContent = String(data.air.length);
+    $("nearbyBikesList").innerHTML = items(bikeItems, bikeFresh ? "范围内没有自行车站。" : "自行车快照暂无数据。");
+    $("nearbyRoadsList").innerHTML = items(roadItems, roadFresh ? "范围内没有道路事件。" : "道路事件快照暂无数据。");
+    $("nearbyAirList").innerHTML = items(airItems, "范围内没有监测点。");
+    const notes = [];
+    if (bikeFresh && data.bike_info?.source === "public_archive")
+      notes.push("自行车" + archiveSnapshotLabel(data.bike_info));
+    else if (data.bike_info?.mode === "nearest")
+      notes.push("自行车快照 " + shortTime(data.bike_info.captured_at) + "，距所选 " + Math.round(data.bike_info.age_minutes) + " 分钟");
+    if (data.road_info?.reconstructed)
+      notes.push("道路事件按前后快照交集重建");
+    else if (roadFresh && data.road_info?.source === "public_road_archive")
+      notes.push("道路事件" + archiveSnapshotLabel(data.road_info));
+    $("nearbyStatus").textContent = notes.join(" · ");
+    $("nearbyDetails").hidden = false;
+    showNearbyTab(S.nearbyTab);
   }
   async function prefillNearbyComparison(selected, data, queryParams, generation) {
     const comparePrefill = S.comparePrefill;
     if (!comparePrefill || selected.kind === "point") return;
     const station = selected.kind === "air" ? selected.feature.properties : data.trend;
     if (!station) return;
-    const series = await api("/api/analysis/series", {...queryParams, source:station.source, sites:station.id}).catch(() => null);
+    const analysisMetric = metricForSource(station.source, $("cityMetric").value);
+    const series = await api("/api/analysis/series", {...queryParams, metric:analysisMetric, source:station.source, sites:station.id}).catch(() => null);
     if (!series || generation !== S.detailGeneration || comparePrefill !== S.comparePrefill) return;
     S.comparePrefill = null;
     S.compareRevision++;
-    if ($("analysisSource").value !== station.source) {
-      $("analysisSource").value = station.source;
-      resetCompareStations();
-    }
+    const analysisChanged = $("analysisSource").value !== station.source ||
+      $("analysisMetric").value !== analysisMetric;
+    setAnalysisSource(station.source, analysisMetric);
+    if (analysisChanged) resetCompareStations();
     const old = selectedCompareStations();
     const ids = selected.kind === "road" ? data.air.filter(a => a.source === station.source).slice(0, MAX_COMPARE_STATIONS).map(a => a.id) :
       old.length ? old : [station.id];
@@ -1539,18 +1773,23 @@
     const p = selected.feature.properties;
     const queryParams = query();
     const key = JSON.stringify([selected.kind, p.source, p.id, selected.center, queryParams]);
+    const selectionKey = JSON.stringify([selected.kind, p.source, p.id, selected.center]);
+    const selectionChanged = S.nearbySelectionKey !== selectionKey;
+    S.nearbySelectionKey = selectionKey;
+    if (selectionChanged) S.airRefOpen = {};
     const refreshAir = !resourcesOnly || S.localAirKey !== key;
     const generation = ++S.detailGeneration;
     const isCoordinate = selected.kind === "point" || selected.kind === "road";
     const [lon, lat] = selected.center;
     const anchor = isCoordinate ? {kind:"point", lon, lat} : {kind:selected.kind, source:p.source || "", site:p.id};
-    $("nearbySummary").textContent = "正在查询…";
-    $("nearbyContent").textContent = "正在查询附近资源…";
+    if (selectionChanged || $("nearbyDetails").hidden) {
+      $("nearbyStatus").textContent = "正在查询附近资源…";
+      $("nearbyDetails").hidden = true;
+    }
     if (refreshAir) {
       S.localAirKey = null;
-      $("localAir").textContent = "正在查询地点空气质量…";
+      if (selectionChanged || !S.localAirHasData) setLocalAirMessage("正在查询地点空气质量…");
     }
-    renderNearbyTrend(null);
     if (!resourcesOnly) {
       void refreshOverviewAdvice(!!queryParams.cursor);
       void refreshOverviewWeather(queryParams);
@@ -1567,19 +1806,21 @@
         S.localAirKey = key;
       }
       renderNearbyResources(data, queryParams.cursor);
-      renderNearbyTrend(data.trend, selected.kind === "air" ? "本站在所选时段暂无有效观测趋势。" : "范围内暂无可显示的监测站观测趋势。");
-      if (!$("bikeStation").value && data.bikes.length) $("bikeStation").value = data.bikes[0].id;
       await prefillNearbyComparison(selected, data, queryParams, generation);
     } catch (e) {
       if (generation !== S.detailGeneration) return;
-      $("nearbySummary").textContent = "周边数据暂不可用";
-      $("nearbyContent").textContent = e.message;
-      if (refreshAir) renderLocalAir({});
+      $("nearbyStatus").textContent = "周边数据暂不可用：" + e.message;
+      $("nearbyDetails").hidden = true;
+      if (refreshAir && !S.localAirHasData) renderLocalAir({});
     }
   }
   function openSelected() {
     if (!S.selected || S.selected.kind === "point") return;
     const { kind, feature } = S.selected;
+    if (kind === "bike" && feature.properties.snapshot_source === "public_archive") {
+      window.open(BIKE_ARCHIVE_DATASET, "_blank", "noopener,noreferrer");
+      return;
+    }
     const cursor = query().cursor;
     if (kind === "road") H.openRoad(feature.properties.id, cursor || null);
     else
@@ -1593,7 +1834,8 @@
       );
   }
   async function loadAnalysis() {
-    if (!S.start || !window.echarts) return;
+    if (!S.start || S.analysisSection === "bike" ||
+        (!window.echarts && S.analysisSection !== "borough")) return;
     const generation = ++S.analysisGeneration;
     const compareRevision = S.compareRevision;
     const source = $("analysisSource").value;
@@ -1604,17 +1846,20 @@
         throw new Error("最多选择 " + MAX_COMPARE_STATIONS + " 个站点进行对比");
       const q = {
         ...query(),
+        metric: $("analysisMetric").value,
         source,
         sites: sites.join(","),
         interval: $("analysisInterval").value,
-        bike_site: $("bikeStation").value,
       };
       const series = await api("/api/analysis/series", q);
       if (generation !== S.analysisGeneration || source !== $("analysisSource").value) return;
-      if (!sites.length) sites = series.stations.map((s) => s.id);
+      sites = series.stations.map((s) => s.id);
       const compareEdited = compareRevision !== S.compareRevision;
       populateStations(series.available_sites, compareEdited ? selectedCompareStations() : sites, !compareEdited);
       S.series = series;
+      S.analysisSeriesCursor = q.cursor ?? null;
+      if (S.analysisSection === "borough") drawAnalysis();
+      if (!window.echarts) return;
       const weather = await api("/api/analysis/weather", {
         ...q,
         site: sites[0] || "",
@@ -1635,7 +1880,7 @@
           )
           .join("");
       $("weatherStation").value = weather.station || "";
-      drawAnalysis();
+      if (S.analysisSection !== "borough") drawAnalysis();
     } catch (e) {
       if (generation === S.analysisGeneration && source === $("analysisSource").value) error(e.message);
     }
@@ -1717,25 +1962,501 @@
       true,
     );
   }
+  function normalizeBoroughName(value) {
+    return String(value ?? "")
+      .trim()
+      .toLowerCase()
+      .replace(/&/g, " and ")
+      .replace(/^(london|royal) borough of /, "")
+      .replace(/[^a-z0-9]+/g, "");
+  }
+  function boroughCoverageValue(row) {
+    const value = Number(row?.coverage);
+    return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
+  }
+  function boroughCoverageModel(rows = [], features = []) {
+    const featureByKey = new Map();
+    for (const feature of features) {
+      const name = feature?.properties?.LAD25NM;
+      if (name) featureByKey.set(normalizeBoroughName(name), feature);
+    }
+    const rowsByKey = new Map();
+    for (const row of rows) {
+      const key = normalizeBoroughName(row?.name);
+      const stations = Math.max(0, Math.round(Number(row?.stations) || 0));
+      const validHours = Math.max(0, Number(row?.valid_hours) || 0);
+      const coverage = boroughCoverageValue(row);
+      const existing = rowsByKey.get(key);
+      if (!existing) {
+        rowsByKey.set(key, {
+          key,
+          name: String(row?.name ?? ""),
+          stations,
+          validHours,
+          coverage,
+        });
+        continue;
+      }
+      const totalStations = existing.stations + stations;
+      existing.coverage = totalStations
+        ? (existing.coverage * existing.stations + coverage * stations) / totalStations
+        : 0;
+      existing.stations = totalStations;
+      existing.validHours += validHours;
+    }
+    const points = [],
+      unmatched = [];
+    let totalStations = 0,
+      weightedCoverage = 0;
+    for (const row of rowsByKey.values()) {
+      totalStations += row.stations;
+      weightedCoverage += row.coverage * row.stations;
+      const feature = featureByKey.get(row.key);
+      if (!feature) {
+        unmatched.push({
+          ...row,
+          displayName: row.name,
+          coveragePercent: row.coverage * 100,
+          unmatched: true,
+        });
+        continue;
+      }
+      const properties = feature.properties || {};
+      const lng = Number(properties.LONG),
+        lat = Number(properties.LAT);
+      points.push({
+        ...row,
+        name: properties.LAD25NM || row.name,
+        displayName: row.name,
+        code: properties.LAD25CD || "",
+        lng: Number.isFinite(lng) ? lng : null,
+        lat: Number.isFinite(lat) ? lat : null,
+        bounds: geometryBounds(feature.geometry),
+        coveragePercent: row.coverage * 100,
+        unmatched: false,
+      });
+    }
+    let missingCount = 0;
+    for (const key of featureByKey.keys())
+      if (!rowsByKey.has(key)) missingCount++;
+    const baseline = totalStations ? weightedCoverage / totalStations : null;
+    for (const item of [...points, ...unmatched]) {
+      item.deltaPercentagePoints = baseline === null || !item.stations
+        ? null
+        : (item.coverage - baseline) * 100;
+      item.missingPerThousand = Math.round((1 - item.coverage) * 1000);
+    }
+    return {
+      points,
+      unmatched,
+      missingCount,
+      totalStations,
+      weightedCoverage: baseline,
+    };
+  }
+  function boroughBubbleSize(stations) {
+    return 7 + Math.sqrt(Math.max(1, Number(stations) || 1)) * 2.8;
+  }
+  function boroughDeltaLabel(delta) {
+    if (delta === null) return "—";
+    const magnitude = Math.abs(delta).toFixed(1);
+    return magnitude === "0.0" ? magnitude : (delta < 0 ? "−" : "+") + magnitude;
+  }
+  function boroughDeltaFraction(delta) {
+    return Math.max(-1, Math.min(1, delta / BOROUGH_DELTA_LIMIT));
+  }
+  function boroughMissingLabel(item) {
+    return "每 1,000 个应有站点小时约缺测 " + item.missingPerThousand + " 小时";
+  }
+  function boroughCoverageDetails(item) {
+    const lines = [
+      item.stations + " 个站点 · " + item.validHours + " 个有效站点小时",
+      "有效时段占比 " + item.coveragePercent.toFixed(1) + "%",
+    ];
+    if (item.deltaPercentagePoints !== null) {
+      lines.push("较全市 " + boroughDeltaLabel(item.deltaPercentagePoints) + " 个百分点");
+      lines.push(boroughMissingLabel(item));
+    }
+    return lines;
+  }
+  function renderBoroughSummary(model, start, end) {
+    const node = $("boroughSummary");
+    const range = $("boroughRange");
+    if (range) range.textContent = start && end ? "统计范围 " + time(start) + " 至 " + time(end) : "";
+    if (!node) return;
+    const count = model.points.length + model.unmatched.length;
+    if (!count) {
+      node.textContent = "当前条件下暂无数据";
+      return;
+    }
+    const parts = [
+      count + " 个行政区",
+      "共 " + model.totalStations + " 个站点",
+    ];
+    if (model.weightedCoverage !== null)
+      parts.push("全市站点加权覆盖率 " + (model.weightedCoverage * 100).toFixed(1) + "%");
+    node.textContent = parts.join(" · ");
+  }
+  function renderBoroughList(model, { mapReady = true } = {}) {
+    const container = $("boroughCoverage");
+    if (!container) return;
+    const entries = (mapReady
+      ? [...model.points, ...model.unmatched]
+      : [...model.unmatched])
+      .sort((a, b) =>
+        Number(a.coveragePercent.toFixed(1)) - Number(b.coveragePercent.toFixed(1)) ||
+        b.stations - a.stations ||
+        String(a.displayName || a.name).localeCompare(String(b.displayName || b.name), "en"),
+      );
+    if (!entries.length) {
+      container.innerHTML =
+        "<p class='borough-empty'>当前筛选条件下暂无行政区覆盖数据。</p>";
+      return;
+    }
+    container.innerHTML = entries
+      .map((item) => {
+        const label = item.displayName || item.name;
+        const unmatched = mapReady && item.unmatched;
+        const delta = item.deltaPercentagePoints;
+        const deltaLabel = boroughDeltaLabel(delta);
+        const bar = boroughDeltaFraction(delta ?? 0) * 50;
+        const direction = delta === null || deltaLabel === "0.0" ? "neutral" : delta < 0 ? "lower" : "higher";
+        const barColor = BOROUGH_DELTA_COLORS[bar < 0 ? 0 : 2];
+        const details = [label, ...boroughCoverageDetails(item)].join(" · ");
+        return (
+          "<button type='button' class='borough-row' data-borough='" + esc(item.name) +
+          "' aria-pressed='false' title='" + esc(details) +
+          "'><span class='borough-row-name'>" + esc(label) +
+          (unmatched ? "<em class='borough-row-unmatched'>未匹配地图</em>" : "") +
+          "</span><span class='borough-row-stat'>" + item.stations + " 站</span>" +
+          "<span class='borough-row-stat'>" + item.coveragePercent.toFixed(1) + "%</span>" +
+          "<span class='borough-row-stat borough-row-delta' data-direction='" + direction + "'>" +
+          deltaLabel + "</span>" +
+          "<span class='borough-bar' aria-hidden='true'><i style='left:" + (50 + Math.min(0, bar)) +
+          "%;width:" + Math.abs(bar) + "%;background:" + barColor + "'></i></span>" +
+          (delta === null ? "" : "<span class='borough-row-detail' hidden>" + boroughMissingLabel(item) + "</span>") +
+          "</button>"
+        );
+      })
+      .join("");
+    updateBoroughSelection();
+  }
+  function renderBoroughLegend(model) {
+    const node = $("boroughLegend");
+    if (!node) return;
+    const bubbles = [1, 5, 10, 20]
+      .map(
+        (stations) =>
+          "<span class='borough-bubble-sample'><i style='width:" +
+          boroughBubbleSize(stations).toFixed(1) + "px;height:" +
+          boroughBubbleSize(stations).toFixed(1) + "px;background:" + BOROUGH_BUBBLE_FILL +
+          ";border-color:" + BOROUGH_BUBBLE_OUTLINE + "'></i>" + stations + "</span>",
+      )
+      .join("");
+    const baseline = (model.weightedCoverage * 100).toFixed(1);
+    node.innerHTML =
+      "<span class='borough-legend-item'><span class='borough-legend-label'>较全市（百分点）</span>" +
+      "<span class='borough-color-scale'><i aria-hidden='true' style='background:linear-gradient(90deg," +
+      BOROUGH_DELTA_COLORS.join(",") + ")'></i><span>≤ −" + BOROUGH_DELTA_LIMIT +
+      "</span><span>0 · 全市 " + baseline + "%</span><span>≥ +" + BOROUGH_DELTA_LIMIT + "</span></span></span>" +
+      "<span class='borough-legend-item'><i class='borough-missing-swatch' style='background:" +
+      BOROUGH_MISSING_COLOR + "' aria-hidden='true'></i>无数据</span>" +
+      "<span class='borough-legend-item'><span class='borough-legend-label'>站点数</span>" +
+      bubbles + "</span>";
+    node.hidden = false;
+  }
+  function updateBoroughSelection() {
+    const key = normalizeBoroughName(S.boroughSelection);
+    const item = S.boroughSelection && S.boroughItems.find((entry) => entry.key === key);
+    const container = $("boroughCoverage");
+    if (container?.querySelectorAll)
+      for (const row of container.querySelectorAll("[data-borough]")) {
+        const selected = Boolean(item) && normalizeBoroughName(row.dataset.borough) === item.key;
+        row.classList.toggle("active", selected);
+        row.setAttribute("aria-pressed", String(selected));
+        const detail = row.querySelector(".borough-row-detail");
+        if (detail) detail.hidden = !selected;
+      }
+    const text = $("boroughSelectionText"),
+      button = $("boroughViewOnMap");
+    if (!item) {
+      S.boroughSelection = null;
+      S.boroughSelectedPoint = null;
+      if (text) text.textContent = "点击地图或右侧列表查看行政区";
+      if (button) button.hidden = true;
+      return;
+    }
+    S.boroughSelectedPoint = item;
+    if (text)
+      text.textContent =
+        [item.displayName || item.name, ...boroughCoverageDetails(item)].join(" · ") +
+        (item.unmatched && S.boroughMapHasData ? "（未匹配地图）" : "");
+    if (button) {
+      button.hidden = !(item.code && item.bounds);
+      button.dataset.borough = item.name;
+    }
+  }
+  function selectBorough(name) {
+    if (!name) return;
+    S.boroughSelection = name;
+    updateBoroughSelection();
+    const chart = S.charts.boroughMap;
+    if (chart && S.boroughMapHasData) {
+      chart.dispatchAction({ type: "downplay", seriesIndex: 0 });
+      if (S.boroughSelectedPoint && !S.boroughSelectedPoint.unmatched)
+        chart.dispatchAction({ type: "highlight", seriesIndex: 0, name: S.boroughSelectedPoint.name });
+    }
+    const container = $("boroughCoverage");
+    const row = container?.querySelector
+      ? [...container.querySelectorAll("[data-borough]")].find(
+          (node) => node.dataset.borough === name,
+        )
+      : null;
+    scrollBoroughRowIntoView(row);
+  }
+  function scrollBoroughRowIntoView(row) {
+    const list = $("boroughCoverage");
+    if (!list?.getBoundingClientRect || !row?.getBoundingClientRect) return;
+    const listRect = list.getBoundingClientRect(),
+      rowRect = row.getBoundingClientRect();
+    const padding = parseFloat(window.getComputedStyle(list).paddingBlockStart);
+    const top = listRect.top + padding;
+    const bottom = listRect.bottom - padding;
+    if (rowRect.top < top)
+      list.scrollTop -= Math.ceil(top - rowRect.top);
+    else if (rowRect.bottom > bottom)
+      list.scrollTop += Math.ceil(rowRect.bottom - bottom);
+  }
+  function ensureBoroughMap() {
+    if (S.boroughMapReady) return Promise.resolve(S.boroughGeo);
+    if (!S.boroughMapPromise) {
+      S.boroughMapPromise = loadSpatial("borough")
+        .then((geo) => {
+          if (!window.echarts || typeof window.echarts.registerMap !== "function")
+            throw new Error("地图组件不可用");
+          window.echarts.registerMap(BOROUGH_MAP_NAME, geo);
+          S.spatial["data/london_boroughs_2025.geojsonData"] = geo;
+          S.boroughGeo = geo;
+          S.boroughMapReady = true;
+          return geo;
+        })
+        .catch((error) => {
+          S.boroughMapPromise = null;
+          throw error;
+        });
+    }
+    return S.boroughMapPromise;
+  }
+  function drawBoroughMap(model, features) {
+    if (!S.boroughMapReady || !window.echarts) return;
+    const mapChart = chart("boroughMap");
+    if (!mapChart) return;
+    mapChart.resize();
+    const byName = new Map(model.points.map((point) => [point.name, point]));
+    const mapData = (features || []).map((feature) => {
+      const name = feature?.properties?.LAD25NM || "";
+      const point = byName.get(name);
+      return { name, value: point?.deltaPercentagePoints ?? null };
+    });
+    const regions = mapData.map(({name, value}) => {
+      const areaColor = value === null ? BOROUGH_MISSING_COLOR : window.echarts.color.lerp(
+        (boroughDeltaFraction(value) + 1) / 2, BOROUGH_DELTA_COLORS,
+      );
+      return { name, itemStyle: { areaColor }, emphasis: { itemStyle: { areaColor } } };
+    });
+    const bubbleData = model.points
+      .filter((point) => point.lng !== null && point.lat !== null && point.stations > 0)
+      .map((point) => ({
+        name: point.name,
+        value: [point.lng, point.lat, point.stations],
+      }));
+    if (!S.boroughMapBound) {
+      S.boroughMapBound = true;
+      mapChart.on("click", (params) => {
+        if (params?.name) selectBorough(params.name);
+      });
+    }
+    mapChart.setOption(
+      {
+        animation: false,
+        backgroundColor: "transparent",
+        textStyle: {
+          color: "#a8bfce",
+          fontFamily: "Inter, Segoe UI, sans-serif",
+          fontSize: 13,
+        },
+        tooltip: {
+          trigger: "item",
+          confine: true,
+          backgroundColor: "#122638",
+          borderColor: "#3b5a6d",
+          textStyle: { color: "#e5edf5", fontSize: 14 },
+          formatter: (item) => {
+            const point = byName.get(item.name);
+            if (!point?.stations)
+              return "<strong>" + esc(item.name) + "</strong><br>当前指标无可用站点";
+            return (
+              "<strong>" + esc(point.displayName) + "</strong><br>" +
+              boroughCoverageDetails(point).map(esc).join("<br>")
+            );
+          },
+        },
+        geo: {
+          map: BOROUGH_MAP_NAME,
+          nameProperty: "LAD25NM",
+          roam: false,
+          layoutCenter: ["50%", "50%"],
+          layoutSize: "120%",
+          aspectScale: 0.62,
+          regions,
+          itemStyle: {
+            areaColor: BOROUGH_MISSING_COLOR,
+            borderColor: "#192d3c",
+            borderWidth: 1,
+          },
+          emphasis: {
+            itemStyle: { borderColor: "#d6f4fb", borderWidth: 2 },
+            label: { show: false },
+          },
+        },
+        series: [
+          {
+            name: "较全市覆盖率（百分点）",
+            type: "map",
+            geoIndex: 0,
+            nameProperty: "LAD25NM",
+            selectedMode: false,
+            data: mapData,
+            label: { show: false },
+            emphasis: { label: { show: false } },
+          },
+          {
+            name: "站点数",
+            type: "scatter",
+            coordinateSystem: "geo",
+            geoIndex: 0,
+            data: bubbleData,
+            symbolSize: (value) => boroughBubbleSize(value[2]),
+            itemStyle: {
+              color: BOROUGH_BUBBLE_FILL,
+              borderColor: BOROUGH_BUBBLE_OUTLINE,
+              borderWidth: 1.25,
+            },
+            emphasis: { scale: 1.2 },
+            z: 3,
+          },
+        ],
+      },
+      true,
+    );
+    const selected = S.boroughSelectedPoint;
+    if (selected && !selected.unmatched) {
+      mapChart.dispatchAction({ type: "downplay", seriesIndex: 0 });
+      mapChart.dispatchAction({
+        type: "highlight",
+        seriesIndex: 0,
+        name: selected.name,
+      });
+    }
+  }
+  function boroughMapNote(model) {
+    const parts = [];
+    if (model.missingCount)
+      parts.push(model.missingCount + " 个行政区当前指标无可用站点。");
+    if (model.unmatched.length)
+      parts.push(model.unmatched.length + " 个行政区未匹配边界，已在列表中标注。");
+    return parts.join("");
+  }
+  function setBoroughWorkspaceMap(hasMap) {
+    const workspace = $("boroughWorkspace");
+    if (workspace)
+      workspace.classList.toggle("borough-workspace-no-map", !hasMap);
+  }
+  function finalizeBoroughFallback(message) {
+    const map = $("boroughMap"),
+      legend = $("boroughLegend"),
+      note = $("boroughMapNote");
+    setBoroughWorkspaceMap(false);
+    if (map) map.hidden = true;
+    if (legend) legend.hidden = true;
+    if (note) note.textContent = message;
+  }
+  function drawBoroughCoverage({ boroughs, start, end }, cursor) {
+    const generation = ++S.boroughGeneration;
+    const data = Array.isArray(boroughs) ? boroughs : [];
+    S.boroughMapHasData = false;
+    const preliminary = boroughCoverageModel(data, []);
+    S.boroughItems = preliminary.unmatched;
+    S.boroughPoints = [];
+    renderBoroughSummary(preliminary, start, cursor ?? end);
+    renderBoroughList(preliminary, { mapReady: false });
+    updateBoroughSelection();
+    const note = $("boroughMapNote");
+    if (!data.length) {
+      finalizeBoroughFallback("");
+      return;
+    }
+    if (note) note.textContent = "正在加载行政区边界…";
+    if (!window.echarts) {
+      finalizeBoroughFallback("地图组件不可用，已保留覆盖率列表。");
+      return;
+    }
+    ensureBoroughMap()
+      .then((geo) => {
+        if (generation !== S.boroughGeneration) return;
+        const model = boroughCoverageModel(data, geo.features);
+        S.boroughItems = [...model.points, ...model.unmatched];
+        S.boroughPoints = model.points;
+        S.boroughMapHasData = model.points.some((point) => point.stations > 0);
+        renderBoroughList(model, { mapReady: S.boroughMapHasData });
+        if (S.boroughMapHasData) {
+          setBoroughWorkspaceMap(true);
+          renderBoroughLegend(model);
+          const map = $("boroughMap");
+          if (map) map.hidden = false;
+          drawBoroughMap(model, geo.features);
+          if (note) note.textContent = boroughMapNote(model);
+        } else {
+          setBoroughWorkspaceMap(false);
+          const map = $("boroughMap");
+          if (map) map.hidden = true;
+          const legend = $("boroughLegend");
+          if (legend) legend.hidden = true;
+          if (note)
+            note.textContent = "当前来源的站点元数据未提供可匹配的行政区，暂无法绘制行政区地图。";
+        }
+        updateBoroughSelection();
+      })
+      .catch(() => {
+        if (generation !== S.boroughGeneration) return;
+        S.boroughItems = preliminary.unmatched;
+        S.boroughPoints = [];
+        S.boroughMapHasData = false;
+        renderBoroughList(preliminary, { mapReady: false });
+        updateBoroughSelection();
+        finalizeBoroughFallback("行政区边界暂不可用，已保留覆盖率列表。");
+      });
+  }
   function drawAnalysis() {
-    if (!S.series || !S.weather) return;
+    if (!S.series) return;
+    if (S.analysisSection === "borough") {
+      drawBoroughCoverage(S.series, S.analysisSeriesCursor);
+      return;
+    }
+    if (!S.weather || !window.echarts) return;
     const series = S.series,
       weather = S.weather,
       first = series.stations[0],
-      cursor = query().cursor;
+      cursor = query().cursor,
+      pollutionUnit = airUnit(
+        series.stations
+          .flatMap((station) => station.points)
+          .find((point) => point.unit)?.unit || "",
+      );
     const interval =
       $("analysisInterval").value === "900" && series.source === "laqn"
         ? 900000
         : 3600000;
-    $("analysisNote").textContent =
-      sourceNames[series.source] +
-      " · " +
-      metric() +
-      " · " +
-      time(S.start.toISOString()) +
-      " 至 " +
-      time(S.end.toISOString()) +
-      "\n小时值优先使用来源记录；由 15 分钟值汇总时至少需要 3 / 4 个时段。缺测保持为空。";
     $("seriesSummary").textContent =
       series.stations.reduce((n, s) => n + s.points.length, 0) + " 个有效时段";
     const pollutionLines = lines(series.stations, interval);
@@ -1781,7 +2502,7 @@
       "pollutionHeatmap",
       cells,
     );
-    if ($("heatmapNote")) $("heatmapNote").textContent = (first ? first.name + " · " + first.id : "尚未选择站点") + " · " + metric() + " · 有值 " + cells.filter(p=>p.value!==null).length + " / " + cells.length + " 个小时。" + (cells.some(p=>p.value!==null) ? "颜色越深表示数值越高；灰色格为缺测。" : "所选站点、指标和时间范围内没有有效小时数据，请调整筛选。") + " 时区：" + zone();
+    if ($("heatmapNote")) $("heatmapNote").textContent = (first ? first.name + " · " + first.id : "尚未选择站点") + " · " + metric(series.metric) + " · 有值 " + cells.filter(p=>p.value!==null).length + " / " + cells.length + " 个小时。" + (cells.some(p=>p.value!==null) ? "颜色越深表示数值越高；灰色格为缺测。" : "所选站点、指标和时间范围内没有有效小时数据，请调整筛选。") + " 时区：" + zone();
     heatmap(
       "missingHeatmap",
       cells.map((p) => ({ ...p, value: p.value === null ? 1 : 0 })),
@@ -1829,33 +2550,39 @@
     }));
     chart("weatherChart").setOption(
       base({
-        grid: { left: 48, right: 115, top: 45, bottom: 50 },
+        grid: { left: 48, right: 195, top: 45, bottom: 50 },
         legend: { top: 3, textStyle: { color: "#aac2d2" } },
         yAxis: [
           {
             type: "value",
-            name: "污染",
+            name: "污染" + (pollutionUnit ? " " + pollutionUnit : ""),
             splitLine: { lineStyle: { color: "#263d4c" } },
           },
           {
             type: "value",
-            name: "风速",
+            name: "风速 m/s",
             position: "right",
             offset: 0,
+            nameLocation: "end",
+            nameGap: 16,
             splitLine: { show: false },
           },
           {
             type: "value",
-            name: "温度",
+            name: "温度 °C",
             position: "right",
-            offset: 36,
+            offset: 70,
+            nameLocation: "end",
+            nameGap: 16,
             splitLine: { show: false },
           },
           {
             type: "value",
-            name: "湿度",
+            name: "湿度 %",
             position: "right",
-            offset: 72,
+            offset: 140,
+            nameLocation: "end",
+            nameGap: 16,
             splitLine: { show: false },
           },
         ],
@@ -1863,7 +2590,7 @@
           ...(first
             ? [
                 {
-                  name: metric(),
+                  name: metric(series.metric),
                   type: "line",
                   symbol: "none",
                   data: pointsWithGaps(first.points, interval),
@@ -1884,26 +2611,30 @@
       "。";
     chart("weatherScatter").setOption(
       base({
+        grid: { left: 60, right: 35, top: 45, bottom: 80 },
         tooltip: {
           trigger: "item",
           formatter: (item) =>
             esc(time(item.data[2])) +
             "<br>风速来源值 " +
             item.data[0] +
-            "<br>" +
-            esc(metric()) +
+            " m/s<br>" +
+            esc(metric(series.metric)) +
             " " +
-            item.data[1],
+            item.data[1] +
+            (pollutionUnit ? " " + pollutionUnit : ""),
         },
         xAxis: {
           type: "value",
-          name: "风速（来源值）",
+          name: "风速 m/s（来源值）",
+          nameLocation: "middle",
+          nameGap: 30,
           axisLabel: { color: "#94a8ba" },
           splitLine: { lineStyle: { color: "#283d4c" } },
         },
         yAxis: {
           type: "value",
-          name: metric(),
+          name: metric(series.metric) + (pollutionUnit ? " " + pollutionUnit : ""),
           splitLine: { lineStyle: { color: "#283d4c" } },
         },
         series: [
@@ -1924,60 +2655,11 @@
         ? "达到 24 对且数值有变化后显示相关系数"
         : "Pearson r = " + weather.correlation.toFixed(3)) +
       " · 观察性分析。";
-    const bikes = series.bike_series;
-    function bikePoints(key) {
-      const values = [];
-      bikes.forEach((p, i) => {
-        const ms = Date.parse(p.captured_at_utc);
-        if (i && ms - Date.parse(bikes[i - 1].captured_at_utc) > 600000)
-          values.push([ms - 1, null]);
-        values.push([ms, p[key]]);
-      });
-      return values;
-    }
-    chart("bikeChart").setOption(
-      base({
-        legend: { top: 4, textStyle: { color: "#abc4d4" } },
-        series: [
-          {
-            name: "可用车辆",
-            type: "line",
-            step: "end",
-            symbol: "none",
-            connectNulls: false,
-            data: bikePoints("bikes"),
-          },
-          {
-            name: "空位",
-            type: "line",
-            step: "end",
-            symbol: "none",
-            connectNulls: false,
-            data: bikePoints("empty_docks"),
-          },
-        ],
-      }),
-      true,
-    );
-    $("bikeNote").textContent = bikes.length
-      ? bikes.length + " 份成功快照 · 按获取时间展示 · 超过 10 分钟的间隔断开"
-      : "选择自行车站后查看已归档快照。";
-    $("boroughCoverage").innerHTML = series.boroughs
-      .map(
-        (row) =>
-          "<div class='borough-item'>" +
-          esc(row.name) +
-          "<span>" +
-          row.stations +
-          " 个站点 · 有效时段 " +
-          (row.coverage * 100).toFixed(1) +
-          "%</span></div>",
-      )
-      .join("");
   }
   S.overviewMapHost = $("cityMap")?.parentElement;
   if ($("gisTableDialog")?.append) $("gisTableDialog").append(document.querySelector(".gis-table-panel"));
   $("healthGroup").addEventListener("change", renderCitizen);
+  $("localAir").addEventListener("click", toggleAirReferences);
   $("closeGisTable")?.addEventListener?.("click", () => $("gisTableDialog").close());
   $("closeLinkage")?.addEventListener?.("click", () => $("linkageDialog").close());
   OUTLOOK_TABS.forEach((name, index) => {
@@ -1989,6 +2671,17 @@
       if (!Object.hasOwn(targets, event.key)) return;
       event.preventDefault();
       showOutlookTab(OUTLOOK_TABS[targets[event.key]], true);
+    });
+  });
+  NEARBY_TABS.forEach((name, index) => {
+    const button = $("nearbyTab-" + name);
+    button.addEventListener("click", () => showNearbyTab(name));
+    button.addEventListener("keydown", event => {
+      const count = NEARBY_TABS.length;
+      const targets = {ArrowLeft:(index+count-1)%count, ArrowRight:(index+1)%count, Home:0, End:count-1};
+      if (!Object.hasOwn(targets, event.key)) return;
+      event.preventDefault();
+      showNearbyTab(NEARBY_TABS[targets[event.key]], true);
     });
   });
   document
@@ -2038,18 +2731,24 @@
   $("gisTablePrevious").addEventListener("click", () => { S.gisPage--; renderGisTable(); });
   $("gisTableNext").addEventListener("click", () => { S.gisPage++; renderGisTable(); });
   $("pollutionZones")?.addEventListener?.("change", drawPollutionZones);
-  $("analysisMetric").innerHTML = $("cityMetric").innerHTML;
-  $("analysisMetric").value = $("cityMetric").value;
-  for (const id of ["cityMetric", "analysisMetric"]) {
-    $(id).addEventListener("change", () => {
-      const value = $(id).value;
-      $("cityMetric").value = $("analysisMetric").value = value;
-      refreshCity();
-    });
-  }
+  // The analysis page starts on the map metric; the two selects then stay
+  // independent because the analysis metrics depend on the chosen source.
+  syncAnalysisMetrics($("analysisSource").value, $("cityMetric").value);
+  syncAnalysisControls(S.analysisSection || "series");
+  $("cityMetric").addEventListener("change", () => refreshCity());
+  $("analysisMetric").addEventListener("change", loadAnalysis);
   $("cityMode").addEventListener("change", () => {
     stopReplay();
     refreshCity(true);
+  });
+  $("replayRange").addEventListener("change", () => {
+    stopReplay();
+    const previousHour = S.hours[Number($("replayHour").value)];
+    resetWindow();
+    const index = S.hours.indexOf(previousHour);
+    if (index >= 0) $("replayHour").value = index;
+    replayLabel();
+    refreshCity();
   });
   $("replayHour").addEventListener("change", () => {
     replayLabel();
@@ -2086,7 +2785,26 @@
       return loadNearby({resourcesOnly:true});
     });
   $("openSelected").addEventListener("click", openSelected);
-  $("analyseSelected").addEventListener("click", () => showPage("analysis"));
+  $("analyseSelected").addEventListener("click", () => {
+    if (S.selected?.kind === "bike") {
+      S.analysisSection = "bike";
+      window.AirWatchBikeAnalysis?.prefill(S.selected.feature.properties.id);
+    } else if (S.selected?.kind === "air" && S.analysisSection === "bike") {
+      S.analysisSection = "series";
+    }
+    showPage("analysis");
+  });
+  $("boroughCoverage").addEventListener("click", (event) => {
+    const button = event.target.closest?.("[data-borough]");
+    if (button) selectBorough(button.dataset.borough);
+  });
+  $("boroughViewOnMap").addEventListener("click", () => {
+    const point = S.boroughSelectedPoint;
+    if (!point?.code || !point.bounds) return;
+    window.dispatchEvent(new CustomEvent("airwatch:show-boundary", {
+      detail: { level: "borough", code: point.code, bounds: point.bounds },
+    }));
+  });
   $("changeLocation").addEventListener("click", () => setLocationPicker($("locationOptions").hidden));
   for (const id of ["locationNetworkLaqn", "locationNetworkBreathe"])
     $(id).addEventListener("change", renderLocationSearch);
@@ -2117,7 +2835,8 @@
     }
   });
   const comparePicker = $("compareStationsPicker");
-  $("compareStations").addEventListener("change", () => {
+  $("compareStations").addEventListener("change", (event) => {
+    if (isSingleSiteSection()) keepSingleCompareStation(event?.target);
     S.compareRevision++;
     S.comparePrefill = null;
     updateCompareSummary();
@@ -2131,6 +2850,7 @@
     if (comparePicker.open && !comparePicker.contains(event.target)) comparePicker.open = false;
   });
   $("analysisSource").addEventListener("change", () => {
+    syncAnalysisMetrics();
     resetCompareStations();
     $("weatherStation").value = "";
     loadAnalysis();
@@ -2143,18 +2863,22 @@
     if (S.selected && S.start) void refreshOverviewWeather(query());
     return loadAnalysis();
   });
-  $("bikeStation").addEventListener("change", loadAnalysis);
   $("analysisInterval").addEventListener("change", loadAnalysis);
   window.addEventListener("resize", () => {
     Object.values(S.charts).forEach((c) => c.resize());
     if (S.map) S.map.resize();
   });
   window.addEventListener("airwatch:refreshed", () => {
+    if (S.page === "analysis" && S.analysisSection === "bike") {
+      window.AirWatchBikeAnalysis?.refresh();
+      return;
+    }
     if (!S.start || S.page === "tables") return;
     refreshCity();
   });
   window.addEventListener("airwatch:timezone", () => {
     replayLabel();
+    repaintOverviewWeather();
     if (S.data) summaries();
     if (S.series) drawAnalysis();
   });

@@ -48,11 +48,12 @@
   const escape = value => String(value ?? "—").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
   const zone = () => $("timezone").value;
   const roads = () => state.source === "tfl" && $("tflMode").value === "roads";
-  function time(value) {
+  function time(value, compact = false) {
     if (!value) return "—";
     const date = new Date(value);
     if (!Number.isFinite(date.getTime())) return String(value);
-    const stamp = new Intl.DateTimeFormat("zh-CN", { timeZone: zone(), year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(date);
+    const stamp = new Intl.DateTimeFormat("zh-CN", { timeZone: zone(), year: compact === true ? undefined : "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(date);
+    if (compact === true) return stamp;
     const name = new Intl.DateTimeFormat("en-GB", { timeZone: zone(), timeZoneName: "short" }).formatToParts(date).find(p => p.type === "timeZoneName").value;
     return stamp + " " + name;
   }
@@ -84,13 +85,35 @@
     if (state.source === "tfl") return ["BIKES_AVAILABLE", "DOCKS_EMPTY"];
     return ["TEMPERATURE", "HUMIDITY", "MSLP", "WIND_SPEED", "WIND_DIRECTION", "WIND_GUST", "VISIBILITY", "WEATHER_CODE", "PRESSURE_TENDENCY"];
   }
+  function readingTime(value) {
+    const full = escape(time(value));
+    if (!value || state.source !== "metoffice") return full;
+    return "<time datetime='" + escape(value) + "' title='" + full + "'>" + escape(time(value, true)) + "</time>";
+  }
   function measurementCell(row) {
-    if (!row) return '<td><span class="muted">—</span></td>';
+    if (!row) return '<span class="muted">—</span>';
     const limit = state.source === "tfl" ? 15 * 60 : state.source === "metoffice" ? 27 * 3600 : 3 * 3600;
     const stale = Date.now() - Date.parse(row.valid_at_utc) > limit * 1000;
     const value = row.value_num === null ? row.value_text : Number(row.value_num).toLocaleString("zh-CN", { maximumFractionDigits: 5 });
     const unit = row.unit || (state.source === "metoffice" ? "单位未提供" : "");
-    return '<td class="' + (stale ? "stale" : "") + '"><span class="value">' + escape(value) + '</span><span class="unit">' + escape(unit) + '</span><span class="quality" title="U 未提供审定状态，P 暂定，R 已审定">' + escape(row.quality) + '</span><span class="obs-time">' + escape(time(row.valid_at_utc)) + (stale ? " · 已过期" : "") + '</span><span class="sub">获取 ' + escape(time(row.fetched_at_utc)) + (row.time_basis === "retrieval_time" ? " · 以获取时间记快照" : "") + "</span></td>";
+    return '<div class="reading' + (stale ? " stale" : "") + '"><span class="value">' + escape(value) +
+      '</span><span class="unit">' + escape(unit) + '</span><span class="quality" title="U 未提供审定状态，P 暂定，R 已审定">' +
+      escape(row.quality) + '</span><span class="obs-time">' + readingTime(row.valid_at_utc) + (stale ? " · 已过期" : "") +
+      '</span><span class="sub">获取 ' + readingTime(row.fetched_at_utc) +
+      (row.time_basis === "retrieval_time" ? " · 以获取时间记快照" : "") + "</span></div>";
+  }
+  function responsiveTable(headings, rows, emptyMessage, tableClass = "") {
+    const labels = headings.map(escape);
+    const header = labels.map(label => "<th scope='col' role='columnheader'>" + label + "</th>").join("");
+    const records = rows.map(cells => "<tr role='row'>" + cells.map((cell, index) =>
+      "<td role='cell'><span class='data-cell-label' aria-hidden='true'>" + labels[index] + "</span>" + cell + "</td>"
+    ).join("") + "</tr>").join("");
+    return "<table class='data-center-table " + tableClass + "' role='table'><thead role='rowgroup'><tr role='row'>" + header +
+      "</tr></thead><tbody role='rowgroup'>" + (records || "<tr role='row'><td role='cell' class='empty' colspan='" +
+        headings.length + "'>" + escape(emptyMessage) + "</td></tr>") + "</tbody></table>";
+  }
+  function detailButton(label, index) {
+    return "<button type='button' class='site-link' data-item='" + index + "'>" + escape(label) + "</button>";
   }
   function pageLabel(page, total, size) {
     return total ? "第 " + page + " / " + Math.ceil(total / size) + " 页 · 共 " + total.toLocaleString() + " 条" : "暂无记录";
@@ -137,21 +160,30 @@
     let headings, rows;
     if (state.source === "boundaries") {
       headings = ["区划名称", "类别", "标准代码", "面积（平方公里）", "周长（公里）"];
-      rows = state.items.map((row, index) => "<tr><td><button class='site-link' data-item='" + index + "'>" + escape(row.name) + "</button></td><td>" + escape(row.kind) + "</td><td>" + escape(row.code) + "</td><td>" + boundaryNumber(row.area) + "</td><td>" + boundaryNumber(row.perimeter) + "</td></tr>").join("");
+      rows = state.items.map((row, index) => [detailButton(row.name, index), escape(row.kind), escape(row.code),
+        boundaryNumber(row.area), boundaryNumber(row.perimeter)]);
     } else if (roads()) {
       headings = ["道路事件", "类别 / 严重程度", "状态", "开始 / 结束时间", "来源修改时间"];
-      rows = state.items.map((row, index) => "<tr><td><button class='site-link' data-item='" + index + "'>" + escape(row.location_text || row.event_id) + "</button><span class='sub'>" + escape(row.event_id) + "</span></td><td>" + escape(row.category) + "<span class='sub'>" + escape(row.severity) + "</span></td><td>" + escape(row.status) + "<span class='sub'>" + (row.is_active ? "进行中" : "已结束") + "</span></td><td>" + escape(time(row.starts_at_utc)) + "<span class='sub'>" + escape(time(row.ends_at_utc)) + "</span></td><td>" + escape(time(row.modified_at_utc)) + "<span class='sub'>最近见于列表 " + escape(time(row.last_seen_utc)) + "</span></td></tr>").join("");
+      rows = state.items.map((row, index) => [
+        detailButton(row.location_text || row.event_id, index) + "<span class='sub'>" + escape(row.event_id) + "</span>",
+        escape(row.category) + "<span class='sub'>" + escape(row.severity) + "</span>",
+        escape(row.status) + "<span class='sub'>" + (row.is_active ? "进行中" : "已结束") + "</span>",
+        escape(time(row.starts_at_utc)) + "<span class='sub'>" + escape(time(row.ends_at_utc)) + "</span>",
+        escape(time(row.modified_at_utc)) + "<span class='sub'>最近见于列表 " + escape(time(row.last_seen_utc)) + "</span>",
+      ]);
     } else {
       const metrics = columns();
       headings = ["站点", state.source === "tfl" ? "坐标" : "类型 / 区域", ...metrics.map(metric => METRICS[metric] || metric)];
       rows = state.items.map((row, index) => {
         const meta = row.metadata || {};
         const info = state.source === "tfl" ? [row.latitude ?? "—", row.longitude ?? "—"].join(", ") : [row.kind, meta.Borough || meta.region || meta.area].filter(Boolean).join(" / ");
-        return "<tr><td><button class='site-link' data-item='" + index + "'>" + escape(row.name || row.source_id) + "</button><span class='sub'>" + escape(row.source_id) + (row.active ? "" : " · 停用") + "</span></td><td>" + escape(info || "—") + "</td>" + metrics.map(metric => measurementCell(row.values[metric])).join("") + "</tr>";
-      }).join("");
+        const station = detailButton(row.name || row.source_id, index) + "<span class='sub'>" +
+          escape(row.source_id) + (row.active ? "" : " · 停用") + "</span>";
+        return [station, escape(info || "—"), ...metrics.map(metric => measurementCell(row.values[metric]))];
+      });
     }
-    $("dataTable").innerHTML = "<table><thead><tr>" + headings.map(title => "<th scope='col'>" + escape(title) + "</th>").join("") + "</tr></thead><tbody>" + (rows || "<tr><td class='empty' colspan='" + headings.length + "'>当前筛选条件下暂无记录</td></tr>") + "</tbody></table>";
-    $("rowCount").textContent = "共 " + state.total.toLocaleString() + (state.source === "boundaries" ? " 个区域" : roads() ? " 个事件" : " 个站点");
+    $("dataTable").innerHTML = responsiveTable(headings, rows, "当前筛选条件下暂无记录",
+      state.source === "metoffice" ? "data-center-table--weather" : "");
     $("pageInfo").textContent = pageLabel(state.page, state.total, Number($("pageSize").value));
     $("previous").disabled = state.page <= 1;
     $("next").disabled = state.page * Number($("pageSize").value) >= state.total;
@@ -203,7 +235,7 @@
       }
     }
   }
-  const jobNames = { laqn_sites: "站点目录", laqn_hourly: "小时浓度与指数", laqn_15min: "15 分钟浓度", breathe_web_hourly: "官网地图", breathe_web_reconcile: "逐站曲线补查", tfl_bikes: "自行车", tfl_roads: "道路列表", met_sites: "站点发现", met_hourly: "气象观测" };
+  const jobNames = { laqn_sites: "站点目录", laqn_hourly: "小时浓度与指数", laqn_15min: "15 分钟浓度", breathe_web_hourly: "官网地图", breathe_web_reconcile: "逐站曲线补查", tfl_bikes: "自行车", tfl_bike_archive: "自行车公开归档补录", tfl_roads: "道路列表", tfl_road_archive: "道路公开归档补录", met_sites: "站点发现", met_hourly: "气象观测" };
   function jobState(job) {
     const labels = { success: "成功", error: "失败", pending_credentials: "缺少密钥", credentials_error: "密钥配置错误", not_started: "尚未采集" };
     return (labels[job.status] || job.status) + (job.stale_run ? " · 采集过期" : "") + (job.stale_data ? " · 数据过期" : "");
@@ -219,9 +251,15 @@
     }
     const jobs = data.jobs.filter(job => job.source === state.source);
     $("statusSummary").textContent = data.collector_running ? "正在采集" : "按来源采集频率更新";
-    $("sourceStatus").innerHTML = "<div class='table-wrap'><table class='jobs'><thead><tr><th>任务</th><th>状态</th><th>最近成功</th><th>最新观测 / 修改</th><th>说明</th></tr></thead><tbody>" + jobs.map(job => "<tr><td>" + escape(jobNames[job.job] || job.job) + "</td><td>" + escape(jobState(job)) + "</td><td>" + escape(time(job.last_success_utc)) + "</td><td>" + escape(time(job.latest_observation_utc)) + "</td><td class='job-error'>" + escape(job.error || "—") + "</td></tr>").join("") + "</tbody></table></div>";
-    if (state.source === "breathe") $("sourceStatus").innerHTML += "<p class='status-extra'>过去 24 小时曲线补查 " + data.breathe_coverage.checked + " / " + data.breathe_coverage.active + " 个活动站 · " + data.breathe_coverage.failed + " 站失败</p>";
-    if (state.source === "metoffice") $("sourceStatus").innerHTML += "<p class='status-extra'>今日 UTC 请求用量 " + data.metoffice_budget.used + " / " + data.metoffice_budget.limit + "</p>";
+    const headings = ["任务", "状态", "最近成功", "最新观测 / 修改", "说明"];
+    const rows = jobs.map(job => [escape(jobNames[job.job] || job.job), escape(jobState(job)),
+      escape(time(job.last_success_utc)), escape(time(job.latest_observation_utc)),
+      job.error ? "<span class='job-error'>" + escape(job.error) + "</span>" : "—"]);
+    let extra = "";
+    if (state.source === "breathe") extra = "<p class='status-extra'>过去 24 小时曲线补查 " + data.breathe_coverage.checked + " / " + data.breathe_coverage.active + " 个活动站 · " + data.breathe_coverage.failed + " 站失败</p>";
+    if (state.source === "metoffice") extra = "<p class='status-extra'>今日 UTC 请求用量 " + data.metoffice_budget.used + " / " + data.metoffice_budget.limit + "</p>";
+    $("sourceStatus").innerHTML = "<div class='table-wrap data-center-table-wrap'>" +
+      responsiveTable(headings, rows, "暂无采集任务", "jobs") + "</div>" + extra;
   }
   async function loadStatus() {
     state.status = await api("/api/status");
@@ -267,6 +305,7 @@
       }));
     });
     $("detail").showModal();
+    $("detail").scrollTop = 0;
   }
   async function openDetail(index, suppliedRow = null, suppliedSource = null, suppliedRoad = null, initialRange = null) {
     const row = suppliedRow || state.items[index];
@@ -284,17 +323,42 @@
     $("boundaryDetail").hidden = true;
     errorAt("detailError", "");
     $("detail").showModal();
+    $("detail").scrollTop = 0;
     if (state.detail.isRoad) {
       $("roadDetail").textContent = "读取事件详情…";
       try {
         const data = await api("/api/road-events", { id: row.event_id, ...(initialRange?.at ? {at: initialRange.at} : {}) });
         if (generation !== state.detailGeneration) return;
         const labels = { event_id: "事件 ID", category: "类别", severity: "严重程度", status: "状态", location_text: "道路范围", starts_at_utc: "开始", ends_at_utc: "结束", modified_at_utc: "来源修改", last_seen_utc: "最近见于列表" };
-        $("roadDetail").innerHTML = "<div class='road-summary'>" + Object.entries(labels).map(([key, label]) => "<p><span>" + label + "</span>" + escape(key.endsWith("_utc") ? time(data[key]) : data[key]) + "</p>").join("") + "</div><h3>几何范围</h3><pre class='raw-data'>" + escape(prettyJSON(data.geometry_json)) + "</pre><h3>历史版本（" + data.versions.length + "）</h3>" + (data.versions.map(version => "<details><summary>版本 " + escape(version.old_revision) + " · 替换于 " + escape(time(version.replaced_at_utc)) + "</summary><pre class='raw-data'>" + escape(prettyJSON(version.old_payload_json)) + "</pre></details>").join("") || "<p class='muted'>暂无修订记录</p>");
-      } catch (error) { errorAt("detailError", error.message); }
+        if (data.replay_mode === "reconstructed") labels.replayed_at_utc = "回放重建于";
+        const revisions = data.versions.map(version => "<details><summary>版本 " + escape(version.old_revision) +
+          " · 替换于 " + escape(time(version.replaced_at_utc)) + "</summary><pre class='raw-data'>" +
+          escape(prettyJSON(version.old_payload_json)) + "</pre></details>").join("");
+        $("roadDetail").innerHTML = (data.replay_mode === "reconstructed" ?
+          "<p class='muted'>该小时没有原始列表快照，事件按前后两次列表的交集重建。</p>" : "") +
+          (data.snapshot_source === "public_road_archive" ?
+            "<p class='muted'>位置和事件状态来自 <a href='https://github.com/farhanmunim/london-buses/commits/main/data/api/roadworks.json' target='_blank' rel='noopener'>公开归档</a> · Powered by TfL Open Data</p>" : "") +
+          "<div class='road-summary'>" + Object.entries(labels).map(([key, label]) => "<p><span>" + label +
+            "</span>" + escape(key.endsWith("_utc") ? time(data[key]) : data[key]) + "</p>").join("") +
+          "</div><details class='road-detail-section'><summary>几何范围</summary><pre class='raw-data'>" +
+          escape(prettyJSON(data.geometry_json)) + "</pre></details>" +
+          (revisions ? "<details class='road-detail-section'><summary>历史版本（" + data.versions.length +
+            "）</summary>" + revisions + "</details>" : "<p class='muted'>暂无修订记录</p>");
+      } catch (error) {
+        if (generation === state.detailGeneration) {
+          $("roadDetail").textContent = "";
+          errorAt("detailError", error.message);
+        }
+      }
       return;
     }
+    $("stationMetadata").open = false;
     $("metadata").innerHTML = metadataHTML(row);
+    $("historyTable").innerHTML = "";
+    $("historyBounds").textContent = "";
+    $("historyPageInfo").textContent = "";
+    $("historyPrevious").disabled = true;
+    $("historyNext").disabled = true;
     state.detail.range = initialRange || recentWindow();
     $("historyMetric").innerHTML = "<option value=''>全部指标</option>";
     $("historyPeriod").value = "";
@@ -319,7 +383,12 @@
         $("historyMetric").innerHTML = "<option value=''>全部指标</option>" + metrics.map(metric => "<option value='" + escape(metric) + "'>" + escape(METRICS[metric] || metric) + "</option>").join("");
       }
       $("historyBounds").textContent = "查询范围 " + time(range.start) + " 至 " + time(range.end);
-      $("historyTable").innerHTML = "<table><thead><tr>" + ["观测时间", "指标", "数值", "单位", "时长", "质量", "获取时间", "时间依据"].map(title => "<th>" + title + "</th>").join("") + "</tr></thead><tbody>" + (data.items.map(row => "<tr><td>" + escape(time(row.valid_at_utc)) + "</td><td>" + escape(METRICS[row.metric] || row.metric) + "</td><td>" + escape(row.value_num ?? row.value_text) + "</td><td>" + escape(row.unit || "单位未提供") + "</td><td>" + (row.period_seconds ? row.period_seconds / 60 + " 分钟" : "快照") + "</td><td>" + escape(row.quality) + "</td><td>" + escape(time(row.fetched_at_utc)) + "</td><td>" + escape(row.time_basis) + "</td></tr>").join("") || "<tr><td class='empty' colspan='8'>该时段暂无符合条件的观测</td></tr>") + "</tbody></table>";
+      const headings = ["观测时间", "指标", "数值", "单位", "时长", "质量", "获取时间", "时间依据"];
+      const rows = data.items.map(row => [escape(time(row.valid_at_utc)), escape(METRICS[row.metric] || row.metric),
+        escape(row.value_num ?? row.value_text), escape(row.unit || "单位未提供"),
+        row.period_seconds ? row.period_seconds / 60 + " 分钟" : "快照", escape(row.quality),
+        escape(time(row.fetched_at_utc)), escape(row.time_basis)]);
+      $("historyTable").innerHTML = responsiveTable(headings, rows, "该时段暂无符合条件的观测");
       $("historyPageInfo").textContent = pageLabel(state.historyPage, data.total, Number($("pageSize").value));
       $("historyPrevious").disabled = state.historyPage <= 1;
       $("historyNext").disabled = state.historyPage * Number($("pageSize").value) >= data.total;
