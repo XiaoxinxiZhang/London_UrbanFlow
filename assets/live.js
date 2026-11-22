@@ -2,8 +2,7 @@
   "use strict";
   const METRICS = {
     PM25_CONCENTRATION: "PM₂.₅", PM10_CONCENTRATION: "PM₁₀", NO2_CONCENTRATION: "NO₂", O3_CONCENTRATION: "O₃",
-    PM25_INDEX: "PM₂.₅ 指数", PM10_INDEX: "PM₁₀ 指数", NO2_INDEX: "NO₂ 指数", O3_INDEX: "O₃ 指数",
-    PM25INDEX: "PM₂.₅ 指数", NO2INDEX: "NO₂ 指数",
+    PM10_INDEX: "PM₁₀ 指数", O3_INDEX: "O₃ 指数",
     BIKES_AVAILABLE: "可用车辆", DOCKS_EMPTY: "空位", DOCKS_TOTAL: "总停靠位",
     TEMPERATURE: "温度", HUMIDITY: "相对湿度", MSLP: "海平面气压", WIND_SPEED: "风速",
     WIND_DIRECTION: "风向", WIND_GUST: "阵风", VISIBILITY: "能见度", WEATHER_CODE: "天气代码",
@@ -37,14 +36,17 @@
     if (!Number.isFinite(next.getTime())) throw new Error("请选择有效日期");
     return { start: midnightUTC(start, zone), end: midnightUTC(next.toISOString().slice(0, 10), zone) };
   }
-  if (typeof module !== "undefined") module.exports = { calendarDate, midnightUTC, dateRange };
+  function recentWindow(now = Date.now()) {
+    const end = Math.floor(now / 1000) * 1000;
+    return { start: new Date(end - 48 * 3600000).toISOString(), end: new Date(end).toISOString() };
+  }
+  if (typeof module !== "undefined") module.exports = { calendarDate, midnightUTC, dateRange, recentWindow };
   if (typeof document === "undefined") return;
 
   const $ = id => document.getElementById(id);
-  const state = { source: "laqn", page: 1, total: 0, items: [], status: null, generation: 0, detail: null, detailGeneration: 0, historyPage: 1, historyInitialRange: null, updating: false, lastUpdate: Date.now(), timer: null, boundaryPromise: null };
+  const state = { source: "laqn", page: 1, total: 0, items: [], status: null, generation: 0, detail: null, detailGeneration: 0, historyPage: 1, updating: false, lastUpdate: Date.now(), timer: null, boundaryPromise: null };
   const escape = value => String(value ?? "—").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
   const zone = () => $("timezone").value;
-  const selectedSource = () => state.source === "breathe" ? $("breatheSource").value : state.source;
   const roads = () => state.source === "tfl" && $("tflMode").value === "roads";
   function time(value) {
     if (!value) return "—";
@@ -67,7 +69,7 @@
     return data;
   }
   function params() {
-    const value = { source: selectedSource(), page: state.page, page_size: $("pageSize").value, active: $("showAll").checked ? "0" : "1", search: $("search").value.trim() };
+    const value = { source: state.source, page: state.page, page_size: $("pageSize").value, active: $("showAll").checked ? "0" : "1", search: $("search").value.trim() };
     if (state.source === "laqn") {
       value.period = $("laqnMode").value === "index" ? "3600" : $("laqnMode").value;
       value.kind = $("laqnMode").value === "index" ? "index" : "concentration";
@@ -76,8 +78,9 @@
     return value;
   }
   function columns() {
-    if (state.source === "laqn") return ["PM25", "PM10", "NO2", "O3"].map(pol => pol + ($("laqnMode").value === "index" ? "_INDEX" : "_CONCENTRATION"));
-    if (state.source === "breathe") return selectedSource() === "breathe_wcc" ? ["PM25_CONCENTRATION", "NO2_CONCENTRATION"] : ["PM25_CONCENTRATION", "NO2_CONCENTRATION", "PM25INDEX", "NO2INDEX"];
+    if (state.source === "laqn") return $("laqnMode").value === "index" ? ["PM10_INDEX", "O3_INDEX"] :
+      ["PM25_CONCENTRATION", "PM10_CONCENTRATION", "NO2_CONCENTRATION", "O3_CONCENTRATION"];
+    if (state.source === "breathe") return ["PM25_CONCENTRATION", "NO2_CONCENTRATION"];
     if (state.source === "tfl") return ["BIKES_AVAILABLE", "DOCKS_EMPTY"];
     return ["TEMPERATURE", "HUMIDITY", "MSLP", "WIND_SPEED", "WIND_DIRECTION", "WIND_GUST", "VISIBILITY", "WEATHER_CODE", "PRESSURE_TENDENCY"];
   }
@@ -154,7 +157,7 @@
     $("next").disabled = state.page * Number($("pageSize").value) >= state.total;
   }
   function configure() {
-    for (const [id, source] of [["laqnFilter", "laqn"], ["breatheFilter", "breathe"], ["tflFilter", "tfl"], ["weatherFilter", "metoffice"]]) $(id).hidden = state.source !== source;
+    for (const [id, source] of [["laqnFilter", "laqn"], ["tflFilter", "tfl"], ["weatherFilter", "metoffice"]]) $(id).hidden = state.source !== source;
     const geographic = state.source === "boundaries";
     $("showAllFilter").hidden = geographic;
     $("collectionStatus").hidden = geographic;
@@ -165,10 +168,10 @@
       button.classList.toggle("active", active);
       if (active) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
     }
-    const titles = { laqn: "LAQN · " + $("laqnMode").selectedOptions[0].text, breathe: "Breathe London · " + $("breatheSource").selectedOptions[0].text, tfl: "TfL · " + $("tflMode").selectedOptions[0].text, metoffice: "英国气象局 · 地面观测", boundaries: "伦敦行政区划" };
+    const titles = { laqn: "LAQN · " + $("laqnMode").selectedOptions[0].text, breathe: "Breathe London", tfl: "TfL · " + $("tflMode").selectedOptions[0].text, metoffice: "英国气象局 · 地面观测", boundaries: "伦敦行政区划" };
     $("tableTitle").textContent = titles[state.source];
     $("showAllLabel").textContent = roads() ? "包括已结束事件" : "包括停用站点";
-    $("tableDescription").textContent = geographic ? "ONS 2025 年边界 · 点击名称查看区划资料与地图位置" : roads() ? "道路范围、状态及来源修改时间" : "各站最新值 · 点击站名查看元数据与历史观测";
+    $("tableDescription").textContent = geographic ? "ONS 2025 年边界 · 点击名称查看区划资料与地图位置" : roads() ? "道路范围、状态及来源修改时间" : "各站最近 48 小时内的最新值 · 点击站名查看元数据与观测";
   }
   async function loadTable() {
     const generation = ++state.generation;
@@ -184,7 +187,8 @@
         const matching = all.filter(row => (row.name + " " + row.code + " " + row.kind).toLowerCase().includes(search));
         const size = Number($("pageSize").value);
         data = { total: matching.length, items: matching.slice((state.page - 1) * size, state.page * size) };
-      } else data = await api(roads() ? "/api/road-events" : "/api/measurements", params());
+      } else if (roads()) data = await api("/api/road-events", params());
+      else data = await api("/api/measurements", { ...params(), ...recentWindow() });
       if (generation !== state.generation) return;
       state.items = data.items;
       state.total = data.total;
@@ -213,12 +217,11 @@
       $("badge-" + source).textContent = issues.length ? issues.length + " 项需关注" : "采集正常";
       $("badge-" + source).classList.toggle("warning", issues.length > 0);
     }
-    const jobs = data.jobs.filter(job => job.source === selectedSource());
+    const jobs = data.jobs.filter(job => job.source === state.source);
     $("statusSummary").textContent = data.collector_running ? "正在采集" : "按来源采集频率更新";
     $("sourceStatus").innerHTML = "<div class='table-wrap'><table class='jobs'><thead><tr><th>任务</th><th>状态</th><th>最近成功</th><th>最新观测 / 修改</th><th>说明</th></tr></thead><tbody>" + jobs.map(job => "<tr><td>" + escape(jobNames[job.job] || job.job) + "</td><td>" + escape(jobState(job)) + "</td><td>" + escape(time(job.last_success_utc)) + "</td><td>" + escape(time(job.latest_observation_utc)) + "</td><td class='job-error'>" + escape(job.error || "—") + "</td></tr>").join("") + "</tbody></table></div>";
-    if (state.source === "breathe" && selectedSource() === "breathe") $("sourceStatus").innerHTML += "<p class='status-extra'>过去 24 小时曲线补查 " + data.breathe_coverage.checked + " / " + data.breathe_coverage.active + " 个活动站 · " + data.breathe_coverage.failed + " 站失败</p>";
+    if (state.source === "breathe") $("sourceStatus").innerHTML += "<p class='status-extra'>过去 24 小时曲线补查 " + data.breathe_coverage.checked + " / " + data.breathe_coverage.active + " 个活动站 · " + data.breathe_coverage.failed + " 站失败</p>";
     if (state.source === "metoffice") $("sourceStatus").innerHTML += "<p class='status-extra'>今日 UTC 请求用量 " + data.metoffice_budget.used + " / " + data.metoffice_budget.limit + "</p>";
-    $("readTime").textContent = "数据库读取 " + time(data.server_time);
   }
   async function loadStatus() {
     state.status = await api("/api/status");
@@ -272,7 +275,7 @@
       openBoundaryDetail(row);
       return;
     }
-    state.detail = { source: suppliedSource || selectedSource(), row, isRoad: suppliedRoad ?? roads() };
+    state.detail = { source: suppliedSource || state.source, row, isRoad: suppliedRoad ?? roads(), replayRange: initialRange };
     const generation = ++state.detailGeneration;
     $("detailTitle").textContent = row.name || row.location_text || row.event_id || row.source_id;
     $("detailSubtitle").textContent = row.source_id || row.event_id;
@@ -292,10 +295,7 @@
       return;
     }
     $("metadata").innerHTML = metadataHTML(row);
-    const range = initialRange || {start: new Date(Date.now() - 48 * 3600000).toISOString(), end: new Date().toISOString()};
-    $("historyStart").value = calendarDate(new Date(range.start), zone());
-    $("historyEnd").value = calendarDate(new Date(range.end), zone());
-    state.historyInitialRange = range;
+    state.detail.range = initialRange || recentWindow();
     $("historyMetric").innerHTML = "<option value=''>全部指标</option>";
     $("historyPeriod").value = "";
     state.historyPage = 1;
@@ -310,7 +310,7 @@
     $("historyTable").style.opacity = ".5";
     errorAt("detailError", "");
     try {
-      const range = state.historyInitialRange || dateRange($("historyStart").value, $("historyEnd").value, zone());
+      const range = state.detail.range;
       const value = { source: state.detail.source, site: state.detail.row.source_id, mode: "history", page: state.historyPage, page_size: $("pageSize").value, metric: $("historyMetric").value, period: $("historyPeriod").value, ...range };
       const data = await api("/api/measurements", value);
       if (generation !== state.detailGeneration || !$("detail").open) return;
@@ -318,8 +318,8 @@
         const metrics = [...new Set(data.metrics.map(row => row.metric))];
         $("historyMetric").innerHTML = "<option value=''>全部指标</option>" + metrics.map(metric => "<option value='" + escape(metric) + "'>" + escape(METRICS[metric] || metric) + "</option>").join("");
       }
-      $("historyBounds").textContent = (state.historyInitialRange ? "查询范围 " + time(range.start) + " 至 " + time(range.end) : "按日期查询，包含结束日") + " · 时区 " + zone() + " · 已存观测范围 " + data.bounds.map(time).join(" 至 ");
-      $("historyTable").innerHTML = "<table><thead><tr>" + ["观测时间", "指标", "数值", "单位", "时长", "质量", "获取时间", "时间依据"].map(title => "<th>" + title + "</th>").join("") + "</tr></thead><tbody>" + (data.items.map(row => "<tr><td>" + escape(time(row.valid_at_utc)) + "</td><td>" + escape(METRICS[row.metric] || row.metric) + "</td><td>" + escape(row.value_num ?? row.value_text) + "</td><td>" + escape(row.unit || "单位未提供") + "</td><td>" + (row.period_seconds ? row.period_seconds / 60 + " 分钟" : "快照") + "</td><td>" + escape(row.quality) + "</td><td>" + escape(time(row.fetched_at_utc)) + "</td><td>" + escape(row.time_basis) + "</td></tr>").join("") || "<tr><td class='empty' colspan='8'>所选日期暂无观测，可调整日期范围</td></tr>") + "</tbody></table>";
+      $("historyBounds").textContent = "查询范围 " + time(range.start) + " 至 " + time(range.end);
+      $("historyTable").innerHTML = "<table><thead><tr>" + ["观测时间", "指标", "数值", "单位", "时长", "质量", "获取时间", "时间依据"].map(title => "<th>" + title + "</th>").join("") + "</tr></thead><tbody>" + (data.items.map(row => "<tr><td>" + escape(time(row.valid_at_utc)) + "</td><td>" + escape(METRICS[row.metric] || row.metric) + "</td><td>" + escape(row.value_num ?? row.value_text) + "</td><td>" + escape(row.unit || "单位未提供") + "</td><td>" + (row.period_seconds ? row.period_seconds / 60 + " 分钟" : "快照") + "</td><td>" + escape(row.quality) + "</td><td>" + escape(time(row.fetched_at_utc)) + "</td><td>" + escape(row.time_basis) + "</td></tr>").join("") || "<tr><td class='empty' colspan='8'>该时段暂无符合条件的观测</td></tr>") + "</tbody></table>";
       $("historyPageInfo").textContent = pageLabel(state.historyPage, data.total, Number($("pageSize").value));
       $("historyPrevious").disabled = state.historyPage <= 1;
       $("historyNext").disabled = state.historyPage * Number($("pageSize").value) >= data.total;
@@ -328,6 +328,11 @@
     } finally {
       if (generation === state.detailGeneration) $("historyTable").style.opacity = "";
     }
+  }
+  function refreshHistory() {
+    state.detail.range = state.detail.replayRange || recentWindow();
+    state.historyPage = 1;
+    return loadHistory();
   }
   const updateLabels = {
     checking: "检查中…", running: "更新中…", waiting: "等待更新…",
@@ -370,7 +375,7 @@
         run = await api("/api/update/" + run.id);
       }
       await refresh();
-      if ($("detail").open && !state.detail.isRoad && !state.detail.isBoundary) await loadHistory();
+      if ($("detail").open && !state.detail.isRoad && !state.detail.isBoundary) await refreshHistory();
       renderUpdate(run.state, run.jobs, run.error, run.finished_at);
     } catch (error) {
       renderUpdate("error", run?.jobs, error.message + "。可重新点击检查更新。", run?.finished_at);
@@ -395,10 +400,6 @@
     resetTable();
   });
   for (const id of ["laqnMode", "tflMode", "showAll", "pageSize", "region"]) $(id).addEventListener("change", resetTable);
-  $("breatheSource").addEventListener("change", () => {
-    $("showAll").checked = $("breatheSource").value === "breathe_wcc";
-    resetTable();
-  });
   let searchTimer;
   $("search").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(resetTable, 250); });
   $("previous").addEventListener("click", () => { state.page--; loadTable(); });
@@ -409,8 +410,7 @@
   });
   $("closeDetail").addEventListener("click", () => $("detail").close());
   $("detail").addEventListener("close", () => { state.detailGeneration++; });
-  $("queryHistory").addEventListener("click", () => { state.historyInitialRange = null; state.historyPage = 1; loadHistory(); });
-  for (const id of ["historyStart", "historyEnd"]) $(id).addEventListener("change", () => { state.historyInitialRange = null; });
+  $("queryHistory").addEventListener("click", refreshHistory);
   $("historyPrevious").addEventListener("click", () => { state.historyPage--; loadHistory(); });
   $("historyNext").addEventListener("click", () => { state.historyPage++; loadHistory(); });
   $("timezone").addEventListener("change", () => {
@@ -422,7 +422,7 @@
   $("autoInterval").addEventListener("change", () => { state.lastUpdate = Date.now(); });
   document.addEventListener("visibilitychange", maybeUpdate);
   window.AirWatchData = {
-    api, time, dateRange, calendarDate, metrics: METRICS,
+    api, time, dateRange, calendarDate, recentWindow, metrics: METRICS,
     async openStation(source, site, range = null) {
       const data = await api("/api/locations", {source, site});
       if (data.items.length) await openDetail(-1, data.items[0], source, false, range);
@@ -432,9 +432,9 @@
       await openDetail(-1, row, "tfl", true, at ? {at} : null);
     },
     showSource(source) {
-      state.source = source === "breathe_wcc" ? "breathe" : source;
-      if (state.source === "breathe") $("breatheSource").value = source;
-      $("showAll").checked = source === "breathe_wcc";
+      if (!Array.from($("sources").querySelectorAll("button")).some(button => button.dataset.source === source)) return;
+      state.source = source;
+      $("showAll").checked = false;
       $("search").value = "";
       resetTable();
     }

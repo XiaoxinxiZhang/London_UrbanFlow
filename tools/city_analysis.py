@@ -4,10 +4,13 @@ from datetime import datetime, timedelta, timezone
 import json
 import math
 
+from live_sources import POLLUTANTS
+
 UTC = timezone.utc
 LONDON = (-.55, 51.28, .34, 51.72)
 AIR_SOURCES = ("laqn", "breathe", "breathe_wcc")
-POLLUTANTS = {"PM25", "PM10", "NO2", "O3", "PM25_INDEX", "NO2_INDEX"}
+AIR_ESTIMATE_RADIUS_M = 2000
+AIR_ESTIMATE_NEAREST_M = 1000
 
 
 def dt(value):
@@ -44,12 +47,6 @@ def pollutant(params):
     return value
 
 
-def source_metric(source, metric):
-    if metric.endswith("_INDEX"):
-        return metric.replace("_INDEX", "Index").upper() if source=="breathe" else metric
-    return metric+"_CONCENTRATION"
-
-
 def valid_coordinate(lon, lat):
     return (isinstance(lon,(int,float)) and isinstance(lat,(int,float))
             and math.isfinite(lon) and math.isfinite(lat) and -180<=lon<=180 and -90<=lat<=90)
@@ -60,6 +57,23 @@ def distance(a, b):
     lon1,lat1,lon2,lat2 = map(math.radians, (*a,*b))
     h = math.sin((lat2-lat1)/2)**2+math.cos(lat1)*math.cos(lat2)*math.sin((lon2-lon1)/2)**2
     return 6371008.8*2*math.asin(min(1,math.sqrt(h)))
+
+
+def weighted_air_value(readings):
+    weights = [(1/max(meters, 50)**2, value) for meters, value in readings]
+    return round(sum(weight*value for weight, value in weights)/sum(weight for weight, _ in weights), 1)
+
+
+def local_air_unit(unit):
+    if not unit:
+        return None
+    compact = unit.replace("µ", "u").replace("μ", "u").replace("³", "3").replace(" ", "")
+    return "ug/m3" if compact == "ug/m3" else unit.strip()
+
+
+def valid_air_value(value, unit, quality):
+    return (isinstance(value, (int, float)) and math.isfinite(value) and value >= 0
+            and bool(unit and unit.strip()) and quality not in ("S", "I"))
 
 
 def ring_contains(point, ring):
@@ -170,6 +184,21 @@ def hourly(rows):
     return out
 
 
+def local_hours(rows):
+    by_unit = {}
+    for row in rows:
+        unit = local_air_unit(row["unit"])
+        by_unit.setdefault(unit, []).append({**row, "unit": unit})
+    hours = {}
+    for unit_rows in by_unit.values():
+        for point in hourly(unit_rows):
+            rank = (point["aggregation"] == "upstream_hour", point["valid_at_utc"])
+            current = hours.get(point["time"])
+            if current is None or rank > current[0]:
+                hours[point["time"]] = (rank, point)
+    return [hours[stamp][1] for stamp in sorted(hours)]
+
+
 class CityAnalysis:
     def __init__(self, connect):
         self.connect = connect
@@ -187,7 +216,7 @@ class CityAnalysis:
     def air_rows(self, db, source, metric, start, end, site=None):
         sql = """SELECT * FROM measurements WHERE source=? AND metric=?
           AND valid_at_utc>=? AND valid_at_utc<? AND period_seconds IN (900,3600)"""
-        values = [source,source_metric(source,metric),iso(start),iso(end)]
+        values = [source,metric+"_CONCENTRATION",iso(start),iso(end)]
         if site:
             sql += " AND source_id=?"
             values.append(site)
@@ -217,8 +246,7 @@ class CityAnalysis:
             else:
                 period = int(params.get("period","900"))
                 candidates = [r for r in rows if r["value_num"] is not None and
-                              (location["source"]!="laqn" or r["period_seconds"]==period
-                               or metric.endswith("_INDEX"))]
+                              (location["source"]!="laqn" or r["period_seconds"]==period)]
                 point = candidates[-1] if candidates else None
             metadata = json.loads(location["metadata_json"])
             properties = dict(source=location["source"],id=location["source_id"],name=location["name"],
@@ -295,7 +323,8 @@ class CityAnalysis:
                       source_stats=source_stats,
                       coverage=dict(total=len(air),valid=len(valid),fresh=sum(not f["properties"]["stale"] for f in valid)),
                       counts=dict(bikes=len(bikes),empty=sum(f["properties"]["state"]=="empty" for f in bikes),
-                                  full=sum(f["properties"]["state"]=="full" for f in bikes),roads=len(roads)))
+                                  full=sum(f["properties"]["state"]=="full" for f in bikes),
+                                  available=sum(f["properties"]["state"]=="available" for f in bikes),roads=len(roads)))
         return result
 
     def series(self, params):
@@ -336,7 +365,7 @@ class CityAnalysis:
                 for point in hourly(points):
                     coverage[point["time"]]=coverage.get(point["time"],0)+1
             bounds = db.execute("""SELECT MIN(valid_at_utc),MAX(valid_at_utc) FROM measurements
-              WHERE source=? AND metric=?""",(source,source_metric(source,metric))).fetchone()
+              WHERE source=? AND metric=?""",(source,metric+"_CONCENTRATION")).fetchone()
             hourly_total = max(1,math.ceil(((cursor or end)-start).total_seconds()/3600))
             boroughs = {}
             for location in locations:
@@ -358,41 +387,167 @@ class CityAnalysis:
                     boroughs=[{**item,"coverage":min(1,item["valid_hours"]/(item["stations"]*hourly_total))}
                               for item in boroughs.values()],bike_series=bike_series)
 
+    def local_air(self, db, params, center, start, end, cursor, anchor=None):
+        reference = cursor or end
+        hour = reference.replace(minute=0, second=0, microsecond=0)
+        earliest = max(start, hour if cursor else reference-timedelta(hours=3))
+        latest = min(end, reference+timedelta(seconds=1))
+        metric = pollutant(params)
+
+        def eligible(rows):
+            return [row for row in rows if dt(row["valid_at_utc"]) <= reference
+                    and valid_air_value(row["value_num"], row["unit"], row["quality"])]
+
+        if anchor:
+            p = anchor["properties"]
+            rows = self.air_rows(db, p["source"], metric, earliest, latest, p["id"])
+            valid = eligible(rows)
+            points = (local_hours(valid) or valid) if cursor else valid
+            if not cursor and p["source"] == "laqn":
+                period = int(params.get("period", "900"))
+                preferred = next((row for row in reversed(rows) if row["period_seconds"] == period
+                                  and row["value_num"] is not None and dt(row["valid_at_utc"]) <= reference), None)
+                if preferred and valid_air_value(preferred["value_num"], preferred["unit"], preferred["quality"]):
+                    points = [preferred]
+            if points:
+                point = points[-1]
+                reading = {**p, "metric": metric, "value": point["value_num"], "unit": point["unit"],
+                           "observed_at": point.get("time", point["valid_at_utc"]),
+                           "period_seconds": 3600 if "time" in point else point["period_seconds"],
+                           "quality": point["quality"], "fetched_at": point.get("fetched_at_utc"),
+                           "sample_count": point.get("sample_count", 1), "stale": False,
+                           "age_minutes": round((reference-dt(point["valid_at_utc"])).total_seconds()/60, 1)}
+                return dict(status="measured", value=reading["value"], unit=reading["unit"],
+                            observed_at=reading["observed_at"], period_seconds=reading["period_seconds"],
+                            stations=[{**reading, "distance_m": 0}])
+
+        sites = {}
+        for location in self.locations(db, include_archival=cursor is not None):
+            meters = distance(center, (location["longitude"], location["latitude"]))
+            if meters <= AIR_ESTIMATE_RADIUS_M:
+                sites[(location["source"], location["source_id"])] = (meters, location["name"])
+
+        by_station = {}
+        for source in ("laqn", "breathe"):
+            if not any(network == source for network, _ in sites):
+                continue
+            for row in eligible(self.air_rows(db, source, metric, earliest, latest)):
+                if (source, row["source_id"]) in sites:
+                    unit = local_air_unit(row["unit"])
+                    by_station.setdefault((source, row["source_id"], unit), []).append(row)
+
+        groups = {}
+        nearest = None
+        for (source, site, unit), rows in by_station.items():
+            meters, name = sites[(source, site)]
+            latest = rows[-1]
+            reading = dict(id=site, source=source, name=name, distance_m=round(meters), value=latest["value_num"],
+                           unit=unit, observed_at=latest["valid_at_utc"], period_seconds=latest["period_seconds"])
+            if (nearest is None or meters < nearest[0] or
+                    (meters == nearest[0] and reading["observed_at"] > nearest[1]["observed_at"])):
+                nearest = (meters, reading)
+            for point in hourly(rows):
+                stamp = point["time"]
+                if dt(stamp) >= (hour if cursor else earliest):
+                    reading = {**reading, "value": point["value_num"], "observed_at": stamp, "period_seconds": 3600}
+                    groups.setdefault((stamp, source, unit), []).append((meters, reading))
+
+        for stamp, source, unit in sorted(groups, key=lambda key: (key[0], key[1] == "laqn", key[2]), reverse=True):
+            readings = sorted(groups[(stamp, source, unit)], key=lambda item: item[0])
+            if len(readings) >= 2 and readings[0][0] <= AIR_ESTIMATE_NEAREST_M:
+                return dict(status="estimated", value=weighted_air_value((m, p["value"]) for m, p in readings),
+                            unit=unit, observed_at=stamp, period_seconds=3600, stations=[p for _, p in readings])
+        if nearest:
+            reading = nearest[1]
+            return dict(status="nearest", value=reading["value"], unit=reading["unit"],
+                        observed_at=reading["observed_at"], period_seconds=reading["period_seconds"], stations=[reading])
+        return dict(status="insufficient", value=None, unit=None, observed_at=None, period_seconds=None, stations=[])
+
+    def nearby_trend(self, db, params, start, end, cursor, stations, anchor=None):
+        candidates = [anchor] if anchor else stations
+        for station in candidates:
+            rows = self.air_rows(db, station["source"], pollutant(params), start, end, station["id"])
+            points = local_hours(row for row in rows if (not cursor or dt(row["valid_at_utc"]) <= cursor)
+                                  and valid_air_value(row["value_num"], row["unit"], row["quality"]))
+            if points:
+                unit = points[-1]["unit"]
+                return dict(id=station["id"], name=station["name"], source=station["source"],
+                            distance_m=station.get("distance_m", 0), unit=unit,
+                            points=[point for point in points if point["unit"] == unit])
+        return None
+
     def nearby(self, params):
         start,end,cursor = window(params)
         radius = int(params.get("radius","500"))
         road_radius = int(params.get("road_radius","1000"))
         if radius not in (500,1000,2000) or road_radius not in (500,1000,2000):
             raise ValueError("距离须为 500、1000 或 2000 米")
+        kind = params.get("kind","air")
+        if kind not in ("air","bike","road","point"):
+            raise ValueError("未知周边查询对象")
+        if kind == "point":
+            try:
+                center = [float(params.get("lon", "nan")), float(params.get("lat", "nan"))]
+            except (TypeError, ValueError) as exc:
+                raise ValueError("请输入有效经纬度") from exc
+            if not valid_coordinate(*center):
+                raise ValueError("请输入有效经纬度")
+        identity = params.get("site")
+        include_trend = params.get("include_trend") == "1"
+        include_air_metrics = params.get("include_air_metrics") == "1"
+        metric = pollutant(params)
+        air_params = {**params, "source": ""} if params.get("all_sources") == "1" else params
         with closing(self.connect()) as db:
-            air,_ = self.air_features(db,params,start,end,cursor)
+            db.execute("BEGIN")
+            air,_ = self.air_features(db,air_params,start,end,cursor)
             bikes,bike_info = self.traffic(db,"bikes",cursor)
             roads,road_info = self.traffic(db,"roads",cursor)
-        kind = params.get("kind","air")
-        if kind not in ("air","bike","road"):
-            raise ValueError("未知周边查询对象")
-        identity = params.get("site")
-        if kind=="road":
-            anchor = next((f for f in roads if f["properties"]["id"]==identity),None)
-            if anchor is None:
-                raise LookupError("所选时刻没有该道路事件")
-            center = anchor["geometry"]
-            separation = lambda f: geometry_distance(f["geometry"]["coordinates"],center)
-        else:
-            pool = bikes if kind=="bike" else air
-            anchor = next((f for f in pool if f["properties"]["id"]==identity and
-                           (kind=="bike" or f["properties"]["source"]==params.get("source","laqn"))),None)
-            if anchor is None:
-                raise LookupError("站点不存在或缺少坐标")
-            center = anchor["geometry"]["coordinates"]
-            separation = lambda f: distance(center,f["geometry"]["coordinates"])
-        nearby_air = [{**f["properties"],"distance_m":round(separation(f))} for f in air if separation(f)<=radius]
-        nearby_bikes = [{**f["properties"],"distance_m":round(separation(f))} for f in bikes if separation(f)<=radius]
+            if kind == "point":
+                anchor = feature(dict(type="Point", coordinates=center), {})
+            else:
+                pool = {"road": roads, "bike": bikes, "air": air}[kind]
+                anchor = next((f for f in pool if f["properties"]["id"] == identity and
+                               (kind != "air" or f["properties"]["source"] == params.get("source", "laqn"))), None)
+                if anchor is None and kind == "air" and params.get("all_sources") == "1":
+                    station_source = params.get("source", "laqn")
+                    location = next((loc for loc in self.locations(db, station_source, include_archival=True)
+                                     if loc["source_id"] == identity), None)
+                    if location:
+                        anchor = feature(dict(type="Point", coordinates=[location["longitude"], location["latitude"]]),
+                                         dict(id=identity, source=station_source, name=location["name"], kind=location["kind"]))
+                if anchor is None:
+                    raise LookupError("所选时刻没有该道路事件" if kind == "road" else "站点不存在或缺少坐标")
+            geometry = anchor["geometry"]
+            separation = lambda f: geometry_distance(f["geometry"]["coordinates"], geometry)
+
+            def within(features):
+                matches = []
+                for f in features:
+                    meters = separation(f)
+                    if meters <= radius:
+                        matches.append({**f["properties"], "distance_m": round(meters)})
+                return sorted(matches, key=lambda f: f["distance_m"])
+
+            nearby_air = within(air)
+            nearby_bikes = within(bikes)
+            local_readings = {}
+            if geometry["type"] == "Point" and params.get("resources_only") != "1":
+                air_metrics = sorted(POLLUTANTS) if include_air_metrics else (metric,)
+                station = anchor if kind == "air" else None
+                for air_metric in air_metrics:
+                    local_readings[air_metric] = self.local_air(db, {**params, "metric": air_metric},
+                                                               geometry["coordinates"], start, end, cursor, station)
+            trend = (self.nearby_trend(db, params, start, end, cursor, nearby_air,
+                                       anchor["properties"] if kind == "air" else None) if include_trend else None)
         if kind=="road":
             nearby_roads = [anchor["properties"]]
         else:
-            nearby_roads = [{**f["properties"],"distance_m":round(geometry_distance(center,f["geometry"]))}
-                            for f in roads if geometry_distance(center,f["geometry"])<=road_radius]
+            nearby_roads = []
+            for f in roads:
+                meters = geometry_distance(geometry["coordinates"], f["geometry"])
+                if meters <= road_radius:
+                    nearby_roads.append({**f["properties"], "distance_m": round(meters)})
+            nearby_roads.sort(key=lambda f: f["distance_m"])
         nearest = None
         if kind=="bike":
             candidates = [(separation(f),f) for f in air if f["properties"]["value"] is not None]
@@ -400,16 +555,20 @@ class CityAnalysis:
                 meters,point = min(candidates,key=lambda pair:pair[0])
                 if meters<=1000:
                     nearest = {**point["properties"],"distance_m":round(meters)}
-        return dict(anchor=anchor,air=sorted(nearby_air,key=lambda f:f["distance_m"]),
-                    bikes=sorted(nearby_bikes,key=lambda f:f["distance_m"]),roads=nearby_roads,
-                    nearest_air=nearest,bike_info=bike_info,road_info=road_info,
-                    available_bikes=sum(f["bikes"] or 0 for f in nearby_bikes))
+        result = dict(anchor=anchor,air=nearby_air,bikes=nearby_bikes,roads=nearby_roads,
+                      nearest_air=nearest,bike_info=bike_info,road_info=road_info,local_air=local_readings.get(metric),trend=trend,
+                      available_bikes=sum(f["bikes"] or 0 for f in nearby_bikes),
+                      empty_docks=sum(f["empty_docks"] or 0 for f in nearby_bikes))
+        if include_air_metrics:
+            result["local_air_by_metric"] = local_readings
+        return result
 
     def weather(self, params):
         start,end,cursor = window(params)
         source = params.get("source","laqn")
         if source not in AIR_SOURCES:
             raise ValueError("未知空气数据来源")
+        metric = pollutant(params)
         selection_end = min(end,cursor+timedelta(seconds=1)) if cursor else end
         with closing(self.connect()) as db:
             candidates = [dict(row) for row in db.execute("""SELECT l.source_id,l.name,l.metadata_json,COUNT(m.metric) count
@@ -426,11 +585,18 @@ class CityAnalysis:
             if station:
                 for row in db.execute("""SELECT * FROM measurements WHERE source='metoffice' AND source_id=?
                   AND valid_at_utc>=? AND valid_at_utc<? ORDER BY valid_at_utc""",(station,iso(start),iso(selection_end))):
-                    time = iso(dt(row["valid_at_utc"]).replace(minute=0,second=0,microsecond=0))
+                    observed = dt(row["valid_at_utc"])
+                    if cursor and observed > cursor:
+                        continue
+                    time = iso(observed.replace(minute=0,second=0,microsecond=0))
                     weather_points.setdefault(time,dict(time=time))[row["metric"]] = dict(row)
-            if cursor:
-                weather_points = {time: point for time,point in weather_points.items() if dt(time)<=cursor}
-            air = self.air_rows(db,source,pollutant(params),start,end,params.get("site",""))
+            if params.get("context_only") == "1":
+                fields = ("TEMPERATURE", "RELATIVE_HUMIDITY", "WIND_SPEED")
+                latest = next((point for point in reversed(weather_points.values())
+                               if any(point.get(field, {}).get("value_num") is not None for field in fields)), None)
+                station_name = next((item["name"] for item in candidates if item["source_id"] == station), None)
+                return dict(station=station, station_name=station_name, latest=latest)
+            air = self.air_rows(db,source,metric,start,end,params.get("site",""))
             if cursor:
                 air = [row for row in air if dt(row["valid_at_utc"])<=cursor]
             pollution = {point["time"]:point for point in hourly(air)}

@@ -34,7 +34,7 @@ const events = {};
 const windowEvents = {};
 function element(id) {
   if (!elements.has(id)) elements.set(id, {
-    value: id === "basemap" ? "dark" : id === "timezone" ? "Europe/London" : id === "cityRange" ? "48" : "",
+    value: id === "timezone" ? "Europe/London" : "",
     checked: true, hidden: false, textContent: "", innerHTML: "",
     addEventListener(name, handler) { this[name] = handler; },
     scrollIntoView() {},
@@ -47,7 +47,7 @@ const tabs = ["overview", "analysis", "tables"].map(page => ({
   setAttribute() {}, removeAttribute() {},
 }));
 const sources = new Map(), layers = new Map(), visibility = new Map(), filters = new Map(), layerOrder = [];
-let focusedBounds;
+let focusedBounds, initialStyle;
 const map = {
   addControl() {}, on(name, handler) { events[name] = handler; }, resize() {},
   addImage() {},
@@ -66,10 +66,9 @@ const map = {
   setFilter(id, filter) { filters.set(id, filter); },
   fitBounds(bounds) { focusedBounds = bounds; },
   setLayoutProperty(id, property, value) { if (property === "visibility") visibility.set(id, value); },
-  setStyle() { sources.clear(); layers.clear(); visibility.clear(); layerOrder.length = 0; },
 };
 const library = {
-  Map: function () { return map; },
+  Map: function ({style}) { initialStyle = style; return map; },
   NavigationControl: function () {}, AttributionControl: function () {},
 };
 const context = {
@@ -77,7 +76,7 @@ const context = {
     AirWatchData: {
       api() { return new Promise(() => {}); }, time: String,
       calendarDate(date) { return date.toISOString().slice(0, 10); },
-      dateRange() { throw new Error("not used"); },
+      recentWindow: require("../assets/live.js").recentWindow,
     },
     maplibregl: library, addEventListener(name, handler) { windowEvents[name] = handler; },
   },
@@ -87,7 +86,7 @@ const context = {
     createElement(name) {
       assert.equal(name, "canvas");
       return {getContext() { return {
-        beginPath() {}, moveTo() {}, lineTo() {}, closePath() {}, fill() {},
+        beginPath() {}, moveTo() {}, lineTo() {}, closePath() {}, fill() {}, stroke() {}, clearRect() {},
         getImageData() { return {data: new Uint8ClampedArray(32 * 32 * 4)}; },
       }; }};
     },
@@ -97,6 +96,8 @@ const context = {
 };
 vm.runInNewContext(fs.readFileSync(path.join(root, "assets/city.js"), "utf8"), context);
 events["style.load"]();
+assert.equal(initialStyle, "https://tiles.openfreemap.org/styles/positron");
+assert.equal(element("mapNotice").hidden, true);
 assert.equal(sources.get("london-region").data, "data/london_region_2025.geojson");
 assert.equal(sources.get("london-boroughs").data, "data/london_boroughs_2025.geojson");
 assert.equal(sources.has("london-rivers"), false);
@@ -104,21 +105,11 @@ assert.equal(layers.get("london-outer-boundary").type, "line");
 assert.equal(layers.get("london-borough-boundaries").type, "line");
 assert.equal(layers.has("london-thames"), false);
 assert.ok(layerOrder.indexOf("london-borough-boundaries") < layerOrder.indexOf("bike-clusters"));
-assert.notEqual(layers.get("london-outer-boundary").paint["line-color"], layers.get("london-borough-boundaries").paint["line-color"]);
-assert.match(element("mapLegend").innerHTML, /大伦敦外边界.*行政区边界/);
-element("layerBoundary").checked = false;
-element("layerBoundary").change();
-assert.equal(visibility.get("london-outer-boundary"), "none");
-assert.equal(visibility.get("london-borough-boundaries"), "none");
-const darkColor = layers.get("london-outer-boundary").paint["line-color"];
-element("basemap").value = "positron";
-element("basemap").change();
-events["style.load"]();
-assert.notEqual(layers.get("london-outer-boundary").paint["line-color"], darkColor);
-assert.equal(visibility.get("london-outer-boundary"), "none");
-assert.equal(visibility.get("london-borough-boundaries"), "none");
-element("layerBoundary").checked = true;
-element("layerBoundary").change();
+assert.equal(layers.get("london-outer-boundary").paint["line-color"], "#8b5700");
+assert.equal(layers.get("london-borough-boundaries").paint["line-color"], "#416578");
+assert.equal(layers.get("london-selected-borough").paint["line-color"], "#b12645");
+assert.match(element("legend-region").innerHTML, /#8b5700.*大伦敦外边界/);
+assert.match(element("legend-borough").innerHTML, /#416578.*行政区边界/);
 const selectedBounds = [[-0.12, 51.50], [-0.07, 51.53]];
 windowEvents["airwatch:show-boundary"]({detail: {
   level: "borough", code: "E09000001", bounds: selectedBounds,
@@ -126,9 +117,20 @@ windowEvents["airwatch:show-boundary"]({detail: {
 assert.deepEqual(focusedBounds, selectedBounds);
 assert.equal(filters.get("london-selected-borough")[2], "E09000001");
 assert.equal(visibility.get("london-selected-borough"), "visible");
-element("basemap").change();
+element("layerBoundary").checked = false;
+element("layerBoundary").change();
+assert.equal(visibility.get("london-outer-boundary"), "none");
+assert.equal(visibility.get("london-borough-boundaries"), "none");
+sources.clear();
+layers.clear();
+visibility.clear();
+layerOrder.length = 0;
 events["style.load"]();
 assert.equal(layers.get("london-selected-borough").filter[2], "E09000001");
+assert.equal(visibility.get("london-outer-boundary"), "none");
+assert.equal(visibility.get("london-borough-boundaries"), "none");
+element("layerBoundary").checked = true;
+element("layerBoundary").change();
 windowEvents["airwatch:show-boundary"]({detail: {
   level: "region", code: "E12000007", bounds: [[-0.55, 51.28], [0.34, 51.72]],
 }});
@@ -137,4 +139,14 @@ assert.equal(filters.get("london-selected-borough")[2], "");
 element("layerBoundary").checked = false;
 element("layerBoundary").change();
 assert.equal(visibility.get("london-selected-region"), "none");
-console.log("PASS London boundary data, layers, toggle and style reload");
+
+const journeyLayers = ["journey-leg-line", "journey-point-dot", "journey-point-label"];
+for (const id of journeyLayers) map.addLayer({id});
+element("cityMode").value = "latest";
+context.window.AirWatchCity.showPage("journey");
+for (const id of journeyLayers) assert.equal(visibility.get(id), "visible");
+context.window.AirWatchCity.showPage("overview");
+for (const id of journeyLayers) assert.equal(visibility.get(id), "none");
+context.window.AirWatchCity.showPage("journey");
+for (const id of journeyLayers) assert.equal(visibility.get(id), "visible");
+console.log("PASS Positron map, London boundary palette, visibility and style reload");

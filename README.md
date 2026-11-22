@@ -54,7 +54,7 @@ python .\tools\collect_live.py run-once
 
 - 双击 [08_DIAGNOSE_AIR_DATA.bat](08_DIAGNOSE_AIR_DATA.bat)，可读取数据库记录数、采集错误，并用 Windows curl 检查两个 LAQN 接口。此诊断对数据库只读。
 - 双击 [04_RUN_TESTS.bat](04_RUN_TESTS.bat)，或运行 `python .\tools\run_tests.py`，可执行项目测试。安装 Node.js 后，测试入口会继续运行 JavaScript 测试。
-- Westminster 年度归档在「数据中心 → Breathe London → Westminster 历史导入」中查询。年度 ZIP 下载、导入和 Windows 定时采集步骤见[多源数据采集说明](docs/Live_Collection_CN.md)。
+- 城市总览、分析和数据中心的站点观测使用最近 48 小时的数据。地图标题旁可切换污染指标和历史回放。Windows 定时采集和 Westminster 离线归档见[多源数据采集说明](docs/Live_Collection_CN.md)。
 
 ## 项目结构
 

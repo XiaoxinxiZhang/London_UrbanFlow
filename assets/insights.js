@@ -49,7 +49,7 @@
       title:names[group] || names.general, advice, note:note + " 地区等级提供健康背景，所选点读数用于了解附近污染状况。"};
   }
   const pollutionPalette = ["#fee5d9", "#fcae91", "#fb6a4a", "#de2d26", "#99000d"];
-  function pollutionZones(boundaries, stations, breaks, index = false) {
+  function pollutionZones(boundaries, stations, breaks) {
     function ringContains(point, ring) {
       let inside = false;
       for (let i=0, j=ring.length-1; i<ring.length; j=i++) {
@@ -65,8 +65,8 @@
     const validStations = stations.filter(f => typeof f.properties.value === "number" && Number.isFinite(f.properties.value) && !f.properties.stale);
     return {type:"FeatureCollection", features:boundaries.features.map(f => {
       const points=validStations.filter(s => contains(s.geometry.coordinates,f.geometry));
-      const value=points.length ? index ? Math.max(...points.map(s=>s.properties.value)) : points.reduce((n,s)=>n+s.properties.value,0)/points.length : null;
-      const grade=value===null ? -1 : index ? value<=3 ? 0 : value<=6 ? 1 : value<=9 ? 3 : 4 : breaks.filter(b=>value>b).length;
+      const value=points.length ? points.reduce((n,s)=>n+s.properties.value,0)/points.length : null;
+      const grade=value===null ? -1 : breaks.filter(b=>value>b).length;
       return {...f, properties:{...f.properties, pollution_value:value, pollution_count:points.length, pollution_color:grade<0 ? "#657481" : pollutionPalette[Math.min(4,grade)]}};
     })};
   }

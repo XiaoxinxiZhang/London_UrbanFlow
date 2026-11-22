@@ -4,12 +4,24 @@
   const $ = (id) => document.getElementById(id),
     H = window.AirWatchData;
   if (!H) return;
-  const { api, time, dateRange, calendarDate } = H;
+  const { api, time, calendarDate, recentWindow } = H;
+  const HOUR_MS = 3600000;
+  const MAX_COMPARE_STATIONS = 4;
+  const OUTLOOK_TABS = ["advice", "air", "nearby"];
+  const OUTLOOK_AIR_METRICS = ["PM25", "PM10", "NO2", "O3"];
   const colors = ["#55c7a5", "#9bcf80", "#e9cf6e", "#ed9867", "#e96a72"];
+  const missingAirColor = "#758290";
+  const roadSeverityColors = { Serious: "#ef7b84", Severe: "#ef7b84", Moderate: "#e9bc70", Minimal: "#8bbddd" };
+  const unknownRoadSeverityColor = "#98aabd";
+  const gisPointStyles = {
+    laqn: { shape: "triangle", clusterColor: "#2b8b7b" },
+    breathe: { shape: "diamond", clusterColor: "#7965a9" },
+    roadPoint: { shape: "square", clusterColor: "#a76558" },
+  };
+  const boundaryColors = { outer: "#8b5700", borough: "#416578", selected: "#b12645" };
   const sourceNames = {
     laqn: "LAQN",
     breathe: "Breathe London",
-    breathe_wcc: "Westminster",
   };
   const S = {
     page: "overview",
@@ -18,15 +30,19 @@
     data: null,
     charts: {},
     selected: null,
+    outlookTab: "advice",
+    pickingLocation: false,
     start: null,
     end: null,
     hours: [],
     generation: 0,
     detailGeneration: 0,
     analysisGeneration: 0,
+    compareRevision: 0,
+    comparePrefill: null,
     series: null,
     weather: null,
-    playing: false,
+    playback: null,
     lastRefresh: 0,
     selectedBoundary: null,
     pendingBoundaryFocus: false,
@@ -64,6 +80,8 @@
     borough: ["boundaries", "data/london_boroughs_2025.geojson"],
   };
   function gisVisible(layer) {
+    if (S.page === "journey")
+      return ["region", "borough", "bikes", "roadPoint", "roadArea"].includes(layer);
     return GIS_CONTROLS[layer].every((id) => $(id).checked !== false);
   }
   function gisKey(layer, feature) {
@@ -105,7 +123,7 @@
       const region = layer === "region";
       return [p[region ? "RGN25NM" : "LAD25NM"], p[region ? "RGN25CD" : "LAD25CD"], n(p.Shape__Area / 1e6), n(p.Shape__Length / 1000), region ? "大伦敦" : "行政区"];
     }
-    if (layer === "laqn" || layer === "breathe") return [p.name, p.source === "breathe_wcc" ? "Breathe London · Westminster 导入" : sourceNames[p.source] || p.source, p.kind, p.value === null ? "缺测" : n(p.value) + (p.unit ? " " + p.unit : ""), time(p.observed_at), p.quality || "—", p.borough || f.geometry.coordinates.map(v => n(v, 4)).join(", ")];
+    if (layer === "laqn" || layer === "breathe") return [p.name, sourceNames[p.source] || p.source, p.kind, p.value === null ? "缺测" : n(p.value) + (p.unit ? " " + p.unit : ""), time(p.observed_at), p.quality || "—", p.borough || f.geometry.coordinates.map(v => n(v, 4)).join(", ")];
     if (layer === "bikes") return [p.name, n(p.bikes, 0), n(p.empty_docks, 0), n(p.capacity, 0), time(p.captured_at), f.geometry.coordinates.map(v => n(v, 4)).join(", ")];
     return [p.name, p.id, p.category, p.severity, p.status, time(p.starts_at), time(p.modified_at)];
   }
@@ -155,7 +173,9 @@
   }
   function highlightGis() {
     if (!S.ready || !S.map.getSource("city-selected")) return;
-    S.map.getSource("city-selected").setData({type:"FeatureCollection", features:S.gisSelected ? [S.gisSelected.feature] : []});
+    const selected = S.gisSelected;
+    const features = selected && gisVisible(selected.layer) ? [selected.feature] : [];
+    S.map.getSource("city-selected").setData({type:"FeatureCollection", features});
   }
   async function chooseGisFeature(layer, feature, focus = true, fromMap = false, lngLat = null) {
     if (GIS_STATIC[layer]) {
@@ -183,15 +203,13 @@
       selectFeature(layer === "bikes" ? "bike" : layer.startsWith("road") ? "road" : "air", feature, lngLat, true);
   }
   const zone = () => $("timezone").value;
-  const metric = () =>
+  const metric = (value = $("cityMetric").value) =>
     ({
       PM25: "PM₂.₅",
       NO2: "NO₂",
       PM10: "PM₁₀",
       O3: "O₃",
-      PM25_INDEX: "PM₂.₅ 指数",
-      NO2_INDEX: "NO₂ 指数",
-    })[$("cityMetric").value];
+    })[value];
   function hourKey(v) {
     const d = new Date(v);
     d.setUTCMinutes(0, 0, 0);
@@ -206,40 +224,27 @@
       start: S.start.toISOString(),
       end: S.end.toISOString(),
       metric: $("cityMetric").value,
-      period: $("cityPeriod").value,
+      period: "900",
       ...extra,
     };
-    if ($("citySource").value) p.source = $("citySource").value;
     if ($("cityMode").value === "history" && S.hours.length) {
       const ms = S.hours[Number($("replayHour").value)];
       p.cursor = new Date(
-        Math.min(ms + 3599000, S.end.getTime() - 1000),
+        Math.min(ms + HOUR_MS, S.end.getTime()) - 1000,
       ).toISOString();
     }
     return p;
   }
   function resetWindow() {
-    const now = new Date();
-    if ($("cityRange").value === "custom") {
-      const range = dateRange($("cityStart").value, $("cityEnd").value, zone());
-      S.start = new Date(range.start);
-      S.end = new Date(Math.min(Date.parse(range.end), now.getTime()));
-    } else {
-      S.end = now;
-      S.start = new Date(
-        now.getTime() - Number($("cityRange").value) * 3600000,
-      );
-    }
-    if (!(S.start < S.end)) throw new Error("请选择早于当前时刻的日期范围");
+    const { start, end } = recentWindow();
+    S.start = new Date(start);
+    S.end = new Date(end);
+    const firstHour = Math.ceil(S.start.getTime() / HOUR_MS) * HOUR_MS;
+    const endMs = S.end.getTime();
     S.hours = [];
-    for (
-      let ms = Date.parse(hourKey(S.start));
-      ms < S.end.getTime();
-      ms += 3600000
-    )
-      S.hours.push(ms);
-    $("replayHour").max = Math.max(0, S.hours.length - 1);
-    $("replayHour").value = Math.max(0, S.hours.length - 2);
+    for (let ms = firstHour; ms < endMs; ms += HOUR_MS) S.hours.push(ms);
+    $("replayHour").max = S.hours.length - 1;
+    $("replayHour").value = S.hours.length - (endMs % HOUR_MS ? 2 : 1);
     replayLabel();
   }
   function replayLabel() {
@@ -248,6 +253,10 @@
       $("replayLabel").textContent =
         time(new Date(S.hours[Number($("replayHour").value)]).toISOString()) +
         " 小时";
+  }
+  function stopReplay() {
+    S.playback = null;
+    $("replayPlay").textContent = "播放";
   }
   function showAnalysisSection(section) {
     S.analysisSection = section;
@@ -265,17 +274,34 @@
   function showPage(page) {
     const previousPage = S.page;
     S.page = page;
+    if (page !== "analysis") $("compareStationsPicker").open = false;
     if (S.map?.getLayer?.("pollution-fill")) S.map.setLayoutProperty("pollution-fill", "visibility", page === "overview" && $("pollutionZones")?.checked ? "visible" : "none");
+    for (const id of ["journey-leg-line", "journey-point-dot", "journey-point-label"]) {
+      if (S.map?.getLayer?.(id)) S.map.setLayoutProperty(id, "visibility", page === "journey" ? "visible" : "none");
+    }
     $("cityOverview").hidden = page !== "overview";
     if ($("journeyPage")) $("journeyPage").hidden = page !== "journey";
     $("cityAnalysis").hidden = page !== "analysis";
     $("tablesPage").hidden = page !== "tables";
-    $("cityControls").hidden = page === "tables" || page === "journey";
+    if (page !== "overview") {
+      stopReplay();
+      setOverviewPicking(false);
+    }
+    drawOverviewLocation();
+    $("sourceFooter").hidden = page === "overview" || page === "journey";
     const mapNode = $("cityMap"), journeyHost = $("journeyMapHost");
+    mapNode.classList.toggle("map-shows-journey", page === "journey");
     if (page === "journey" && journeyHost?.append && mapNode?.parentElement !== journeyHost)
       journeyHost.append(mapNode);
     else if (page === "overview" && S.overviewMapHost?.append && mapNode?.parentElement !== S.overviewMapHost)
       S.overviewMapHost.append(mapNode);
+    if (page === "journey" && S.selected?.kind === "air" && S.popup) {
+      S.popup.remove();
+      S.popup = null;
+    }
+    visibility();
+    highlightGis();
+    if (page === "overview" || page === "journey") legend();
     document.querySelectorAll("[data-page]").forEach((b) => {
       const active = b.dataset.page === page;
       b.classList.toggle("active", active);
@@ -292,16 +318,14 @@
     });
     if (page === "analysis") {
       showAnalysisSection(S.analysisSection || "series");
-      loadAnalysis();
+      if ($("cityMode").value === "latest") refreshCity();
+      else loadAnalysis();
     }
     if (page === "journey" && $("cityMode").value !== "latest") {
       $("cityMode").value = "latest";
       refreshCity(true).catch((e) => error(e.message));
     }
-    if (page === "overview" && previousPage === "tables")
-      refreshCity($("cityMode").value === "latest").catch((e) =>
-        error(e.message),
-      );
+    if (page === "overview" && previousPage !== "overview") refreshCity();
   }
   function fitLondonView() {
     if (!S.map || !S.ready) return;
@@ -315,20 +339,76 @@
     S.initialMapFitted = true;
     requestAnimationFrame(fitLondonView);
   }
+  function setMapNotice(message = "") {
+    const notice = $("mapNotice");
+    notice.textContent = message;
+    notice.hidden = !message;
+  }
+  function removeAttributionSeparator(node, pattern) {
+    if (node?.nodeType !== Node.TEXT_NODE) return;
+    node.data = node.data.replace(pattern, "");
+    if (!node.data) node.remove();
+  }
+  function groupBasemapAttribution(mapNode) {
+    const inner = mapNode.querySelector?.(".maplibregl-ctrl-attrib-inner");
+    if (!inner) return;
+    const group = () => {
+      const card = inner.querySelector(":scope > .map-attribution-card");
+      if (!card || inner.childNodes.length === 1) return;
+      // MapLibre joins the sanitized basemap credits and the custom card with pipes.
+      if (!card.nextSibling) removeAttributionSeparator(card.previousSibling, /\s*\|\s*$/);
+      removeAttributionSeparator(card.nextSibling, /^\s*\|\s*/);
+      const credits = Array.from(inner.childNodes).filter(node => node !== card);
+      card.querySelector(".map-basemap-live").append(...credits);
+    };
+    group();
+    new MutationObserver(group).observe(inner, { childList: true });
+  }
+  function collapseAttributionAfterLoad(map, mapNode) {
+    const disclosure = mapNode.querySelector?.(".maplibregl-ctrl-attrib");
+    if (!disclosure) return;
+    const toggle = disclosure.querySelector("summary");
+    let interacted = false;
+    let scheduled = false;
+    const markInteraction = () => { interacted = true; };
+    disclosure.addEventListener("pointerdown", markInteraction, { once: true });
+    disclosure.addEventListener("focusin", markInteraction, { once: true });
+    toggle.addEventListener("click", markInteraction, { once: true });
+    const schedule = () => {
+      if (scheduled) return;
+      scheduled = true;
+      setTimeout(() => {
+        if (!interacted && disclosure.open && disclosure.classList.contains("maplibregl-compact-show"))
+          toggle.click();
+      }, 5000);
+    };
+    map.once("load", schedule);
+    map.once("error", schedule);
+  }
   function initMap() {
+    const mapNode = $("cityMap");
+    const fallback = $("mapAttributionTemplate")?.content?.firstElementChild?.cloneNode(true);
+    const card = fallback?.querySelector(".map-attribution-card");
+    if (card) {
+      const footer = $("sourceFooter");
+      card.querySelector(".map-source-summary").innerHTML = footer.querySelector(".footer-source-summary").innerHTML;
+      card.querySelector(".map-quality-summary").innerHTML = footer.querySelector(".footer-quality-summary").innerHTML;
+    }
     if (!window.maplibregl) {
-      $("mapNotice").textContent = "地图组件未加载，图表与表格仍可查询。";
+      setMapNotice("地图组件未加载，图表与表格仍可查询。");
+      if (fallback) mapNode.append(fallback, $("mapNotice"));
       return;
     }
     try {
       S.map = new maplibregl.Map({
         container: "cityMap",
-        style: "https://tiles.openfreemap.org/styles/dark",
+        style: "https://tiles.openfreemap.org/styles/positron",
         center: [-0.12, 51.51],
         zoom: 10,
         minZoom: 7,
         maxZoom: 17,
         attributionControl: false,
+        locale: {"AttributionControl.ToggleAttribution": "数据来源与许可"},
       });
       S.map.addControl(
         new maplibregl.NavigationControl({ showCompass: false }),
@@ -337,17 +417,20 @@
       S.map.addControl(
         new maplibregl.AttributionControl({
           compact: true,
-          customAttribution: "OpenFreeMap · © OpenMapTiles · © OpenStreetMap",
+          customAttribution: card?.outerHTML,
         }),
         "bottom-right",
       );
+      groupBasemapAttribution(mapNode);
+      collapseAttributionAfterLoad(S.map, mapNode);
       S.map.on("style.load", () => {
         S.ready = true;
+        $("pickOverviewLocation").disabled = $("pickLocationFromPanel").disabled = false;
         installLayers();
         installBoundaryLayers();
         drawLayers();
         legend();
-        $("mapNotice").textContent = "底图已加载 · ○ LAQN · ◇ Breathe London";
+        setMapNotice();
         fitInitialMap();
         if (S.pendingBoundaryFocus && S.selectedBoundary) {
           S.pendingBoundaryFocus = false;
@@ -355,19 +438,16 @@
         }
       });
       S.map.on("error", () => {
-        $("mapNotice").textContent =
-          "部分底图资源暂不可用，业务数据和图表仍可查询。";
+        setMapNotice("部分底图资源暂不可用，业务数据和图表仍可查询。");
       });
       S.map.on("moveend", () => { drawBikes(); drawPointClusters(); });
     } catch (e) {
-      $("mapNotice").textContent =
-        "当前浏览器无法初始化地图，图表和表格仍可使用。";
+      S.map?.remove?.();
+      S.map = null;
+      if (fallback) mapNode.append(fallback);
+      setMapNotice("当前浏览器无法初始化地图，图表和表格仍可使用。");
     }
-  }
-  function boundaryColors() {
-    return $("basemap").value === "positron"
-      ? { outer: "#8b5700", borough: "#416578" }
-      : { outer: "#f5cf72", borough: "#96bdcf" };
+    mapNode.append?.($("mapNotice"));
   }
   function selectedBoundaryFilter(level) {
     const field = level === "region" ? "RGN25CD" : "LAD25CD";
@@ -388,7 +468,7 @@
   }
   function installBoundaryLayers() {
     if (!S.ready) return;
-    const m = S.map, colors = boundaryColors();
+    const m = S.map;
     for (const [id, file] of [
       ["london-region", "data/london_region_2025.geojson"],
       ["london-boroughs", "data/london_boroughs_2025.geojson"],
@@ -397,38 +477,64 @@
     const before = m.getLayer("bike-clusters") ? "bike-clusters" : undefined;
     if (!m.getLayer("london-region-fill")) m.addLayer({
       id:"london-region-fill", type:"fill", source:"london-region",
-      paint:{"fill-color":colors.outer,"fill-opacity":0.035},
+      paint:{"fill-color":boundaryColors.outer,"fill-opacity":0.035},
     }, before);
     if (!m.getLayer("london-borough-fill")) m.addLayer({
       id:"london-borough-fill", type:"fill", source:"london-boroughs",
-      paint:{"fill-color":colors.borough,"fill-opacity":0.055},
+      paint:{"fill-color":boundaryColors.borough,"fill-opacity":0.055},
     }, before);
     if (!m.getLayer("london-borough-boundaries"))
       m.addLayer({
         id: "london-borough-boundaries",
         type: "line",
         source: "london-boroughs",
-        paint: { "line-color": colors.borough, "line-width": 1, "line-opacity": 0.65 },
+        paint: { "line-color": boundaryColors.borough, "line-width": 1, "line-opacity": 0.65 },
       }, before);
     if (!m.getLayer("london-outer-boundary"))
       m.addLayer({
         id: "london-outer-boundary",
         type: "line",
         source: "london-region",
-        paint: { "line-color": colors.outer, "line-width": 3, "line-opacity": 0.95 },
+        paint: { "line-color": boundaryColors.outer, "line-width": 3, "line-opacity": 0.95 },
       }, before);
     for (const [level, source] of [["region", "london-region"], ["borough", "london-boroughs"]]) {
       const id = "london-selected-" + level;
       if (!m.getLayer(id)) m.addLayer({
         id, type: "line", source, filter: selectedBoundaryFilter(level),
         paint: {
-          "line-color": $("basemap").value === "positron" ? "#b12645" : "#ff8e71",
+          "line-color": boundaryColors.selected,
           "line-width": 5, "line-opacity": 0.98,
         },
       }, before);
     }
     positionBoundaryLayers();
     visibility();
+  }
+  function addPointImages(map, shape, vertices, fills, outline, strokeWidth) {
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = 32;
+    const ctx = canvas.getContext("2d");
+    ctx.strokeStyle = outline;
+    ctx.lineWidth = strokeWidth;
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    ctx.moveTo(...vertices[0]);
+    for (const vertex of vertices.slice(1)) ctx.lineTo(...vertex);
+    ctx.closePath();
+    for (const fill of fills) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.stroke();
+      map.addImage(`city-${shape}-${fill}`, ctx.getImageData(0, 0, canvas.width, canvas.height), { pixelRatio: 2 });
+    }
+  }
+  function pointSymbolLayout(shape, fill) {
+    return {
+      "icon-image": ["concat", `city-${shape}-`, fill],
+      "icon-allow-overlap": true,
+      "icon-ignore-placement": true,
+    };
   }
   function installLayers() {
     const m = S.map,
@@ -439,19 +545,19 @@
         data: empty,
       });
     m.addSource("city-selected", {type:"geojson", data:empty});
+    m.addSource("city-outlook", {type:"geojson", data:empty});
     const roadColor = [
       "match",
       ["get", "severity"],
-      "Serious",
-      "#ef7b84",
-      "Severe",
-      "#ef7b84",
-      "Moderate",
-      "#e9bc70",
-      "Minimal",
-      "#8bbddd",
-      "#98aabd",
+      ...Object.entries(roadSeverityColors).flat(),
+      unknownRoadSeverityColor,
     ];
+    const airColors = [...colors, missingAirColor];
+    const airColor = ["coalesce", ["get", "color"], missingAirColor];
+    addPointImages(m, gisPointStyles.laqn.shape, [[16, 3], [30, 28], [2, 28]], airColors, "#f0f7ff", 2.8);
+    addPointImages(m, gisPointStyles.breathe.shape, [[16, 1.5], [30.5, 16], [16, 30.5], [1.5, 16]], airColors, "#f0f7ff", 2);
+    addPointImages(m, gisPointStyles.roadPoint.shape, [[6, 6], [26, 6], [26, 26], [6, 26]],
+      new Set([...Object.values(roadSeverityColors), unknownRoadSeverityColor]), "#172737", 2);
     m.addLayer({
       id: "road-fill",
       type: "fill",
@@ -468,15 +574,10 @@
     });
     m.addLayer({
       id: "road-point",
-      type: "circle",
+      type: "symbol",
       source: "city-roads",
       filter: ["==", ["geometry-type"], "Point"],
-      paint: {
-        "circle-color": roadColor,
-        "circle-radius": 5,
-        "circle-stroke-width": 1,
-        "circle-stroke-color": "#172737",
-      },
+      layout: pointSymbolLayout(gisPointStyles.roadPoint.shape, roadColor),
     });
     m.addLayer({
       id: "bike-clusters",
@@ -538,43 +639,17 @@
     });
     m.addLayer({
       id: "air-laqn",
-      type: "circle",
+      type: "symbol",
       source: "city-air",
       filter: ["==", ["get", "source"], "laqn"],
-      paint: {
-        "circle-color": ["get", "color"],
-        "circle-radius": 7,
-        "circle-stroke-width": 1.4,
-        "circle-stroke-color": "#f0f7ff",
-      },
+      layout: pointSymbolLayout(gisPointStyles.laqn.shape, airColor),
     });
-    const canvas = document.createElement("canvas");
-    canvas.width = canvas.height = 32;
-    const ctx = canvas.getContext("2d");
-    ctx.fillStyle = "#fff";
-    ctx.beginPath();
-    ctx.moveTo(16, 2);
-    ctx.lineTo(30, 16);
-    ctx.lineTo(16, 30);
-    ctx.lineTo(2, 16);
-    ctx.closePath();
-    ctx.fill();
-    m.addImage("sensor-diamond", ctx.getImageData(0, 0, 32, 32), { sdf: true });
     m.addLayer({
       id: "air-breathe",
       type: "symbol",
       source: "city-air",
       filter: ["!=", ["get", "source"], "laqn"],
-      layout: {
-        "icon-image": "sensor-diamond",
-        "icon-size": 0.6,
-        "icon-allow-overlap": true,
-      },
-      paint: {
-        "icon-color": ["get", "color"],
-        "icon-halo-width": 1,
-        "icon-halo-color": "#f0f7ff",
-      },
+      layout: pointSymbolLayout(gisPointStyles.breathe.shape, airColor),
     });
     m.addLayer({
       id: "air-values",
@@ -606,6 +681,13 @@
     m.addLayer({id:"city-selected-point", type:"circle", source:"city-selected",
       filter:["==",["geometry-type"],"Point"],
       paint:{"circle-color":"#ffe174","circle-radius":11,"circle-opacity":0.2,"circle-stroke-color":"#ffe174","circle-stroke-width":3}});
+    for (const [kind, color] of [["resources", "#128978"], ["roads", "#915620"]]) {
+      m.addLayer({id:"city-outlook-"+kind, type:"line", source:"city-outlook", filter:["==",["get","kind"],kind],
+        paint:{"line-color":color,"line-width":2,...(kind === "roads" ? {"line-dasharray":[3,2]} : {})}});
+    }
+    m.addLayer({id:"city-outlook-point", type:"circle", source:"city-outlook", filter:["==",["get","kind"],"selected"],
+      paint:{"circle-radius":6,"circle-color":"#126e65","circle-stroke-color":"#f2fff9","circle-stroke-width":2}});
+    drawOverviewLocation();
     highlightGis();
     positionBoundaryLayers();
     if (S.mapEventsBound) {
@@ -613,6 +695,13 @@
       return;
     }
     S.mapEventsBound = true;
+    m.on("click", (event) => {
+      if (!S.pickingLocation || S.page !== "overview") return;
+      if (event.originalEvent) event.originalEvent.overviewPicked = true;
+      const p = m.queryRenderedFeatures?.(event.point, {layers:["air-laqn", "air-breathe"]})?.[0]?.properties;
+      const station = p && S.data?.air.features.find(f => f.properties.source === p.source && f.properties.id === p.id);
+      finishOverviewPick([event.lngLat.lng, event.lngLat.lat], station);
+    });
     for (const layer of [
       "air-laqn",
       "air-breathe",
@@ -622,7 +711,8 @@
       "road-line",
     ]) {
       m.on("click", layer, (event) => {
-        if ($("journeyPage")?.dataset?.picking) return;
+        if (S.pickingLocation || event.originalEvent?.overviewPicked) return;
+        if (S.page === "journey" && $("journeyPage")?.dataset?.picking) return;
         if (event.originalEvent?.gisHandled) return;
         if (event.originalEvent) event.originalEvent.gisHandled = true;
         const point = event.features[0],
@@ -644,7 +734,8 @@
       m.on("mouseleave", layer, () => (m.getCanvas().style.cursor = ""));
     }
     m.on("click", "bike-clusters", async (event) => {
-      if ($("journeyPage")?.dataset?.picking) return;
+      if (S.pickingLocation || event.originalEvent?.overviewPicked) return;
+      if (S.page === "journey" && $("journeyPage")?.dataset?.picking) return;
       if (!S.bikeIndex) return;
       const f = event.features[0],
         zoom = S.bikeIndex.getClusterExpansionZoom(f.properties.cluster_id);
@@ -654,7 +745,8 @@
     m.on("mouseleave", "bike-clusters", () => (m.getCanvas().style.cursor = ""));
     for (const [layer, gisLayer] of [["london-borough-fill","borough"],["london-region-fill","region"]]) {
       m.on("click", layer, (event) => {
-        if ($("journeyPage")?.dataset?.picking) return;
+        if (S.pickingLocation || event.originalEvent?.overviewPicked) return;
+        if (S.page === "journey" && $("journeyPage")?.dataset?.picking) return;
         if (event.originalEvent?.gisHandled) return;
         if (event.originalEvent) event.originalEvent.gisHandled = true;
         if (event.features?.[0]) chooseGisFeature(gisLayer, event.features[0], false, true);
@@ -666,13 +758,7 @@
   }
   function color(f) {
     const p = f.properties;
-    if (p.value === null) return "#758290";
-    if ($("mapColor").value === "freshness")
-      return p.stale ? "#d6946c" : "#63dfc6";
-    if ($("cityMetric").value.endsWith("_INDEX"))
-      return ["#55c7a5", "#e9cf6e", "#ed9867", "#c37be5"][
-        p.value <= 3 ? 0 : p.value <= 6 ? 1 : p.value <= 9 ? 2 : 3
-      ];
+    if (p.value === null) return missingAirColor;
     return colors[S.data.breaks.filter((b) => p.value > b).length];
   }
   function drawLayers() {
@@ -704,16 +790,21 @@
     try {
       const boundary = await loadSpatial("borough");
       if (!$("pollutionZones").checked || !S.ready) return;
-      const index = $("cityMetric").value.endsWith("_INDEX");
-      const zones = window.AirWatchInsights.pollutionZones(boundary, S.data.air.features, S.data.breaks, index);
+      const zones = window.AirWatchInsights.pollutionZones(boundary, S.data.air.features, S.data.breaks);
       if (!S.map.getSource("pollution-zones")) S.map.addSource("pollution-zones", {type:"geojson", data:zones});
       else S.map.getSource("pollution-zones").setData(zones);
       if (!S.map.getLayer("pollution-fill")) S.map.addLayer({id:"pollution-fill",type:"fill",source:"pollution-zones",paint:{"fill-color":["get","pollution_color"],"fill-opacity":0.58,"fill-outline-color":"#bca99e"}}, S.map.getLayer("road-fill") ? "road-fill" : undefined);
       S.map.setLayoutProperty("pollution-fill", "visibility", S.page === "overview" ? "visible" : "none");
       const palette = window.AirWatchInsights.pollutionPalette;
       const b = S.data.breaks;
-      const labels = index ? ["低 1–3","中 4–6","高 7–9","极高 10"] : b.length ? b.map((v,i)=>(i ? "> "+b[i-1]+"–" : "≤ ")+v).concat("> "+b[b.length-1]) : ["同值 / 单一等级"];
-      box.innerHTML = "<strong>"+esc(metric())+" · 污染划分</strong><div class='zone-scale'>"+labels.map((v,i)=>"<span><i style='background:"+palette[index ? [0,1,3,4][i] : i]+"'></i>"+esc(v)+"</span>").join("")+"<span><i style='background:#657481'></i>无有效观测</span></div><small>"+(index ? "区内来源单项指数最高值" : "区内监测点均值 · µg/m³ · 所选范围分位数分级")+"；颜色越深，数值越高。<br>"+zones.features.filter(f=>f.properties.pollution_count).length+" / "+zones.features.length+" 个区有有效观测；不代表全区实测或官方 DAQI。</small>";
+      const labels = b.length ? b.map((v,i)=>(i ? "> "+b[i-1]+"–" : "≤ ")+v).concat("> "+b[b.length-1]) : ["同值 / 单一等级"];
+      const title = metric() + "（µg/m³）";
+      const scale = labels.map((label, i) => {
+        const color = palette[i];
+        return "<span><i style='background:" + color + "'></i>" + esc(label) + "</span>";
+      }).join("");
+      box.innerHTML = "<strong>" + esc(title) + "</strong><div class='zone-scale'>" + scale +
+        "<span><i style='background:#657481'></i>无有效观测</span></div>";
     } catch(e) { box.textContent="污染划分暂不可用："+e.message; }
   }
   function drawBikes() {
@@ -742,8 +833,9 @@
           element.style.background = ({empty:"#ee9a69",full:"#bf92df",available:"#58b9d1"})[p.state] || "#7b8c9c";
         }
         element.addEventListener("click", (event) => {
-          if ($("journeyPage")?.dataset?.picking) return;
+          if (S.page === "journey" && $("journeyPage")?.dataset?.picking) return;
           event.stopPropagation();
+          if (S.pickingLocation) return finishOverviewPick(feature.geometry.coordinates);
           if (p.cluster) {
             S.map.easeTo({center:feature.geometry.coordinates,zoom:S.bikeIndex.getClusterExpansionZoom(p.cluster_id)});
           } else chooseGisFeature("bikes", feature, false, true);
@@ -756,7 +848,7 @@
   }
   function drawPointClusters() {
     if (!S.ready || !S.data || !S.map || !window.maplibregl) return;
-    for (const layer of ["laqn", "breathe", "roadPoint"]) {
+    for (const [layer, {shape, clusterColor}] of Object.entries(gisPointStyles)) {
       const group = S.pointGroups[layer] || (S.pointGroups[layer] = {markers:[]});
       const token = layer === "roadPoint" ? S.data.roads : S.airDrawData;
       if (group.token !== token) {
@@ -773,14 +865,21 @@
       for (const feature of features) {
         const p = feature.properties, element = document.createElement("button");
         element.type = "button";
-        element.className = (p.cluster ? "gis-map-cluster " : "gis-map-point ") + layer;
+        element.className = (p.cluster ? "gis-map-cluster" : "gis-map-point") + " shape-" + shape;
         element.textContent = p.cluster ? String(p.point_count_abbreviated) : "";
         element.title = p.cluster ? p.point_count + " 个" + GIS_LABELS[layer] + "，点击展开" : p.name;
         element.setAttribute("aria-label", element.title);
-        if (!p.cluster) element.style.background = layer === "roadPoint" ? ({Serious:"#ef7b84",Severe:"#ef7b84",Moderate:"#e9bc70",Minimal:"#8bbddd"})[p.severity] || "#98aabd" : p.color || "#758290";
+        const fill = p.cluster ? clusterColor : layer === "roadPoint"
+          ? roadSeverityColors[p.severity] || unknownRoadSeverityColor
+          : p.color || missingAirColor;
+        element.style.setProperty("--marker-color", fill);
         element.addEventListener("click", (event) => {
-          if ($("journeyPage")?.dataset?.picking) return;
+          if (S.page === "journey" && $("journeyPage")?.dataset?.picking) return;
           event.stopPropagation();
+          if (S.pickingLocation) {
+            const station = !p.cluster && layer !== "roadPoint" ? feature : null;
+            return finishOverviewPick(feature.geometry.coordinates, station);
+          }
           if (p.cluster) S.map.easeTo({center:feature.geometry.coordinates, zoom:group.index.getClusterExpansionZoom(p.cluster_id)});
           else chooseGisFeature(layer, feature, false, true);
         });
@@ -807,139 +906,92 @@
     for (const [layer, show] of Object.entries(flags))
       if (S.map.getLayer(layer)) S.map.setLayoutProperty(layer, "visibility", show ? "visible" : "none");
     if (S.map.getLayer("air-values") && S.map.setFilter)
-      S.map.setFilter("air-values", ["in", ["get", "source"], ["literal", ["laqn", "breathe", "breathe_wcc"].filter((v) => gisVisible(v === "laqn" ? "laqn" : "breathe"))]]);
+      S.map.setFilter("air-values", ["in", ["get", "source"], ["literal", ["laqn", "breathe"].filter(gisVisible)]]);
     for (const item of S.bikeMarkers || []) item.element.hidden = !gisVisible("bikes");
     for (const [layer, group] of Object.entries(S.pointGroups))
       for (const item of group.markers) item.element.hidden = !gisVisible(layer);
   }
+  function legendSwatch(color, label, {lineWidth, shape} = {}) {
+    const style = lineWidth ? "border-top:" + lineWidth + "px solid " : "background:";
+    const className = lineWidth ? " class='boundary-key'" : shape ? " class='shape-" + shape + "'" : "";
+    return "<span><i" + className + " aria-hidden='true' style='" + style + color + "'></i>" + esc(label) + "</span>";
+  }
   function legend() {
-    const boundary = boundaryColors();
-    const parts = [];
-    if (gisVisible("region")) parts.push("<span><i class='boundary-key' style='border-top:3px solid " + boundary.outer + "'></i>大伦敦外边界</span>");
-    if (gisVisible("borough")) parts.push("<span><i class='boundary-key' style='border-top:1px solid " + boundary.borough + "'></i>行政区边界</span>");
-    if (!S.data) {
-      $("mapLegend").innerHTML = parts.join("");
+    const stationCount = "聚合点数字为站点数";
+    const bikeLegend = {shape:"circle"};
+    const layerLegends = {
+      region: legendSwatch(boundaryColors.outer, "大伦敦外边界", {lineWidth:3}),
+      borough: legendSwatch(boundaryColors.borough, "行政区边界", {lineWidth:1}),
+      laqn: legendSwatch(gisPointStyles.laqn.clusterColor, stationCount, gisPointStyles.laqn),
+      breathe: legendSwatch(gisPointStyles.breathe.clusterColor, stationCount, gisPointStyles.breathe),
+      bikes: legendSwatch("#286f96", "聚合点数字为自行车站数", bikeLegend) +
+        legendSwatch("#ee9a69", "空站", bikeLegend) + legendSwatch("#bf92df", "满站", bikeLegend) + legendSwatch("#58b9d1", "可用", bikeLegend),
+      roadPoint: legendSwatch(gisPointStyles.roadPoint.clusterColor, "聚合点数字为事件数", gisPointStyles.roadPoint),
+      roadArea: legendSwatch("#e9bc70", "颜色表示严重程度"),
+    };
+    const journey = S.page === "journey";
+    const prefix = journey ? "journey-legend-" : "legend-";
+    for (const [layer, content] of Object.entries(layerLegends)) {
+      const target = $(prefix + layer);
+      if (target) target.innerHTML = gisVisible(layer) ? content : "";
+    }
+    if (journey) return;
+
+    const airLegend = $("legend-air");
+    if (!S.data || !(gisVisible("laqn") || gisVisible("breathe"))) {
+      airLegend.innerHTML = "";
       return;
     }
-    let entries;
-    if ($("mapColor").value === "freshness")
-      entries = [
-        ["#63dfc6", "3 小时内"],
-        ["#d6946c", "超过 3 小时"],
-        ["#758290", "缺测"],
-      ];
-    else if ($("cityMetric").value.endsWith("_INDEX"))
-      entries = [
-        ["#55c7a5", "低 1–3"],
-        ["#e9cf6e", "中 4–6"],
-        ["#ed9867", "高 7–9"],
-        ["#c37be5", "很高 10"],
-      ];
-    else {
-      const b = S.data.breaks;
-      entries = b.length
+    const thresholds = S.data.breaks.map((value) => `${value} µg/m³`);
+    const entries = thresholds.length
         ? [
-            ...b.map((v, i) => [
+            ...thresholds.map((value, i) => [
               colors[i],
-              (i ? "> " + b[i - 1] + " 至 " : "≤ ") + v,
+              (i ? "> " + thresholds[i - 1] + " 至 " : "≤ ") + value,
             ]),
-            [colors[b.length], "> " + b[b.length - 1]],
+            [colors[thresholds.length], "> " + thresholds[thresholds.length - 1]],
           ]
-        : [["#758290", "暂无有效浓度"]];
-    }
-    if (gisVisible("laqn") || gisVisible("breathe")) parts.push(...entries
-        .map(
-          ([c, t]) =>
-            "<span><i style='background:" + c + "'></i>" + esc(t) + "</span>",
-        ));
-    if (gisVisible("laqn") || gisVisible("breathe")) parts.push($("cityMetric").value.endsWith("_INDEX")
-        ? "<span>来源空气质量指数</span>"
-        : "<span>浓度 µg/m³ · 固定于所选时间范围</span>");
-    if (gisVisible("laqn")) parts.push("<span>○ LAQN · 聚合圈数字为站点数</span>");
-    if (gisVisible("breathe")) parts.push("<span>◇ Breathe London · 聚合圈数字为站点数</span>");
-    if (gisVisible("bikes")) parts.push("<span><i style='background:#286f96'></i>聚合圈数字 = 自行车站数</span><span><i style='background:#ee9a69'></i>空站</span><span><i style='background:#bf92df'></i>满站</span><span><i style='background:#58b9d1'></i>可用</span>");
-    if (gisVisible("roadPoint")) parts.push("<span><i style='background:#a76558'></i>道路点事件 · 聚合圈数字为事件数</span>");
-    if (gisVisible("roadArea")) parts.push("<span><i style='background:#e9bc70'></i>道路面事件 · 颜色表示严重程度</span>");
-    $("mapLegend").innerHTML = parts.join("");
+        : [[missingAirColor, "暂无有效浓度"]];
+    airLegend.innerHTML = entries.map(([color, label]) => legendSwatch(color, label)).join("");
   }
   function summaries() {
     const d = S.data;
-    $("cityKpis").innerHTML = [
-      [
-        "有值空气监测点",
-        d.coverage.valid + " / " + d.coverage.total,
-        "其中 " + d.coverage.fresh + " 站在最近 3 小时内",
-      ],
-      ["自行车资源", d.counts.bikes, "同一份成功列表中的自行车站"],
-      [
-        "空站 / 满站",
-        d.counts.empty + " / " + d.counts.full,
-        "按可用车辆和空位统计",
-      ],
-      ["道路事件", d.counts.roads, "成功获取的事件列表"],
-    ]
-      .map(
-        ([label, value, note]) =>
-          "<div class='city-kpi'><span>" +
-          esc(label) +
-          "</span><strong>" +
-          esc(value) +
-          "</strong><small>" +
-          esc(note) +
-          "</small></div>",
-      )
+    const renderCounts = (counts) => counts
+      .map(([label, value]) => `<div><small>${esc(label)}</small><strong>${esc(value)}</strong></div>`)
       .join("");
-    $("mapWindow").textContent =
-      time(d.start) +
-      " 至 " +
-      time(d.end) +
-      ($("cityMode").value === "history"
-        ? " · 统一小时回放"
-        : " · 各点保留来源时间");
-    $("coverageSummary").innerHTML =
-      Object.entries(d.source_stats)
-        .map(
-          ([source, stats]) =>
-            "<span><strong>" +
-            esc(sourceNames[source]) +
-            "</strong> · " +
-            stats.valid +
-            " 个有值监测点" +
-            (stats.mean === null
-              ? ""
-              : " · 监测点均值 " + stats.mean.toFixed(2)) +
-            "</span>",
-        )
-        .join("") +
-      "<span>自行车快照 " +
-      esc(time(d.bike_info.captured_at)) +
-      (d.bike_info.gap ? " · 间断超过 10 分钟" : "") +
-      (d.bike_info.stale ? " · 快照已过期" : "") +
-      "</span>" +
-      "<span>道路列表 " +
-      esc(time(d.road_info.captured_at)) +
-      (d.road_info.gap ? " · 间断超过 10 分钟" : "") +
-      (d.road_info.stale ? " · 列表已过期" : "") +
-      "</span>";
-    const old = $("quickStation").value;
-    $("quickStation").innerHTML = d.air.features
-      .map(
-        (f) =>
-          "<option value='" +
-          esc(f.properties.source + ":" + f.properties.id) +
-          "'>" +
-          esc(
-            sourceNames[f.properties.source] +
-              " · " +
-              f.properties.name +
-              " · " +
-              f.properties.id,
-          ) +
-          "</option>",
-      )
-      .join("");
-    if ([...$("quickStation").options].some((o) => o.value === old))
-      $("quickStation").value = old;
+    const snapshotStatus = (info) => {
+      if (!info?.captured_at || info.gap)
+        return { available: false, label: d.cursor ? "所选小时无可用快照" : "暂无采集快照" };
+      return { available: true, label: (info.stale ? "快照已过期 · " : "采集于 ") + time(info.captured_at) };
+    };
+    const airCounts = Object.entries(sourceNames).map(([source, name]) => [
+      name, d.source_stats?.[source]?.valid ?? 0,
+    ]);
+    const bikes = snapshotStatus(d.bike_info);
+    const roads = snapshotStatus(d.road_info);
+    const bikeCounts = [
+      ["空站数量", bikes.available ? d.counts.empty : "—"],
+      ["满站数量", bikes.available ? d.counts.full : "—"],
+      ["有车有空位", bikes.available ? d.counts.available : "—"],
+    ];
+    $("cityKpis").innerHTML = `
+      <div class="city-kpi">
+        <h2>有值空气监测点</h2>
+        <div class="city-kpi-metrics">${renderCounts(airCounts)}</div>
+        ${d.cursor ? `<small>所选小时 · ${esc(metric(d.metric))}</small>` : ""}
+      </div>
+      <div class="city-kpi">
+        <h2>自行车资源</h2>
+        <div class="city-kpi-metrics">${renderCounts(bikeCounts)}</div>
+        <small>${esc(bikes.label)}</small>
+      </div>
+      <div class="city-kpi">
+        <h2>道路事件</h2>
+        <strong>${esc(roads.available ? d.counts.roads : "—")}</strong>
+        <small>${esc(roads.label)}</small>
+      </div>`;
+    $("mapWindow").textContent = "时间范围：" + time(d.start) + " 至 " + time(d.end);
+    if ($("changeLocation").getAttribute?.("aria-expanded") === "true") renderLocationSearch();
     const bike = $("bikeStation").value;
     $("bikeStation").innerHTML =
       "<option value=''>选择自行车站</option>" +
@@ -960,8 +1012,9 @@
   }
   async function refreshCity(reset = false) {
     if (location.protocol === "file:") return;
-    if (reset || !S.start) resetWindow();
+    if (reset || !S.start || $("cityMode").value === "latest") resetWindow();
     const generation = ++S.generation;
+    S.detailGeneration++;
     error("");
     try {
       const d = await api("/api/map", query({ bbox: "-.55,51.28,.34,51.72" }));
@@ -987,6 +1040,8 @@
             (f) => f.properties.id === "BL0027" && f.properties.value !== null,
           ) || d.air.features.find((f) => f.properties.value !== null);
         if (f) await selectFeature("air", f, null, false);
+      } else if (S.selected.kind === "point") {
+        await loadNearby();
       } else {
         const bucket =
             S.selected.kind === "air"
@@ -1001,15 +1056,22 @@
             (bucket !== "air" || f.properties.source === p.source),
         );
         if (f) await selectFeature(S.selected.kind, f, null, false);
+        else if (S.selected.kind === "air") await loadNearby();
         else {
+          S.detailGeneration++;
           S.selected = null;
-          $("openSelected").disabled = $("analyseSelected").disabled = true;
-          $("linkTitle").textContent = "周边环境与出行";
-          $("linkSubtitle").textContent = "点击地图中的站点或道路事件";
-          $("nearbyContent").innerHTML =
-            "<p class='muted'>所选对象在该时刻没有有效记录，请选择其他对象。</p>";
+          S.comparePrefill = null;
+          $("selectedActions").hidden = true;
+          $("linkTitle").textContent = "尚未选择地点";
+          $("linkSubtitle").textContent = "在地图上选点或搜索监测站";
+          $("nearbyContent").textContent = "所选对象在该时刻没有有效记录，请选择其他对象。";
+          $("nearbySummary").textContent = "";
           $("citizenCard").textContent = "";
-          chart("miniTrend").clear();
+          $("localAir").textContent = "选点后查看附近的污染物浓度。";
+          S.overviewWeatherKey = null;
+          $("outlookWeather").textContent = "选点后查看气象观测。";
+          renderNearbyTrend(null);
+          drawOverviewLocation();
         }
       }
       if (S.page === "analysis") await loadAnalysis();
@@ -1062,10 +1124,7 @@
         points.map((p) => [Date.parse(p.time), p.value_num]),
       ),
       output = [];
-    const start =
-      interval === 3600000
-        ? Date.parse(hourKey(S.start))
-        : Math.ceil(S.start.getTime() / interval) * interval;
+    const start = Math.ceil(S.start.getTime() / interval) * interval;
     for (let ms = start; ms < S.end.getTime(); ms += interval)
       output.push([ms, values.get(ms) ?? null]);
     return output;
@@ -1081,7 +1140,7 @@
     }));
   }
   function popup(kind, f, lngLat) {
-    if (!S.map || !S.ready) return;
+    if (!S.map || !S.ready || (kind === "air" && S.page === "journey")) return;
     if (S.popup) S.popup.remove();
     const p = f.properties,
       content = document.createElement("div"),
@@ -1145,14 +1204,12 @@
     nearbyButton.textContent = "周边详情";
     nearbyButton.className = "map-popup-button";
     nearbyButton.addEventListener("click", () => {
-      const details = document.querySelector(".nearby-details");
-      const summary = details?.querySelector("summary");
-      if (!summary) return;
       if (S.page !== "overview") showPage("overview");
-      details.open = true;
+      showOutlookTab("nearby");
       requestAnimationFrame(() => {
-        summary.focus({preventScroll:true});
-        summary.scrollIntoView({block:"start", behavior:"smooth"});
+        const tab = $("outlookTab-nearby");
+        tab.focus({preventScroll:true});
+        tab.scrollIntoView({block:"nearest", behavior:"smooth"});
       });
     });
     content.append(nearbyButton);
@@ -1162,236 +1219,366 @@
       .setDOMContent(content)
       .addTo(S.map);
   }
+  function setLocationPicker(open) {
+    $("locationOptions").hidden = !open;
+    $("changeLocation").setAttribute("aria-expanded", String(open));
+    if (open) {
+      const source = S.selected?.kind === "air" && S.selected.feature.properties.source;
+      if (source === "laqn" || source === "breathe") {
+        $("locationNetworkLaqn").checked = source === "laqn";
+        $("locationNetworkBreathe").checked = source === "breathe";
+      }
+      renderLocationSearch();
+      ($("locationNetworkLaqn").checked ? $("locationNetworkLaqn") : $("locationNetworkBreathe")).focus?.();
+    }
+  }
+  function renderLocationSearch() {
+    const source = $("locationNetworkLaqn").checked ? "laqn" : "breathe";
+    const terms = $("locationSearch").value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const stations = S.data?.air.features || [];
+    const matches = stations.filter(({properties: p}) => {
+      if (p.source !== source) return false;
+      const text = `${p.name} ${p.id}`.toLowerCase();
+      return terms.every(term => text.includes(term));
+    }).sort((a, b) => a.properties.name.localeCompare(b.properties.name, "en"));
+    const picker = $("locationStation");
+    picker.innerHTML = '<option value="">请选择监测站</option>' + matches.map(({properties: p}) =>
+      `<option value="${esc(p.id)}">${esc(p.name)} · ${esc(p.id)}</option>`).join("");
+    picker.disabled = !matches.length;
+    $("locationSearchStatus").textContent = !S.data ? "监测站列表正在加载。" :
+      matches.length ? `${matches.length} 个监测站` : terms.length ? "找不到匹配的监测站。" : "此网络暂无监测站。";
+  }
+  function setOverviewPicking(active) {
+    S.pickingLocation = active;
+    $("pickOverviewLocation").setAttribute("aria-pressed", String(active));
+    $("pickOverviewLocation").textContent = active ? "取消选点" : "选点";
+    $("overviewPickHint").hidden = !active;
+    $("cityMap").classList.toggle("map-picking-location", active);
+  }
+  function beginOverviewPick(fromPanel) {
+    if (!S.ready) return;
+    setLocationPicker(false);
+    setOverviewPicking(true);
+    if (fromPanel) $("pickOverviewLocation").focus?.();
+  }
+  function chooseLocationStation(station, moveMap = false) {
+    const pending = selectFeature("air", station, null, false);
+    if (moveMap) S.map?.easeTo({center:station.geometry.coordinates, zoom:Math.max(13, S.map.getZoom())});
+    return pending;
+  }
+  function finishOverviewPick(coordinates, station = null) {
+    setOverviewPicking(false);
+    if (station) return chooseLocationStation(station);
+    const [longitude, latitude] = coordinates;
+    const point = [longitude >= -180 && longitude <= 180 ? longitude : ((longitude+180)%360+360)%360-180, latitude];
+    return selectFeature("point", {type:"Feature", geometry:{type:"Point", coordinates:point},
+      properties:{name:"地图选点"}}, null, false);
+  }
+  function rangeRing([lon, lat], radius) {
+    const radians = Math.PI / 180, phi = lat * radians, arc = radius / 6371008.8;
+    const points = Array.from({length:64}, (_, i) => {
+      const heading = i * Math.PI / 32;
+      const y = Math.asin(Math.sin(phi)*Math.cos(arc) + Math.cos(phi)*Math.sin(arc)*Math.cos(heading));
+      const x = Math.atan2(Math.sin(heading)*Math.sin(arc)*Math.cos(phi), Math.cos(arc)-Math.sin(phi)*Math.sin(y));
+      return [lon + x/radians, y/radians];
+    });
+    return [...points, points[0]];
+  }
+  function drawOverviewLocation() {
+    const source = S.map?.getSource?.("city-outlook");
+    if (!source) return;
+    const center = S.page === "overview" && S.selected?.center;
+    const features = [];
+    if (center) {
+      features.push({type:"Feature", geometry:{type:"Point", coordinates:center}, properties:{kind:"selected"}});
+      if (S.outlookTab === "nearby") {
+        for (const [kind, input] of [["resources", "nearRadius"], ["roads", "roadRadius"]]) {
+          features.push({type:"Feature", geometry:{type:"LineString", coordinates:rangeRing(center, Number($(input).value))}, properties:{kind}});
+        }
+      }
+    }
+    source.setData({type:"FeatureCollection", features});
+  }
+  function showOutlookTab(tab, focus = false) {
+    S.outlookTab = tab;
+    for (const name of OUTLOOK_TABS) {
+      const selected = name === tab;
+      const button = $("outlookTab-" + name);
+      button.setAttribute("aria-selected", String(selected));
+      button.tabIndex = selected ? 0 : -1;
+      $("outlookPanel-" + name).hidden = !selected;
+      if (selected && focus) button.focus();
+    }
+    drawOverviewLocation();
+    if (tab === "advice" && S.selected && S.start) void refreshOverviewWeather(query());
+    if (tab === "nearby" && S.nearbyTrend) requestAnimationFrame(() => {
+      if (S.outlookTab === "nearby" && S.nearbyTrend) renderNearbyTrend(S.nearbyTrend);
+    });
+  }
   async function selectFeature(kind, f, lngLat = null, withPopup = true) {
     const previous = S.selected;
-    S.selected = { kind, feature: f };
     const p = f.properties;
+    const changed = !previous || previous.kind !== kind || kind === "point" ||
+      previous.feature.properties.id !== p.id || previous.feature.properties.source !== p.source;
+    let center = f.geometry.coordinates;
+    if (kind === "road") {
+      if (lngLat) center = [lngLat.lng, lngLat.lat];
+      else if (!changed && !withPopup) center = previous.center;
+      else if (f.geometry.type !== "Point") {
+        const [a, b] = geometryBounds(f.geometry);
+        center = [(a[0]+b[0])/2, (a[1]+b[1])/2];
+      }
+    }
+    S.selected = {kind, feature:f, center};
     $("linkTitle").textContent = p.name;
     $("linkSubtitle").textContent =
       kind === "air"
-        ? sourceNames[p.source] + " · " + p.id + " · " + p.kind
-        : p.id + " · " + (kind === "bike" ? "自行车停靠站" : "道路事件");
-    $("openSelected").disabled = $("analyseSelected").disabled = false;
-    if (
-      kind === "air" &&
-      (!previous ||
-        previous.feature.properties.id !== p.id ||
-        previous.feature.properties.source !== p.source)
-    ) {
-      $("analysisSource").value = p.source;
-      $("compareStations").innerHTML = "";
+        ? [sourceNames[p.source] || p.source, p.id, p.kind].filter(Boolean).join(" · ")
+        : kind === "point" ? `${center[1].toFixed(5)}°, ${center[0].toFixed(5)}°`
+          : p.id + " · " + (kind === "bike" ? "自行车停靠站" : "道路事件");
+    $("selectedActions").hidden = kind === "point";
+    $("analyseSelected").textContent = kind === "air" ? "分析此站" : "查看环境与交通分析";
+    if (kind === "point") S.comparePrefill = null;
+    else if (S.page !== "analysis" && (changed || withPopup)) {
+      if (kind === "air" && (changed || $("analysisSource").value !== p.source)) {
+        $("analysisSource").value = p.source;
+        resetCompareStations();
+      }
+      S.comparePrefill = { site: kind === "air" ? p.id : null };
     }
     if (kind === "bike") $("bikeStation").value = p.id;
     if (withPopup) popup(kind, f, lngLat);
+    else if (S.popup) {
+      S.popup.remove();
+      S.popup = null;
+    }
+    drawOverviewLocation();
     await loadNearby();
   }
-  function populateStations(options, selected) {
-    $("compareStations").innerHTML = options
-      .map(
-        (o) =>
-          "<option value='" +
-          esc(o.id) +
-          "'>" +
-          esc(o.name + " · " + o.id + " · " + (o.kind || "类型未提供")) +
-          "</option>",
-      )
-      .join("");
-    for (const option of $("compareStations").options)
-      option.selected = selected.includes(option.value);
-    if (
-      !$("compareStations").selectedOptions.length &&
-      $("compareStations").options.length
-    )
-      $("compareStations").options[0].selected = true;
+  let compareStationsMarkup;
+  function compareStationInputs() {
+    return [...$("compareStations").querySelectorAll('input[type="checkbox"]')];
   }
-  function renderCitizen(air, nearby, hourlyPoints = []) {
-    S.citizenContext = {air, nearby, hourlyPoints};
-    const cursor = query().cursor;
-    const reference = cursor ? Date.parse(cursor) : Date.now();
-    const item = window.AirWatchInsights.citizen(air, nearby, hourlyPoints, reference, !!cursor);
-    const label = cursor ? "历史回放参考" : "当前出行参考";
-    const health = window.AirWatchInsights.healthAdvice(S.officialDAQI, $("healthGroup")?.value || "general", !!cursor);
-    let html = "<div class='health-band " + health.tone + "'><span>" + esc(health.basis) + "</span><strong>" + esc(health.title) + "</strong></div>" +
-      "<p class='health-action'>" + esc(health.advice) + "</p><p class='health-note'>" + esc(health.note) +
-      (health.tone !== "unknown" ? " 官方发布时间：" + esc(time(S.officialDAQI.observed_at)) + "。" : "") + "</p><h3>" + label + "</h3>";
-    if (!item.air || item.air.value === null || item.air.observed_at === null) {
-      html += "<p>附近暂无有效空气监测读数，无法判断当前环境。</p>";
-    } else {
-      html += "<p>" + esc(item.air.name) +
-        (item.air.distance_m !== undefined ? " · 距离 " + esc(item.air.distance_m) + " 米" : "") +
-        "<br>" + esc(metric()) + "：<strong>" + esc(Number(item.air.value).toFixed(1)) +
-        " " + esc(item.air.unit || "") + "</strong> · " + esc(time(item.air.observed_at)) +
-        " · " + (item.airFresh ? "观测有效" : "已超过 3 小时，仅供历史查看") + "</p>";
-      html += item.airFresh && item.threeHourChange !== null
-        ? "<p>较 3 小时前" + (item.threeHourChange >= 0 ? "增加 " : "减少 ") +
-          esc(Math.abs(item.threeHourChange).toFixed(1)) + " " + esc(item.air.unit || "") + "。</p>"
-        : "<p class='muted'>近 3 小时连续观测不足，暂不判断变化。</p>";
+  function selectedCompareStations() {
+    const sites = compareStationInputs().filter((input) => input.checked).map((input) => input.value);
+    if (!sites.length && S.comparePrefill?.site) return [S.comparePrefill.site];
+    return sites;
+  }
+  function updateCompareSummary(inputs = compareStationInputs()) {
+    const selected = inputs.filter((input) => input.checked);
+    $("compareStationsSummary").textContent = selected.length > 1
+      ? "已选 " + selected.length + " 站"
+      : selected[0]?.dataset.name || "请选择站点";
+    for (const input of inputs)
+      input.disabled = !input.checked && selected.length >= MAX_COMPARE_STATIONS;
+  }
+  function populateStations(options, selected, useDefault = true) {
+    const markup = options.map(({ id, name, kind }) =>
+      "<label><input type='checkbox' value='" + esc(id) + "' data-name='" + esc(name) +
+      "'><span>" + esc(name + " · " + id + " · " + (kind || "类型未提供")) + "</span></label>",
+    ).join("") || "<p>暂无可选站点</p>";
+    if (markup !== compareStationsMarkup) {
+      $("compareStations").innerHTML = markup;
+      compareStationsMarkup = markup;
     }
-    html += "<p>" + (item.bikeFresh
-      ? "附近快照记录可用车辆 " + esc(item.availableBikes) + " 辆（" + esc(time(item.bikeTime)) + "）。"
-      : "自行车快照缺失或超过 15 分钟，" + (cursor ? "该时刻" : "当前") + "可用车辆数未知。") + "</p>";
-    html += "<p>" + (item.roadFresh
-      ? "附近快照记录道路事件 " + esc(item.roadCount) + " 件（" + esc(time(item.roadTime)) + "）。"
-      : "道路事件快照缺失或超过 15 分钟，" + (cursor ? "该时刻" : "当前") + "事件状态未知。") + "</p>";
-    html += "<p class='muted'>" + (cursor ? "以上均为所选时刻的历史快照。" : "以上为站点附近的当前观测参考。") +
-      "站点读数不代表整条路线；单项指数不等于完整官方 DAQI。</p>";
-    html += "<p class='health-source'><a href='https://www.gov.uk/government/publications/health-effects-of-air-pollution/health-advice-for-the-daily-air-quality-index-daqi' target='_blank' rel='noopener'>英国 Defra 健康指导 ↗</a> · 2026-04-13 更新</p>";
-    $("citizenCard").innerHTML = html;
+    const inputs = compareStationInputs();
+    const ids = new Set(selected.slice(0, MAX_COMPARE_STATIONS));
+    for (const input of inputs) input.checked = ids.has(input.value);
+    if (useDefault && inputs.length && !inputs.some((input) => input.checked))
+      inputs[0].checked = true;
+    updateCompareSummary(inputs);
   }
-  async function loadNearby() {
+  function resetCompareStations() {
+    S.compareRevision++;
+    S.comparePrefill = null;
+    $("compareStationsPicker").open = false;
+    populateStations([], []);
+  }
+  function renderCitizen() {
     if (!S.selected) return;
-    const selected = S.selected,
-      p = selected.feature.properties,
-      generation = ++S.detailGeneration;
-    $("nearbyContent").textContent = "正在查询附近资源…";
-    $("citizenCard").textContent = "正在整理出行参考…";
-    try {
-      const data = await api(
-        "/api/analysis/nearby",
-        query({
-          kind: selected.kind,
-          source: p.source || "",
-          site: p.id,
-          radius: $("nearRadius").value,
-          road_radius: $("roadRadius").value,
-        }),
-      );
-      if (generation !== S.detailGeneration) return;
-      const cursor = query().cursor;
-      const snapshot = window.AirWatchInsights.citizen(null, data, [], cursor ? Date.parse(cursor) : Date.now(), !!cursor);
-      let html =
-        "<div class='nearby-stat'><div><b>" +
-        (snapshot.bikeFresh ? data.available_bikes : "—") +
-        "</b><span>附近可用车辆</span></div><div><b>" +
-        (snapshot.bikeFresh ? data.bikes.length : "—") +
-        "</b><span>自行车站</span></div><div><b>" +
-        (snapshot.roadFresh ? data.roads.length : "—") +
-        "</b><span>道路事件</span></div></div>";
-      if (data.nearest_air)
-        html +=
-          "<p>附近监测点浓度 · " +
-          esc(data.nearest_air.name) +
-          " · " +
-          data.nearest_air.distance_m +
-          " 米 · " +
-          esc(data.nearest_air.value) +
-          " " +
-          esc(data.nearest_air.unit || "") +
-          "<br><small>" +
-          esc(time(data.nearest_air.observed_at)) +
-          "</small></p>";
-      if (selected.kind === "bike" && !data.nearest_air)
-        html += "<p class='muted'>1 公里内暂无有值监测点。</p>";
-      html +=
-        "<div class='selection-title'>附近自行车站</div><ul class='nearby-list'>" +
-        ((snapshot.bikeFresh ? data.bikes : [])
-          .slice(0, 8)
-          .map(
-            (b) =>
-              "<li><span>" +
-              esc(b.name) +
-              "<small>" +
-              b.distance_m +
-              " 米</small></span><span>" +
-              (b.bikes ?? "—") +
-              " 辆 / " +
-              (b.empty_docks ?? "—") +
-              " 空位</span></li>",
-          )
-          .join("") || "<li>该时刻或范围内无有效快照</li>") +
-        "</ul>";
-      html +=
-        "<div class='selection-title'>同期道路事件</div><ul class='nearby-list'>" +
-        ((snapshot.roadFresh ? data.roads : [])
-          .slice(0, 8)
-          .map(
-            (r) =>
-              "<li><span>" +
-              esc(r.name) +
-              "<small>" +
-              esc(r.severity) +
-              (r.distance_m !== undefined ? " · " + r.distance_m + " 米" : "") +
-              "</small></span></li>",
-          )
-          .join("") || "<li>该时刻或范围内无有效事件快照</li>") +
-        "</ul>";
-      if (selected.kind === "road")
-        html += "<p class='muted'>观察性分析 · 展示附近监测点与同期变化。</p>";
-      const air =
-        selected.kind === "air"
-          ? p
-          : data.nearest_air || data.air.find((a) => a.value !== null);
-      S.officialDAQI = await api("/api/health", {}).catch(() => ({status:"unavailable"}));
-      if (generation !== S.detailGeneration) return;
-      renderCitizen(air, data);
-      $("nearbyContent").innerHTML = html;
-      if (air) {
-        $("analysisSource").value = air.source;
-        const [series, weather] = await Promise.all([
-          api("/api/analysis/series", {
-            ...query(),
-            source: air.source,
-            sites: air.id,
-          }),
-          api("/api/analysis/weather", {
-            ...query(),
-            source: air.source,
-            site: air.id,
-            weather_site: $("weatherStation").value,
-          }),
-        ]);
-        if (generation !== S.detailGeneration) return;
-        renderCitizen(air, data, series.stations[0]?.hourly_points || []);
-        if (!$("bikeStation").value && data.bikes.length)
-          $("bikeStation").value = data.bikes[0].id;
-        const latestWeather = weather.points[weather.points.length - 1];
-        $("nearbyContent").innerHTML +=
-          "<div class='selection-title'>伦敦气象背景 · " +
-          esc(weather.station || "暂无站点") +
-          "</div><p class='city-info'>" +
-          (latestWeather
-            ? esc(time(latestWeather.time)) +
-              "<br>风速 " +
-              esc(latestWeather.WIND_SPEED?.value_num) +
-              " · 温度 " +
-              esc(latestWeather.TEMPERATURE?.value_num) +
-              " · 湿度 " +
-              esc(latestWeather.HUMIDITY?.value_num) +
-              "<br>气象单位未提供"
-            : "所选范围暂无气象观测") +
-          "</p>";
-        chart("miniTrend").setOption(
-          base({
-            grid: { left: 45, right: 15, top: 20, bottom: 45 },
-            legend: { show: false },
-            series: lines(series.stations),
-          }),
-          true,
-        );
-        const old = [...$("compareStations").selectedOptions].map(
-          (o) => o.value,
-        );
-        populateStations(
-          series.available_sites,
-          selected.kind === "road"
-            ? data.air
-                .filter((a) => a.source === air.source)
-                .slice(0, 4)
-                .map((a) => a.id)
-            : old.length
-              ? old
-              : [air.id],
-        );
-      } else chart("miniTrend").clear();
-    } catch (e) {
-      if (generation === S.detailGeneration) {
-        $("nearbyContent").textContent = e.message;
-        $("citizenCard").textContent = "出行参考暂不可用：" + e.message;
+    const replay = $("cityMode").value === "history";
+    const health = window.AirWatchInsights.healthAdvice(S.officialDAQI, $("healthGroup").value || "general", replay);
+    $("citizenCard").innerHTML = `<div class="health-band ${health.tone}">
+      <span>${esc(health.basis)}</span>${health.tone !== "unknown" ? `<small>发布于 ${esc(time(S.officialDAQI.observed_at))}</small>` : ""}</div>
+      <p class="health-action">${esc(health.advice)}</p><p class="health-note">${esc(health.note)}</p>
+      <p class="health-source"><a href="https://www.gov.uk/government/publications/health-effects-of-air-pollution/health-advice-for-the-daily-air-quality-index-daqi" target="_blank" rel="noopener">Defra 分人群健康指导 ↗</a></p>`;
+  }
+  async function refreshOverviewAdvice(replay) {
+    const generation = S.adviceGeneration = (S.adviceGeneration || 0) + 1;
+    renderCitizen();
+    if (replay) return;
+    const advice = await api("/api/health", {}).catch(() => null);
+    if (generation === S.adviceGeneration) {
+      S.officialDAQI = advice;
+      renderCitizen();
+    }
+  }
+  function airUnit(unit) {
+    return unit === "ug/m3" ? "µg/m³" : unit;
+  }
+  function renderLocalAir(readings) {
+    const items = OUTLOOK_AIR_METRICS.map(pollutant => {
+      const label = metric(pollutant);
+      const reading = readings[pollutant];
+      if (!reading || reading.status === "insufficient") {
+        return `<li><span class="local-air-label">${esc(label)}</span>
+          <p class="muted">${reading ? "附近观测不足" : "读数暂不可用"}</p></li>`;
       }
+      const {status, value, unit, observed_at, period_seconds, stations} = reading;
+      const source = stations[0];
+      const network = sourceNames[source.source] || source.source;
+      const basis = status === "measured" ? `监测站实测 · ${network} · ${source.name}` :
+        status === "nearest" ? `最近站点读数 · ${network} · ${source.name} · ${source.distance_m} 米` :
+          `附近站点估算 · ${network} · ${stations.length} 个参考站`;
+      const duration = period_seconds === 3600 ? "小时值" : period_seconds === 900 ? "15 分钟值" : "";
+      const contributors = status === "estimated" ? `<details class="air-contributors"><summary>查看 ${esc(label)} 参考站</summary>
+        <ul class="nearby-list">${stations.map(station => `<li><span>${esc(station.name)}<small>${esc(station.id)} · ${esc(station.distance_m)} 米</small></span>
+          <span>${esc(station.value)} ${esc(airUnit(station.unit))}</span></li>`).join("")}</ul></details>` : "";
+      return `<li><p class="local-air-value"><span class="local-air-label">${esc(label)}</span> <strong>${esc(value)}</strong> ${esc(airUnit(unit))}</p>
+        <p>${esc(basis)}</p><p class="muted">${esc(time(observed_at))}${duration ? ` · ${duration}` : ""}</p>${contributors}</li>`;
+    });
+    $("localAir").innerHTML = `<ul class="outlook-air-list">${items.join("")}</ul>`;
+  }
+  async function refreshOverviewWeather({start, end, cursor}) {
+    const params = {start, end, ...(cursor ? {cursor} : {}), weather_site:$("weatherStation").value, context_only:"1"};
+    const key = JSON.stringify(params);
+    if (S.overviewWeatherKey === key) return;
+    S.overviewWeatherKey = key;
+    $("outlookWeather").textContent = "正在查询气象观测…";
+    try {
+      const weather = await api("/api/analysis/weather", params);
+      if (S.overviewWeatherKey !== key) return;
+      const latest = weather.latest ?? weather.points?.at(-1);
+      if (!latest) {
+        $("outlookWeather").textContent = "所选时段暂无伦敦气象观测。";
+        return;
+      }
+      const fields = [["温度", latest.TEMPERATURE], ["湿度", latest.RELATIVE_HUMIDITY], ["风速", latest.WIND_SPEED]];
+      const readings = fields.map(([label, reading]) => {
+        const value = reading?.value_num != null ? `${reading.value_num}${reading.unit ? " " + reading.unit : ""}` : "—";
+        return `<div><dt>${label}</dt><dd>${esc(value)}</dd></div>`;
+      }).join("");
+      $("outlookWeather").innerHTML = `<p class="muted">${esc(weather.station_name || weather.station)} · ${esc(time(latest.time))}</p>
+        <dl>${readings}</dl>${fields.some(([, reading]) => reading?.value_num != null && !reading.unit) ? '<p class="muted">部分观测未提供单位。</p>' : ""}`;
+    } catch (_) {
+      if (S.overviewWeatherKey !== key) return;
+      S.overviewWeatherKey = null;
+      $("outlookWeather").textContent = "伦敦气象观测暂不可用。";
+    }
+  }
+  function renderNearbyResources(data, cursor) {
+    const snapshot = window.AirWatchInsights.citizen(null, data, [], cursor ? Date.parse(cursor) : Date.now(), !!cursor);
+    const {bikeFresh, roadFresh} = snapshot;
+    const bikeTotal = (field, total) => {
+      if (!bikeFresh || (data.bikes.length && data.bikes.every(bike => bike[field] == null))) return "暂无数据";
+      const count = Number.isFinite(total) ? total : data.bikes.reduce((sum, bike) => sum + (bike[field] ?? 0), 0);
+      return count + (data.bikes.some(bike => bike[field] == null) ? "（部分站点）" : "");
+    };
+    const bikes = bikeTotal("bikes", data.available_bikes);
+    const docks = bikeTotal("empty_docks", data.empty_docks);
+    $("nearbySummary").textContent = `${bikes === "暂无数据" ? "车辆暂无数据" : "可用车辆 " + bikes} · ${roadFresh ? "道路事件 " + data.roads.length : "道路暂无数据"}`;
+    const count = (label, value) => `<div><b>${esc(value)}</b><span>${label}</span></div>`;
+    const list = (label, items, empty) =>
+      `<h4>${label}</h4><ul class="nearby-list">${items || `<li class="muted">${empty}</li>`}</ul>`;
+    const bikeItems = bikeFresh ? data.bikes.map(b => `<li><span>${esc(b.name)}<small>${esc(b.distance_m)} 米</small></span>
+      <span>${esc(b.bikes)} 辆 / ${esc(b.empty_docks)} 空位</span></li>`).join("") : "";
+    const roadItems = roadFresh ? data.roads.map(r => `<li><span>${esc(r.name)}<small>${esc(r.severity)} · ${esc(r.distance_m)} 米</small></span></li>`).join("") : "";
+    const airItems = data.air.map(a => `<li><span>${esc(a.name)}<small>${esc(sourceNames[a.source] || a.source)} · ${esc(a.distance_m)} 米</small></span>
+      <span>${a.value == null || a.stale ? "暂无有效读数" : `${esc(a.value)} ${esc(airUnit(a.unit || ""))}`}</span></li>`).join("");
+    const snapshots = [bikeFresh ? `自行车采集于 ${time(snapshot.bikeTime)}` : "",
+      roadFresh ? `道路事件采集于 ${time(snapshot.roadTime)}` : ""].filter(Boolean);
+    $("nearbyContent").innerHTML = `<div class="nearby-stat">
+      ${count("可用车辆", bikes)}${count("空车位", docks)}${count("自行车站", bikeFresh ? data.bikes.length : "暂无数据")}
+      ${count("道路事件", roadFresh ? data.roads.length : "暂无数据")}${count("监测点", data.air.length)}</div>
+      ${snapshots.length ? `<p class="muted">${esc(snapshots.join(" · "))}</p>` : ""}
+      ${list("自行车站", bikeItems, bikeFresh ? "范围内没有自行车站。" : "自行车快照暂无数据。")}
+      ${list("道路事件", roadItems, roadFresh ? "范围内没有道路事件。" : "道路事件快照暂无数据。")}
+      ${list("监测点", airItems, "范围内没有监测点。")}`;
+  }
+  function renderNearbyTrend(trend, missing = "") {
+    S.nearbyTrend = trend;
+    $("miniTrend").hidden = !trend || !window.echarts;
+    $("miniTrendLabel").textContent = trend
+      ? `${trend.name} · ${trend.distance_m ? `距选点 ${trend.distance_m} 米 · ` : ""}${metric()} 小时观测（${airUnit(trend.unit)}）`
+      : missing;
+    if (!trend || !window.echarts) {
+      S.charts.miniTrend?.clear();
+      return;
+    }
+    if (S.outlookTab !== "nearby") return;
+    const [series] = lines([trend]);
+    if (trend.points.length === 1) series.symbol = "circle";
+    chart("miniTrend").setOption(base({
+      grid:{left:45,right:15,top:20,bottom:40},
+      legend:{show:false},
+      series:[series],
+    }), true);
+    S.charts.miniTrend.resize();
+  }
+  async function prefillNearbyComparison(selected, data, queryParams, generation) {
+    const comparePrefill = S.comparePrefill;
+    if (!comparePrefill || selected.kind === "point") return;
+    const station = selected.kind === "air" ? selected.feature.properties : data.trend;
+    if (!station) return;
+    const series = await api("/api/analysis/series", {...queryParams, source:station.source, sites:station.id}).catch(() => null);
+    if (!series || generation !== S.detailGeneration || comparePrefill !== S.comparePrefill) return;
+    S.comparePrefill = null;
+    S.compareRevision++;
+    if ($("analysisSource").value !== station.source) {
+      $("analysisSource").value = station.source;
+      resetCompareStations();
+    }
+    const old = selectedCompareStations();
+    const ids = selected.kind === "road" ? data.air.filter(a => a.source === station.source).slice(0, MAX_COMPARE_STATIONS).map(a => a.id) :
+      old.length ? old : [station.id];
+    populateStations(series.available_sites, ids);
+  }
+  async function loadNearby({resourcesOnly = false} = {}) {
+    const selected = S.selected;
+    if (!selected) return;
+    const p = selected.feature.properties;
+    const queryParams = query();
+    const key = JSON.stringify([selected.kind, p.source, p.id, selected.center, queryParams]);
+    const refreshAir = !resourcesOnly || S.localAirKey !== key;
+    const generation = ++S.detailGeneration;
+    const isCoordinate = selected.kind === "point" || selected.kind === "road";
+    const [lon, lat] = selected.center;
+    const anchor = isCoordinate ? {kind:"point", lon, lat} : {kind:selected.kind, source:p.source || "", site:p.id};
+    $("nearbySummary").textContent = "正在查询…";
+    $("nearbyContent").textContent = "正在查询附近资源…";
+    if (refreshAir) {
+      S.localAirKey = null;
+      $("localAir").textContent = "正在查询地点空气质量…";
+    }
+    renderNearbyTrend(null);
+    if (!resourcesOnly) {
+      void refreshOverviewAdvice(!!queryParams.cursor);
+      void refreshOverviewWeather(queryParams);
+    }
+    try {
+      const data = await api("/api/analysis/nearby", {
+        ...queryParams, ...anchor, all_sources:"1", include_trend:"1",
+        ...(refreshAir ? {include_air_metrics:"1"} : {resources_only:"1"}),
+        radius:$("nearRadius").value, road_radius:$("roadRadius").value,
+      });
+      if (generation !== S.detailGeneration) return;
+      if (refreshAir) {
+        renderLocalAir(data.local_air_by_metric ?? {[queryParams.metric]:data.local_air});
+        S.localAirKey = key;
+      }
+      renderNearbyResources(data, queryParams.cursor);
+      renderNearbyTrend(data.trend, selected.kind === "air" ? "本站在所选时段暂无有效观测趋势。" : "范围内暂无可显示的监测站观测趋势。");
+      if (!$("bikeStation").value && data.bikes.length) $("bikeStation").value = data.bikes[0].id;
+      await prefillNearbyComparison(selected, data, queryParams, generation);
+    } catch (e) {
+      if (generation !== S.detailGeneration) return;
+      $("nearbySummary").textContent = "周边数据暂不可用";
+      $("nearbyContent").textContent = e.message;
+      if (refreshAir) renderLocalAir({});
     }
   }
   function openSelected() {
-    if (!S.selected) return;
+    if (!S.selected || S.selected.kind === "point") return;
     const { kind, feature } = S.selected;
     const cursor = query().cursor;
     if (kind === "road") H.openRoad(feature.properties.id, cursor || null);
@@ -1399,22 +1586,22 @@
       H.openStation(
         kind === "bike" ? "tfl" : feature.properties.source,
         feature.properties.id,
-        {
+        cursor ? {
           start: S.start.toISOString(),
-          end: cursor
-            ? new Date(Date.parse(cursor) + 1000).toISOString()
-            : S.end.toISOString(),
-        },
+          end: new Date(Date.parse(cursor) + 1000).toISOString(),
+        } : null,
       );
   }
   async function loadAnalysis() {
     if (!S.start || !window.echarts) return;
     const generation = ++S.analysisGeneration;
+    const compareRevision = S.compareRevision;
+    const source = $("analysisSource").value;
     error("");
     try {
-      const source = $("analysisSource").value;
-      let sites = [...$("compareStations").selectedOptions].map((o) => o.value);
-      if (sites.length > 4) throw new Error("最多选择 4 个站点进行对比");
+      let sites = selectedCompareStations();
+      if (sites.length > MAX_COMPARE_STATIONS)
+        throw new Error("最多选择 " + MAX_COMPARE_STATIONS + " 个站点进行对比");
       const q = {
         ...query(),
         source,
@@ -1423,16 +1610,17 @@
         bike_site: $("bikeStation").value,
       };
       const series = await api("/api/analysis/series", q);
-      if (generation !== S.analysisGeneration) return;
+      if (generation !== S.analysisGeneration || source !== $("analysisSource").value) return;
       if (!sites.length) sites = series.stations.map((s) => s.id);
-      populateStations(series.available_sites, sites);
+      const compareEdited = compareRevision !== S.compareRevision;
+      populateStations(series.available_sites, compareEdited ? selectedCompareStations() : sites, !compareEdited);
       S.series = series;
       const weather = await api("/api/analysis/weather", {
         ...q,
         site: sites[0] || "",
         weather_site: $("weatherStation").value,
       });
-      if (generation !== S.analysisGeneration) return;
+      if (generation !== S.analysisGeneration || source !== $("analysisSource").value) return;
       S.weather = weather;
       $("weatherStation").innerHTML =
         "<option value=''>按有效观测数选择</option>" +
@@ -1449,7 +1637,7 @@
       $("weatherStation").value = weather.station || "";
       drawAnalysis();
     } catch (e) {
-      if (generation === S.analysisGeneration) error(e.message);
+      if (generation === S.analysisGeneration && source === $("analysisSource").value) error(e.message);
     }
   }
   function heatmap(id, cells, missing = false) {
@@ -1547,10 +1735,7 @@
       time(S.start.toISOString()) +
       " 至 " +
       time(S.end.toISOString()) +
-      "\n小时值优先使用来源记录；由 15 分钟值汇总时至少需要 3 / 4 个时段。缺测保持为空。" +
-      (series.source === "breathe_wcc"
-        ? "\n年度导入覆盖 Westminster 的所选站点。"
-        : "");
+      "\n小时值优先使用来源记录；由 15 分钟值汇总时至少需要 3 / 4 个时段。缺测保持为空。";
     $("seriesSummary").textContent =
       series.stations.reduce((n, s) => n + s.points.length, 0) + " 个有效时段";
     const pollutionLines = lines(series.stations, interval);
@@ -1792,14 +1977,19 @@
   }
   S.overviewMapHost = $("cityMap")?.parentElement;
   if ($("gisTableDialog")?.append) $("gisTableDialog").append(document.querySelector(".gis-table-panel"));
-  $("healthGroup")?.addEventListener?.("change", () => {
-    const context = S.citizenContext;
-    if (context) renderCitizen(context.air, context.nearby, context.hourlyPoints);
-  });
+  $("healthGroup").addEventListener("change", renderCitizen);
   $("closeGisTable")?.addEventListener?.("click", () => $("gisTableDialog").close());
   $("closeLinkage")?.addEventListener?.("click", () => $("linkageDialog").close());
-  document.querySelector?.(".nearby-details")?.addEventListener?.("toggle", (event) => {
-    if (event.currentTarget.open) requestAnimationFrame(() => S.charts.miniTrend?.resize());
+  OUTLOOK_TABS.forEach((name, index) => {
+    const button = $("outlookTab-" + name);
+    button.addEventListener("click", () => showOutlookTab(name));
+    button.addEventListener("keydown", event => {
+      const count = OUTLOOK_TABS.length;
+      const targets = {ArrowLeft:(index+count-1)%count, ArrowRight:(index+1)%count, Home:0, End:count-1};
+      if (!Object.hasOwn(targets, event.key)) return;
+      event.preventDefault();
+      showOutlookTab(OUTLOOK_TABS[targets[event.key]], true);
+    });
   });
   document
     .querySelectorAll("[data-page]")
@@ -1819,7 +2009,7 @@
     requestAnimationFrame(() => $("cityMap").scrollIntoView({ behavior: "smooth", block: "center" }));
     if (!S.map || !S.ready) {
       S.pendingBoundaryFocus = true;
-      $("mapNotice").textContent = "等待地图加载后显示所选行政区。";
+      setMapNotice("等待地图加载后显示所选行政区。");
       return;
     }
     for (const level of ["region", "borough"]) {
@@ -1847,86 +2037,112 @@
   $("gisTableSearch").addEventListener("input", () => { S.gisPage = 1; renderGisTable(); });
   $("gisTablePrevious").addEventListener("click", () => { S.gisPage--; renderGisTable(); });
   $("gisTableNext").addEventListener("click", () => { S.gisPage++; renderGisTable(); });
-  $("mapColor").addEventListener("change", () => {
-    drawLayers();
-    if (S.data) legend();
-  });
   $("pollutionZones")?.addEventListener?.("change", drawPollutionZones);
-  $("basemap").addEventListener("change", () => {
-    if (!S.map) return;
-    S.ready = false;
-    if (S.popup) S.popup.remove();
-    $("mapNotice").textContent = "正在切换底图…";
-    S.map.setStyle(
-      "https://tiles.openfreemap.org/styles/" + $("basemap").value,
-      { diff: false },
-    );
-  });
-  $("cityRange").addEventListener("change", () => {
-    $("cityStartLabel").hidden = $("cityEndLabel").hidden =
-      $("cityRange").value !== "custom";
-  });
-  $("cityApply").addEventListener("click", () => {
-    S.playing = false;
-    $("replayPlay").textContent = "播放";
-    const source = $("citySource").value;
-    if (source) {
-      $("analysisSource").value = source;
-      $("compareStations").innerHTML = "";
-      if (
-        S.selected?.kind === "air" &&
-        S.selected.feature.properties.source !== source
-      )
-        S.selected = null;
-    }
-    refreshCity(true).catch((e) => error(e.message));
-  });
+  $("analysisMetric").innerHTML = $("cityMetric").innerHTML;
+  $("analysisMetric").value = $("cityMetric").value;
+  for (const id of ["cityMetric", "analysisMetric"]) {
+    $(id).addEventListener("change", () => {
+      const value = $(id).value;
+      $("cityMetric").value = $("analysisMetric").value = value;
+      refreshCity();
+    });
+  }
   $("cityMode").addEventListener("change", () => {
-    replayLabel();
-    refreshCity();
+    stopReplay();
+    refreshCity(true);
   });
   $("replayHour").addEventListener("change", () => {
     replayLabel();
     refreshCity();
   });
-  $("replayHour").addEventListener("input", replayLabel);
+  $("replayHour").addEventListener("input", () => {
+    stopReplay();
+    replayLabel();
+  });
   $("replayPlay").addEventListener("click", async () => {
-    S.playing = !S.playing;
-    $("replayPlay").textContent = S.playing ? "暂停" : "播放";
-    while (S.playing) {
-      const next = Number($("replayHour").value) + 1;
-      if (next > Number($("replayHour").max)) {
-        S.playing = false;
-        $("replayPlay").textContent = "播放";
-        break;
-      }
-      $("replayHour").value = next;
+    if (S.playback) {
+      stopReplay();
+      return;
+    }
+    const playback = S.playback = {};
+    $("replayPlay").textContent = "暂停";
+    const slider = $("replayHour");
+    const max = Number(slider.max);
+    let next = Number(slider.value) + 1;
+    if (next > max) next = 0;
+    while (S.playback === playback && next <= max) {
+      slider.value = next;
       replayLabel();
       await refreshCity();
-      await new Promise((resolve) => setTimeout(resolve, 1200));
+      next++;
+      if (S.playback === playback && next <= max)
+        await new Promise((resolve) => setTimeout(resolve, 1200));
     }
+    if (S.playback === playback) stopReplay();
   });
   for (const id of ["nearRadius", "roadRadius"])
-    $(id).addEventListener("change", loadNearby);
+    $(id).addEventListener("change", () => {
+      drawOverviewLocation();
+      return loadNearby({resourcesOnly:true});
+    });
   $("openSelected").addEventListener("click", openSelected);
   $("analyseSelected").addEventListener("click", () => showPage("analysis"));
-  $("chooseQuick").addEventListener("click", () => {
-    const [source, id] = $("quickStation").value.split(":");
-    const f = S.data?.air.features.find(
-      (f) => f.properties.source === source && f.properties.id === id,
-    );
-    if (f) {
-      selectFeature("air", f);
-      if (S.map) S.map.easeTo({ center: f.geometry.coordinates, zoom: 13 });
+  $("changeLocation").addEventListener("click", () => setLocationPicker($("locationOptions").hidden));
+  for (const id of ["locationNetworkLaqn", "locationNetworkBreathe"])
+    $(id).addEventListener("change", renderLocationSearch);
+  $("locationSearch").addEventListener("input", renderLocationSearch);
+  $("locationStation").addEventListener("change", () => {
+    const source = $("locationNetworkLaqn").checked ? "laqn" : "breathe";
+    const id = $("locationStation").value;
+    const station = id && S.data?.air.features.find(({properties: p}) => p.source === source && p.id === id);
+    if (!station) return;
+    $("locationSearch").value = "";
+    setLocationPicker(false);
+    $("changeLocation").focus?.();
+    return chooseLocationStation(station, true);
+  });
+  $("pickLocationFromPanel").addEventListener("click", () => beginOverviewPick(true));
+  $("pickOverviewLocation").addEventListener("click", () => {
+    if (S.pickingLocation) setOverviewPicking(false);
+    else beginOverviewPick(false);
+  });
+  window.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || S.page !== "overview") return;
+    if (S.pickingLocation) {
+      setOverviewPicking(false);
+      $("pickOverviewLocation").focus?.({preventScroll:true});
+    } else if (!$("locationOptions").hidden && $("locationOptions").contains(event.target)) {
+      setLocationPicker(false);
+      $("changeLocation").focus?.();
     }
   });
+  const comparePicker = $("compareStationsPicker");
+  $("compareStations").addEventListener("change", () => {
+    S.compareRevision++;
+    S.comparePrefill = null;
+    updateCompareSummary();
+  });
+  comparePicker.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || !comparePicker.open) return;
+    comparePicker.open = false;
+    $("compareStationsToggle").focus();
+  });
+  window.addEventListener("click", (event) => {
+    if (comparePicker.open && !comparePicker.contains(event.target)) comparePicker.open = false;
+  });
   $("analysisSource").addEventListener("change", () => {
-    $("compareStations").innerHTML = "";
+    resetCompareStations();
     $("weatherStation").value = "";
     loadAnalysis();
   });
-  $("analysisApply").addEventListener("click", loadAnalysis);
-  $("weatherStation").addEventListener("change", loadAnalysis);
+  $("analysisApply").addEventListener("click", () => {
+    comparePicker.open = false;
+    loadAnalysis();
+  });
+  $("weatherStation").addEventListener("change", () => {
+    if (S.selected && S.start) void refreshOverviewWeather(query());
+    return loadAnalysis();
+  });
   $("bikeStation").addEventListener("change", loadAnalysis);
   $("analysisInterval").addEventListener("change", loadAnalysis);
   window.addEventListener("resize", () => {
@@ -1935,25 +2151,16 @@
   });
   window.addEventListener("airwatch:refreshed", () => {
     if (!S.start || S.page === "tables") return;
-    refreshCity($("cityMode").value === "latest").catch((e) =>
-      error(e.message),
-    );
+    refreshCity();
   });
   window.addEventListener("airwatch:timezone", () => {
     replayLabel();
     if (S.data) summaries();
     if (S.series) drawAnalysis();
   });
-  $("cityStart").value = calendarDate(
-    new Date(Date.now() - 48 * 3600000),
-    zone(),
-  );
-  $("cityEnd").value = calendarDate(new Date(), zone());
   const gisSidebar = document.querySelector?.(".gis-sidebar");
-  if (gisSidebar) {
-    gisSidebar.open = false;
-    gisSidebar.addEventListener("toggle", () => S.map?.resize());
-  }
+  gisSidebar?.addEventListener("toggle", () => S.map?.resize());
+  legend();
   renderGisTable();
   window.AirWatchCity = {getMap: () => S.map, showPage, fitLondonView, getData: () => S.data};
   if (location.protocol !== "file:") {

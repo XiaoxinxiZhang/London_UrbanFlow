@@ -16,8 +16,10 @@ import collect_live as collector
 import live_store as store
 from collector_lock import collector_running
 from city_analysis import CityAnalysis
+from live_sources import EXCLUDED_INDEX_METRICS, breathe_site_metadata
 
 SOURCES = {"laqn", "breathe", "breathe_wcc", "tfl", "metoffice"}
+VISIBLE_MEASUREMENT = "m.metric NOT IN (" + ",".join("?" for _ in EXCLUDED_INDEX_METRICS) + ")"
 
 
 def utc_now():
@@ -69,7 +71,8 @@ def location_filter(params):
 
 def location_row(row):
     result = dict(row)
-    result["metadata"] = json.loads(result.pop("metadata_json"))
+    metadata = json.loads(result.pop("metadata_json"))
+    result["metadata"] = breathe_site_metadata(metadata) if result["source"] == "breathe" else metadata
     return result
 
 
@@ -102,7 +105,8 @@ class LiveAPI:
             return self.latest(params)
         page, size = page_params(params)
         where, values = location_filter({**params, "active": "0"})
-        clauses = [where]
+        clauses = [where, VISIBLE_MEASUREMENT]
+        values.extend(EXCLUDED_INDEX_METRICS)
         for key, column in (("metric", "m.metric"), ("period", "m.period_seconds")):
             if params.get(key):
                 clauses.append(column+"=?")
@@ -118,12 +122,12 @@ class LiveAPI:
             rows = db.execute("SELECT m.*,l.name"+join+where+
                               " ORDER BY m.valid_at_utc DESC,m.source_id,m.metric,m.period_seconds LIMIT ? OFFSET ?",
                               (*values,size,(page-1)*size)).fetchall()
-            bounds = db.execute("""SELECT MIN(valid_at_utc),MAX(valid_at_utc) FROM measurements
-              WHERE source=? AND (?='' OR source_id=?)""",
-              (source_param(params),params.get("site",""),params.get("site",""))).fetchone()
-            metrics = db.execute("""SELECT DISTINCT metric,period_seconds FROM measurements
-              WHERE source=? AND (?='' OR source_id=?) ORDER BY metric,period_seconds""",
-              (source_param(params),params.get("site",""),params.get("site",""))).fetchall()
+            site = params.get("site", "")
+            visible = f" FROM measurements m WHERE source=? AND (?='' OR source_id=?) AND {VISIBLE_MEASUREMENT}"
+            visible_values = (source_param(params), site, site, *EXCLUDED_INDEX_METRICS)
+            bounds = db.execute("SELECT MIN(valid_at_utc),MAX(valid_at_utc)"+visible, visible_values).fetchone()
+            metrics = db.execute("SELECT DISTINCT metric,period_seconds"+visible+" ORDER BY metric,period_seconds",
+                                 visible_values).fetchall()
             return dict(items=[dict(row) for row in rows],total=total,page=page,page_size=size,
                         bounds=list(bounds),metrics=[dict(row) for row in metrics])
 
@@ -132,14 +136,20 @@ class LiveAPI:
         source = source_param(params)
         period = int(params.get("period", "900" if source == "laqn" else "0" if source == "tfl" else "3600"))
         kind = params.get("kind","concentration")
+        time_filter = ""
+        time_values = []
+        for key, operator in (("start", ">="), ("end", "<")):
+            if params.get(key):
+                time_filter += f" AND n.valid_at_utc{operator}?"
+                time_values.append(timestamp(params[key]))
         with closing(self.connect()) as db:
             for location in result["items"]:
-                rows = db.execute("""SELECT m.* FROM measurements m WHERE source=? AND source_id=?
-                  AND period_seconds=? AND valid_at_utc=(
+                rows = db.execute(f"""SELECT m.* FROM measurements m WHERE source=? AND source_id=?
+                  AND period_seconds=? AND {VISIBLE_MEASUREMENT} AND valid_at_utc=(
                     SELECT MAX(n.valid_at_utc) FROM measurements n
                     WHERE n.source=m.source AND n.source_id=m.source_id
-                      AND n.metric=m.metric AND n.period_seconds=m.period_seconds)""",
-                  (source,location["source_id"],period)).fetchall()
+                      AND n.metric=m.metric AND n.period_seconds=m.period_seconds{time_filter})""",
+                  (source,location["source_id"],period,*EXCLUDED_INDEX_METRICS,*time_values)).fetchall()
                 metrics = {}
                 for row in rows:
                     metric = row["metric"]

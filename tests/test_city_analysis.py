@@ -75,6 +75,30 @@ class CityAnalysisTests(unittest.TestCase):
         self.assertTrue(data["bike_info"]["gap"])
         self.assertEqual(data["bikes"]["features"],[])
 
+    def test_map_bike_counts_use_snapshot_states(self):
+        stamp=(self.base+timedelta(minutes=18)).isoformat()
+        station=parsers.tfl_bikes(self.bikes)[0]
+        stations=[
+            {**station, "sid":f"BikePoints_{index}",
+             "counts":{"BIKES_AVAILABLE":(bikes,None),"DOCKS_EMPTY":(docks,None)}}
+            for index,(bikes,docks) in enumerate(((0,5),(5,0),(3,2),(None,2)), start=1)
+        ]
+        traffic_history.save_bikes(self.db,stations,stamp,"sha")
+        self.db.commit()
+
+        latest=self.api.map(self.params)
+        self.assertEqual(latest["counts"],dict(bikes=4,empty=1,full=1,available=1,roads=1))
+        self.assertEqual({f["properties"]["state"] for f in latest["bikes"]["features"]},
+                         {"empty","full","available","unknown"})
+        outside_map=self.api.map({**self.params,"bbox":"-.05,51.4,.1,51.6"})
+        self.assertEqual(outside_map["bikes"]["features"],[])
+        self.assertEqual(outside_map["counts"],latest["counts"])
+
+        replay={**self.params,"cursor":(self.base+timedelta(minutes=12)).isoformat()}
+        self.assertEqual(self.api.map(replay)["counts"],dict(bikes=1,empty=0,full=0,available=1,roads=1))
+        replay["cursor"]=(self.base+timedelta(minutes=40)).isoformat()
+        self.assertEqual(self.api.map(replay)["counts"],dict(bikes=0,empty=0,full=0,available=0,roads=0))
+
     def test_nearby_and_bike_nearest_air(self):
         p={**self.params,"cursor":(self.base+timedelta(minutes=12)).isoformat()}
         result=self.api.nearby(p)
@@ -83,6 +107,108 @@ class CityAnalysisTests(unittest.TestCase):
         result=self.api.nearby({**p,"source":"","kind":"bike","site":"BikePoints_1"})
         self.assertEqual(result["nearest_air"]["id"],"A")
         self.assertLess(result["nearest_air"]["distance_m"],20)
+
+    def add_air_readings(self, source, site, lon, rows):
+        store.location(self.db,source,site,site,"Urban Background",51.5,lon)
+        for minute, value, unit, period, quality in rows:
+            stamp=(self.base+timedelta(minutes=minute)).isoformat()
+            store.measurement(self.db,source,site,"PM25_CONCENTRATION",stamp,stamp,period,"test",
+                              value_num=value,unit=unit,quality=quality)
+        self.db.commit()
+
+    def point_query(self, **params):
+        query={**self.params,"kind":"point","source":"","lon":"-.101","lat":"51.5",
+               "cursor":(self.base+timedelta(minutes=12)).isoformat(),"include_trend":"1",**params}
+        return self.api.nearby(query)
+
+    def test_coordinate_estimate_uses_same_hour_network_and_unit_independent_of_radius(self):
+        self.add_air_readings("laqn","B",-.110,[(0,21,"µg/m³",3600,"P"),(60,99,"ug/m3",3600,"P")])
+        self.add_air_readings("laqn","C",-.101,[(0,500,"ug/m3",3600,"I")])
+        self.add_air_readings("laqn","D",-.101,[(0,800,"ppb",3600,"R")])
+        self.add_air_readings("breathe","BL2",-.102,[(0,200,"ug/m3",3600,"R")])
+        nearby=self.point_query()
+        wider=self.point_query(radius="1000",road_radius="500")
+        self.assertEqual(nearby["anchor"]["geometry"]["coordinates"],[-.101,51.5])
+        self.assertNotIn("B",[station["id"] for station in nearby["air"]])
+        self.assertIn("B",[station["id"] for station in wider["air"]])
+        reading=nearby["local_air"]
+        self.assertEqual(reading,wider["local_air"])
+        self.assertEqual((reading["status"],reading["unit"],reading["value"]),("estimated","ug/m3",1.2))
+        self.assertEqual([(site["id"],site["value"]) for site in reading["stations"]],[("A",1),("B",21)])
+        self.assertEqual(nearby["trend"]["id"],"D")
+        self.assertEqual(nearby["empty_docks"],2)
+        self.assertIsNone(self.point_query(resources_only="1")["local_air"])
+
+    def test_coordinate_replay_fallback_and_station_hourly_measurement(self):
+        self.add_air_readings("laqn","B",-.1025,[(0,12,"ug/m3",900,"P"),(15,18,"ug/m3",900,"R"),
+                                                  (30,24,"ug/m3",900,"R")])
+        early=self.point_query()["local_air"]
+        self.assertEqual((early["status"],early["value"],early["stations"][0]["id"]),("nearest",1,"A"))
+        later=self.point_query(cursor=(self.base+timedelta(minutes=31)).isoformat())["local_air"]
+        self.assertEqual(later["status"],"estimated")
+        self.assertEqual(later["stations"][1]["value"],18)
+        no_data=self.point_query(lon="-.5")["local_air"]
+        self.assertEqual((no_data["status"],no_data["value"]),("insufficient",None))
+
+        current=self.api.nearby({**self.params,"end":(self.base+timedelta(hours=2,minutes=10)).isoformat(),"period":"900"})
+        self.assertEqual((current["local_air"]["status"],current["local_air"]["value"]),("measured",3))
+        self.assertEqual(current["local_air"]["period_seconds"],3600)
+        with self.assertRaisesRegex(ValueError,"有效经纬度"):
+            self.point_query(lat="nan")
+
+    def test_selected_station_replay_does_not_average_incompatible_or_invalid_readings(self):
+        self.add_air_readings("laqn","B",-.102,[(0,12,"ug/m3",900,"P"),(15,99,"ppb",900,"R"),
+                                                 (30,999,"ug/m3",900,"I")])
+        result=self.api.nearby({**self.params,"site":"B","cursor":(self.base+timedelta(minutes=31)).isoformat(),
+                                "include_trend":"1"})
+        reading=result["local_air"]
+        self.assertEqual((reading["status"],reading["value"],reading["unit"],reading["period_seconds"]),
+                         ("measured",99,"ppb",900))
+        self.assertIsNone(result["trend"])
+
+    def test_nearby_batch_keeps_pollutant_values_and_fallbacks_independent(self):
+        self.add_air_readings("laqn", "B", -.103, [(0, 21, "ug/m3", 3600, "R")])
+        for source, site, metric, minute, value in (("laqn", "A", "PM10", 0, 18),
+                                                    ("breathe", "BL1", "NO2", 0, 32),
+                                                    ("laqn", "A", "O3", 15, 42)):
+            stamp = (self.base + timedelta(minutes=minute)).isoformat()
+            store.measurement(self.db, source, site, metric+"_CONCENTRATION", stamp, stamp, 900,
+                              "test", value_num=value, unit="ug/m3", quality="R")
+        self.db.commit()
+        point = self.point_query(include_air_metrics="1", metric="NO2")
+        readings = point["local_air_by_metric"]
+        self.assertEqual({metric: item["status"] for metric, item in readings.items()},
+                         {"PM25":"estimated", "PM10":"nearest", "NO2":"nearest", "O3":"insufficient"})
+        self.assertEqual(point["local_air"], readings["NO2"])
+        self.assertEqual(self.point_query(include_air_metrics="1", metric="PM25")["local_air_by_metric"], readings)
+        self.assertNotIn("local_air_by_metric", self.point_query())
+        self.assertIsNone(self.point_query(include_air_metrics="1", resources_only="1")["local_air"])
+
+        station = self.api.nearby({**self.params, "include_air_metrics":"1", "cursor":
+                                   (self.base+timedelta(minutes=12)).isoformat()})["local_air_by_metric"]
+        self.assertEqual((station["PM25"]["status"], station["PM25"]["value"]), ("measured", 1))
+        self.assertEqual((station["PM10"]["status"], station["PM10"]["value"]), ("measured", 18))
+        self.assertEqual(station["PM10"]["stations"][0]["metric"], "PM10")
+        self.assertEqual(station["NO2"]["value"], 32)
+        self.assertEqual(station["O3"]["status"], "insufficient")
+
+    def test_recent_point_estimate_chooses_newest_shared_hour_and_rejects_stale_data(self):
+        self.add_air_readings("laqn","B",-.101,[(0,30,"ug/m3",3600,"P"),(60,20,"ug/m3",3600,"R")])
+        end=(self.base+timedelta(hours=3,minutes=10)).isoformat()
+        query={"cursor":"","end":end}
+        reading=self.point_query(**query)["local_air"]
+        self.assertEqual(reading["status"],"estimated")
+        self.assertEqual(reading["observed_at"],(self.base+timedelta(hours=1)).isoformat())
+        end=(self.base+timedelta(hours=5)).isoformat()
+        reading=self.point_query(cursor="",end=end)["local_air"]
+        self.assertEqual(reading["status"],"nearest")
+        self.assertNotEqual(reading["stations"][0]["id"],"B")
+
+    def test_analysis_accepts_concentrations_only(self):
+        for query in (self.api.map, self.api.series, self.api.nearby, self.api.weather):
+            for metric in ("PM25_INDEX", "NO2_INDEX", "PM10_INDEX", "O3_INDEX"):
+                with self.subTest(query=query.__name__, metric=metric), self.assertRaisesRegex(ValueError, "未知污染指标"):
+                    query({**self.params, "metric": metric})
 
     def test_weather_utc_pairs_minimum_samples_and_correlation(self):
         result=self.api.weather(self.params)
@@ -94,6 +220,23 @@ class CityAnalysisTests(unittest.TestCase):
         result=self.api.weather({**self.params,"cursor":(self.base+timedelta(hours=2)).isoformat()})
         self.assertEqual(result["sample_count"],3)
         self.assertNotIn("other",[row["id"] for row in result["candidates"]])
+
+    def test_weather_context_returns_only_observations_at_or_before_cursor(self):
+        cursor = self.base + timedelta(hours=2, minutes=10)
+        observed = (cursor - timedelta(minutes=1)).isoformat()
+        future = (cursor + timedelta(minutes=1)).isoformat()
+        store.measurement(self.db, "metoffice", "weather", "TEMPERATURE", observed, observed, 3600,
+                          "test", value_num=11, unit="°C")
+        store.measurement(self.db, "metoffice", "weather", "TEMPERATURE", future, future, 3600,
+                          "test", value_num=30, unit="°C")
+        self.db.commit()
+        params = {**self.params, "cursor":cursor.isoformat(), "context_only":"1", "weather_site":"weather"}
+        context = self.api.weather(params)
+        self.assertEqual((context["station"], context["station_name"]), ("weather", "Greater London"))
+        self.assertEqual(context["latest"]["TEMPERATURE"]["value_num"], 11)
+        self.assertIn("WIND_SPEED", context["latest"])
+        self.assertNotIn("pairs", context)
+        self.assertIsNone(self.api.weather({**params, "start":(cursor-timedelta(seconds=15)).isoformat()})["latest"])
 
     def test_road_detail_uses_replay_snapshot_and_excludes_future_versions(self):
         first=(self.base+timedelta(minutes=5)).isoformat()

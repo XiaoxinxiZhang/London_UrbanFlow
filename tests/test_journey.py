@@ -11,7 +11,8 @@ from urllib.error import URLError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from city_analysis import distance
-from journey import DAQI, JourneyPlanner, OpenRouteService, RoutingUnavailable, estimate
+from journey import (DAQI, JourneyPlanner, OpenRouteService, RoutingUnavailable, estimate,
+                     route_air_segments)
 
 UTC = timezone.utc
 START = [-.1500, 51.5100]
@@ -23,10 +24,17 @@ def dock(sid, point, bikes, spaces):
             "properties": {"id": sid, "name": sid, "bikes": bikes, "empty_docks": spaces}}
 
 
+def air_station(point, value, *, stale=False, unit="ug/m3", quality="R"):
+    return {"geometry": {"coordinates": point},
+            "properties": {"value": value, "stale": stale, "unit": unit, "quality": quality,
+                           "observed_at": "2026-11-18T12:00:00+00:00"}}
+
+
 class Analysis:
-    def __init__(self, bikes, stale=False):
+    def __init__(self, bikes, stale=False, air=None):
         self.bikes = bikes
         self.stale = stale
+        self.air = air or {}
 
     def connect(self):
         return sqlite3.connect(":memory:")
@@ -38,7 +46,7 @@ class Analysis:
         return [], {"captured_at": stamp, "stale": False, "gap": False}
 
     def air_features(self, db, params, start, end, cursor):
-        return [], []
+        return self.air.get((params["metric"], params["source"]), []), []
 
 
 class Router:
@@ -121,7 +129,8 @@ class JourneyTests(unittest.TestCase):
 
     def test_complete_pickup_cycle_return_and_alternative_selection(self):
         router = Router()
-        planner = JourneyPlanner(Analysis(self.bikes), router, FixedDAQI())
+        stations = [air_station(START, 0), air_station([-.1495, 51.5101], 2)]
+        planner = JourneyPlanner(Analysis(self.bikes, air={("PM25", "laqn"): stations}), router, FixedDAQI())
         result = planner.plan(self.payload)
         self.assertEqual([leg["kind"] for leg in result["legs"]],
                          ["walk_to_bike", "cycle", "walk_to_destination"])
@@ -130,6 +139,16 @@ class JourneyTests(unittest.TestCase):
         self.assertEqual([call[0] for call in router.matrix_calls],
                          ["foot-walking", "foot-walking", "cycling-regular"])
         self.assertEqual(result["context"]["daqi"]["index"], 3)
+        profile = result["context"]["route_air"]
+        segments = profile["segments"]
+        self.assertEqual(sorted({s["leg_index"] for s in segments}), [0, 1, 2])
+        self.assertTrue(all(a["to_m"] == b["from_m"] for a, b in zip(segments, segments[1:])))
+        covered = [s for s in segments if s["readings"]["PM25"]["laqn"]["status"] == "estimated"]
+        coverage = profile["summary"]["PM25"]["laqn"]["coverage"]
+        self.assertGreater(len(covered), 0)
+        self.assertLess(len(covered), len(segments))
+        self.assertAlmostEqual(coverage, sum(s["to_m"] - s["from_m"] for s in covered) / profile["total_distance_m"])
+        self.assertNotAlmostEqual(coverage, len(covered) / len(segments))
         with self.assertRaisesRegex(ValueError, "不可用"):
             planner.plan({**self.payload, "pickup_id": "empty", "dropoff_id": "dropoff"})
 
@@ -139,12 +158,73 @@ class JourneyTests(unittest.TestCase):
         self.assertEqual([leg["kind"] for leg in result["legs"]], ["walk"])
         self.assertEqual(result["alternatives"], [])
         self.assertIn("15 分钟", result["message"])
+        self.assertEqual({s["leg_index"] for s in result["context"]["route_air"]["segments"]}, {0})
 
     def test_no_docks_and_routing_failure_are_explicit(self):
         result = JourneyPlanner(Analysis([]), Router(fail=True), FixedDAQI()).plan(self.payload)
         self.assertEqual(result["legs"], [])
         self.assertIn("无可取车辆", result["message"])
         self.assertEqual(result["routing_error"], "route service down")
+        self.assertEqual(result["context"]["route_air"]["status"], "unavailable")
+        self.assertEqual(result["context"]["route_air"]["segments"], [])
+        self.assertEqual(result["context"]["daqi"]["index"], 3)
+
+    def test_bent_route_estimates_internal_hotspot_and_keeps_sources_separate(self):
+        path = [START, START, [-.15, 51.53], [-.11, 51.53], END]
+        router = Router()
+        leg = {**router.directions("foot-walking", START, END),
+               "geometry": {"type": "LineString", "coordinates": path}}
+        analysis = Analysis([], air={
+            ("NO2", "laqn"): [air_station(START, 0), air_station([-.1502, 51.51], 0, unit="µg/m³"),
+                             air_station([-.13, 51.5301], 40), air_station([-.13, 51.5299], 40),
+                             air_station([-.13, 51.53], 500, stale=True),
+                             air_station([-.13, 51.53], 500, quality="S"),
+                             air_station([-.13, 51.53], 500, unit="ppb")],
+            ("NO2", "breathe"): [air_station([-.13, 51.53], 5)],
+        })
+        planner = JourneyPlanner(analysis, router, FixedDAQI())
+        with patch.object(router, "directions", return_value=leg), patch.object(
+                analysis, "air_features", wraps=analysis.air_features) as queried:
+            result = planner.plan({**self.payload, "mode": "walk"})
+        self.assertEqual(queried.call_count, 8)
+        context = result["context"]
+        self.assertEqual(context["start"]["NO2"]["laqn"]["value"], 0)
+        self.assertEqual(context["end"]["NO2"]["laqn"]["status"], "insufficient")
+        route = context["route_air"]
+        segments = route["segments"]
+        self.assertEqual(route["status"], "available")
+        self.assertAlmostEqual(route["total_distance_m"], sum(distance(a, b) for a, b in zip(path, path[1:])))
+        self.assertTrue(all(s["to_m"] - s["from_m"] <= 250 for s in segments))
+        for lon, lat in (s["coordinates"] for s in segments):
+            self.assertTrue(lon in (START[0], END[0]) or lat == 51.53)
+        laqn = route["summary"]["NO2"]["laqn"]
+        self.assertEqual((laqn["min"], laqn["max"]), (0, 40))
+        self.assertGreater(laqn["coverage"], 0)
+        self.assertLess(laqn["coverage"], 1)
+        peak = segments[laqn["peak_segment_index"]]
+        self.assertEqual(peak["coordinates"][1], 51.53)
+        self.assertEqual(peak["readings"]["NO2"]["laqn"]["station_count"], 2)
+        self.assertEqual(peak["readings"]["NO2"]["breathe"]["status"], "insufficient")
+        self.assertIsNotNone(peak["readings"]["NO2"]["breathe"]["latest_at"])
+        for summary in (route["summary"]["NO2"]["breathe"], route["summary"]["PM25"]["laqn"]):
+            self.assertEqual(summary["coverage"], 0)
+            self.assertIsNone(summary["peak_segment_index"])
+
+    def test_adaptive_segments_keep_each_nonzero_leg_and_limit_long_routes(self):
+        def leg(a, b):
+            return {"geometry": {"type": "LineString", "coordinates": [a, b]}}
+
+        short = [-.149, 51.51]
+        far = [.30, 51.70]
+        legs = [leg(START, short), leg(short, far), leg(far, far)]
+        segments = route_air_segments(legs)
+        self.assertLessEqual(len(segments), 120)
+        self.assertGreater(len(segments), 100)
+        self.assertEqual({segment["leg_index"] for segment in segments}, {0, 1})
+        self.assertEqual(segments[0]["from_m"], 0)
+        self.assertAlmostEqual(segments[-1]["to_m"], distance(START, short) + distance(short, far))
+        self.assertEqual(route_air_segments([leg(far, far)]), [])
+        self.assertEqual(route_air_segments([*legs, {"geometry": {"type": "Point", "coordinates": far}}]), [])
 
     def test_idw_requires_two_fresh_same_source_observations(self):
         def air(lon, value, stale=False):

@@ -75,9 +75,12 @@ class ParserTests(unittest.TestCase):
         sites,idx=p.laqn_indices({"HourlyAirQualityIndex":{"LocalAuthority":{"Site":{
             "@SiteCode":"A","@BulletinDate":"2026-11-17 03:00:00",
             "Species":[{"@SpeciesCode":"NO2","@AirQualityIndex":"2"},
+                       {"@SpeciesCode":"PM25","@AirQualityIndex":"1"},
+                       {"@SpeciesCode":"PM10","@AirQualityIndex":"2"},
+                       {"@SpeciesCode":"O3","@AirQualityIndex":"3"},
                        {"@SpeciesCode":"O3","@AirQualityIndex":"0"}]}}}})
         self.assertEqual(len(sites),1)
-        self.assertEqual([x["metric"] for x in idx],["NO2_INDEX"])
+        self.assertEqual([x["metric"] for x in idx],["PM10_INDEX","O3_INDEX"])
 
     def test_breathe_public_map_deduplicates_installations_and_uses_each_timestamp(self):
         now = datetime(2026,11,17,15,tzinfo=timezone.utc)
@@ -88,9 +91,10 @@ class ParserTests(unittest.TestCase):
                          [("BL0027","Guy's Hospital",True)])
         self.assertEqual({r["metric"]:r["valid_at"] for r in rows}, {
             "NO2_CONCENTRATION":"2026-11-17T13:00:00+00:00",
-            "NO2INDEX":"2026-11-17T12:00:00+00:00",
-            "PM25INDEX":"2026-11-17T13:00:00+00:00",
         })
+        self.assertFalse(any("Index" in key for key in sites[0]["metadata"]))
+        without_indices = {key: value for key, value in active.items() if "Index" not in key}
+        self.assertEqual(p.breathe_web_map([without_indices], now), (sites, rows))
         with self.assertRaisesRegex(ValueError, "fields changed"):
             p.breathe_web_map([active, {"SiteCode":"BL0028"}], now)
 
@@ -101,9 +105,12 @@ class ParserTests(unittest.TestCase):
                         "cols":["PM25Index","ts","NO2Index","PM25","NO2"]},
                 "data":[[1,1794920400000,1,3.47,5.45],[None,1794924000000,None,None,None]]}
         rows = p.breathe_web_chart(data, "BL0027", start, end)
-        self.assertEqual(len(rows),4)
+        self.assertEqual([row["metric"] for row in rows], ["NO2_CONCENTRATION", "PM25_CONCENTRATION"])
         self.assertEqual((rows[0]["valid_at"],rows[0]["value_num"],rows[0]["quality"]),
                          ("2026-11-17T13:00:00+00:00",5.45,"U"))
+        without_indices = {"meta": {**data["meta"], "cols": ["ts", "PM25", "NO2"]},
+                           "data": [[1794920400000, 3.47, 5.45], [1794924000000, None, None]]}
+        self.assertEqual(p.breathe_web_chart(without_indices, "BL0027", start, end), rows)
         with self.assertRaisesRegex(ValueError, "site mismatch"):
             p.breathe_web_chart(data, "BL0086", start, end)
 
@@ -157,10 +164,10 @@ class StoreTests(unittest.TestCase):
             return 200, json.dumps({"meta": {"site":sid, "from":args["startTime"][0],
                                            "to":args["endTime"][0],
                                            "cols":["ts","NO2","NO2Index","PM25","PM25Index"]},
-                                    "data":[[1794920400000,6.0,None,3.47,None]]}).encode()
+                                    "data":[[1794920400000,6.0,1,3.47,2]]}).encode()
         with patch.object(collector,"MIN_REQUEST_GAP",0):
             f = collector.Fetcher(self.db, raw_root=Path(self.temp.name), transport=transport)
-            self.assertEqual(collector.breathe_web_hourly(self.db, f, now)[0],20)
+            self.assertEqual(collector.breathe_web_hourly(self.db, f, now)[0],10)
             self.assertEqual(collector.breathe_web_reconcile(self.db, f, now)[0],4)
             self.db.close()
             self.db = s.connect(Path(self.temp.name)/"test.sqlite3")
@@ -169,6 +176,8 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(collector.breathe_web_hourly(self.db, f, now)[0],0)
             self.assertEqual(collector.breathe_web_reconcile(self.db, f, now)[0],1)
         self.assertEqual(chart_sites,site_ids)
+        self.assertEqual({row[0] for row in self.db.execute("SELECT DISTINCT metric FROM measurements WHERE source='breathe'")},
+                         {"NO2_CONCENTRATION", "PM25_CONCENTRATION"})
         self.assertEqual([tuple(row) for row in self.db.execute("""SELECT metric,value_num,revision
           FROM measurements WHERE source_id='BL0027' AND time_basis=? ORDER BY metric""",
           (p.BREATHE_CHART_BASIS,))], [("NO2_CONCENTRATION",6.0,2),("PM25_CONCENTRATION",3.47,1)])

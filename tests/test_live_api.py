@@ -33,7 +33,10 @@ class LiveAPITests(unittest.TestCase):
                 ("NO2_CONCENTRATION","2026-11-18T00:15:00+00:00",900,6),
                 ("PM25_CONCENTRATION","2026-11-18T00:00:00+00:00",900,2),
                 ("NO2_CONCENTRATION","2026-11-18T00:00:00+00:00",3600,7),
-                ("NO2_INDEX","2026-11-18T00:00:00+00:00",3600,1),
+                ("NO2_INDEX","2026-11-17T23:00:00+00:00",3600,1),
+                ("PM25_INDEX","2026-11-18T01:00:00+00:00",3600,2),
+                ("PM10_INDEX","2026-11-18T00:00:00+00:00",3600,3),
+                ("O3_INDEX","2026-11-18T00:00:00+00:00",3600,4),
             ]:
                 store.measurement(db,"laqn","A",metric,stamp,stamp,period,"test",value_num=value,quality="P")
             store.measurement(db,"metoffice","abc","WIND_DIRECTION","2026-11-18T00:00:00Z",
@@ -55,13 +58,18 @@ class LiveAPITests(unittest.TestCase):
         hourly = self.api.measurements({"source":"laqn","period":"3600","kind":"concentration"})
         self.assertEqual(list(hourly["items"][0]["values"]),["NO2_CONCENTRATION"])
         index = self.api.measurements({"source":"laqn","period":"3600","kind":"index"})
-        self.assertEqual(list(index["items"][0]["values"]),["NO2_INDEX"])
+        self.assertEqual(set(index["items"][0]["values"]),{"PM10_INDEX","O3_INDEX"})
 
     def test_history_filters_bounds_pagination_and_parameterization(self):
         data = self.api.measurements({"mode":"history","source":"laqn","site":"A","period":"900",
                                      "start":"2026-11-18T00:00:00Z","end":"2026-11-18T00:15:00Z"})
         self.assertEqual(data["total"],2)
-        self.assertEqual(len(data["metrics"]),4)
+        visible_metrics = {"NO2_CONCENTRATION", "PM25_CONCENTRATION", "PM10_INDEX", "O3_INDEX"}
+        self.assertEqual({row["metric"] for row in data["metrics"]}, visible_metrics)
+        history = self.api.measurements({"mode":"history", "source":"laqn", "site":"A"})
+        self.assertEqual(history["total"], 6)
+        self.assertEqual({row["metric"] for row in history["items"]}, visible_metrics)
+        self.assertEqual(history["bounds"], ["2026-11-18T00:00:00+00:00", "2026-11-18T00:15:00+00:00"])
         self.assertEqual(self.api.locations({"source":"laqn","active":"0"})["total"],2)
         self.assertEqual(self.api.locations({"source":"laqn","search":"ALPHA"})["total"],1)
         self.assertEqual(self.api.locations({"source":"laqn","search":"' OR 1=1 --"})["total"],0)
@@ -70,6 +78,41 @@ class LiveAPITests(unittest.TestCase):
             self.api.locations({"page_size":"10000"})
         with self.assertRaises(ValueError):
             self.api.measurements({"mode":"history","start":"2026-11-18"})
+
+    def test_breathe_legacy_indices_hidden_from_observations_and_metadata(self):
+        metadata = {"Borough": "Southwark", "LatestPM25Index": 1, "LatestNO2Index": 2,
+                    "LatestPM25IndexUpdate": "2026-11-18T00:00:00Z", "LatestNO2IndexUpdate": "2026-11-18T00:00:00Z"}
+        stamp = "2026-11-18T00:00:00+00:00"
+        with closing(store.connect(self.path)) as db:
+            store.location(db, "breathe", "BL0027", metadata=metadata)
+            for metric in ("PM25INDEX", "NO2INDEX", "PM25_CONCENTRATION", "NO2_CONCENTRATION"):
+                store.measurement(db, "breathe", "BL0027", metric, stamp, stamp, 3600, "test", value_num=3)
+            db.commit()
+        params = {"source": "breathe", "site": "BL0027"}
+        latest = self.api.measurements(params)["items"][0]
+        self.assertEqual(latest["metadata"], {"Borough": "Southwark"})
+        concentrations = {"PM25_CONCENTRATION", "NO2_CONCENTRATION"}
+        self.assertEqual(set(latest["values"]), concentrations)
+        history = self.api.measurements({**params, "mode": "history"})
+        self.assertEqual(history["total"], 2)
+        self.assertEqual({row["metric"] for row in history["items"]}, concentrations)
+        self.assertEqual({row["metric"] for row in history["metrics"]}, concentrations)
+        self.assertEqual(self.api.measurements({**params, "mode": "history", "metric": "NO2INDEX"})["total"], 0)
+        with closing(self.api.connect()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM measurements WHERE source='breathe'").fetchone()[0], 4)
+
+    def test_latest_respects_window_without_removing_station(self):
+        params = {"source":"laqn","start":"2026-11-16T00:15:00Z","end":"2026-11-18T00:15:00Z"}
+        data = self.api.measurements(params)
+        values = data["items"][0]["values"]
+        self.assertEqual(values["NO2_CONCENTRATION"]["value_num"],5)
+        self.assertEqual(values["PM25_CONCENTRATION"]["value_num"],2)
+        data = self.api.measurements({**params,"start":"2026-11-18T00:15:00Z","end":"2026-11-18T00:30:00Z"})
+        self.assertEqual(data["items"][0]["values"]["NO2_CONCENTRATION"]["value_num"],6)
+        self.assertNotIn("PM25_CONCENTRATION",data["items"][0]["values"])
+        data = self.api.measurements({**params,"start":"2026-11-19T00:00:00Z","end":"2026-11-21T00:00:00Z"})
+        self.assertEqual(data["total"],1)
+        self.assertEqual(data["items"][0]["values"],{})
 
     def test_weather_missing_units_and_roads_versions(self):
         data = self.api.measurements({"source":"metoffice","region":"London"})

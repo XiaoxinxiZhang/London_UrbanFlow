@@ -1,4 +1,5 @@
-"""Current Santander Cycles journeys and location-specific context."""
+"""Current journeys and air quality context along their routed paths."""
+from bisect import bisect_left
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -13,13 +14,18 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request
 import xml.etree.ElementTree as ET
 
-from city_analysis import distance, dt, geometry_distance, valid_coordinate
+from city_analysis import (AIR_ESTIMATE_NEAREST_M, AIR_ESTIMATE_RADIUS_M, distance, dt,
+                           geometry_distance, local_air_unit, valid_air_value, valid_coordinate,
+                           weighted_air_value)
 from secure_curl import curl_https, open_https, urllib_https
 
 UTC = timezone.utc
 ORS_BASE = "https://api.heigit.org/openrouteservice/v2"
 DAQI_FEED = "https://uk-air.defra.gov.uk/assets/rss/current_region_levels.xml"
 METRICS = ("PM25", "PM10", "NO2", "O3")
+AIR_SOURCES = ("laqn", "breathe")
+ROUTE_AIR_SPACING_M = 250
+MAX_ROUTE_AIR_SEGMENTS = 120
 LOGGER = logging.getLogger(__name__)
 
 
@@ -163,17 +169,105 @@ def estimate(features, point):
         if p["value"] is None or p["stale"] or not isinstance(p["value"], (int, float)):
             continue
         meters = distance(point, feature["geometry"]["coordinates"])
-        if meters <= 2000:
+        if meters <= AIR_ESTIMATE_RADIUS_M:
             nearby.append((meters, p))
     nearby.sort(key=lambda row: row[0])
-    if len(nearby) < 2 or nearby[0][0] > 1000:
+    latest = max((p["observed_at"] for _, p in nearby if p["observed_at"]), default=None)
+    if len(nearby) < 2 or nearby[0][0] > AIR_ESTIMATE_NEAREST_M:
         return {"status": "insufficient", "station_count": len(nearby),
-                "nearest_m": round(nearby[0][0]) if nearby else None}
-    weights = [(1/max(meters, 50)**2, p) for meters, p in nearby]
-    value = sum(weight*p["value"] for weight, p in weights)/sum(weight for weight, _ in weights)
-    return {"status": "estimated", "value": round(value, 1), "unit": nearby[0][1]["unit"],
+                "nearest_m": round(nearby[0][0]) if nearby else None, "latest_at": latest}
+    value = weighted_air_value((meters, p["value"]) for meters, p in nearby)
+    return {"status": "estimated", "value": value, "unit": nearby[0][1]["unit"],
             "station_count": len(nearby), "nearest_m": round(nearby[0][0]),
-            "latest_at": max(p["observed_at"] for _, p in nearby)}
+            "latest_at": latest}
+
+
+def estimate_air(air, point):
+    return {metric: {source: estimate(features, point) for source, features in sources.items()}
+            for metric, sources in air.items()}
+
+
+def route_air_segments(legs):
+    paths = []
+    for leg_index, leg in enumerate(legs):
+        geometry = leg.get("geometry")
+        if not isinstance(geometry, dict) or geometry.get("type") != "LineString":
+            return []
+        vertices = geometry.get("coordinates")
+        if (not isinstance(vertices, (list, tuple)) or len(vertices) < 2
+                or any(not isinstance(point, (list, tuple)) or len(point) < 2
+                       or not valid_coordinate(*point[:2]) for point in vertices)):
+            return []
+        points = [vertices[0][:2]]
+        distances = [0.0]
+        for vertex in vertices[1:]:
+            point = vertex[:2]
+            length = distance(points[-1], point)
+            if length > 0:
+                points.append(point)
+                distances.append(distances[-1] + length)
+        if distances[-1] > 0:
+            paths.append((leg_index, points, distances))
+    if not paths:
+        return []
+
+    # Reserve room for rounding up the block count within each leg.
+    total = sum(distances[-1] for _, _, distances in paths)
+    spacing = max(ROUTE_AIR_SPACING_M, total / (MAX_ROUTE_AIR_SEGMENTS - len(paths)))
+    segments = []
+    offset = 0.0
+    for leg_index, points, distances in paths:
+        length = distances[-1]
+        count = math.ceil(length / spacing)
+        width = length / count
+        for index in range(count):
+            midpoint = (index + 0.5) * width
+            edge = bisect_left(distances, midpoint)
+            ratio = (midpoint - distances[edge-1]) / (distances[edge] - distances[edge-1])
+            point = [start + ratio * (end - start) for start, end in zip(points[edge-1], points[edge])]
+            end_m = length if index == count - 1 else (index + 1) * width
+            segments.append({"leg_index": leg_index, "from_m": offset + index * width,
+                             "to_m": offset + end_m, "coordinates": point})
+        offset += length
+    return segments
+
+
+def route_air_features(features):
+    eligible = []
+    for feature in features:
+        p = feature["properties"]
+        if (not p["stale"] and p["observed_at"] and local_air_unit(p["unit"]) == "ug/m3"
+                and valid_air_value(p["value"], p["unit"], p.get("quality"))):
+            eligible.append({**feature, "properties": {**p, "unit": "ug/m3"}})
+    return eligible
+
+
+def route_air_context(legs, air):
+    segments = route_air_segments(legs)
+    if not segments:
+        return {"status": "unavailable", "total_distance_m": 0, "segments": [], "summary": {}}
+    air = {metric: {source: route_air_features(features) for source, features in sources.items()}
+           for metric, sources in air.items()}
+    total = segments[-1]["to_m"]
+    for segment in segments:
+        segment["readings"] = estimate_air(air, segment["coordinates"])
+    summary = {}
+    for metric, sources in air.items():
+        summary[metric] = {}
+        for source in sources:
+            values = [(index, segment["readings"][metric][source]["value"], segment["to_m"] - segment["from_m"])
+                      for index, segment in enumerate(segments)
+                      if segment["readings"][metric][source]["status"] == "estimated"]
+            peak = max(values, key=lambda row: row[1], default=None)
+            coverage = 1.0 if len(values) == len(segments) else math.fsum(length for _, _, length in values) / total
+            summary[metric][source] = {
+                "min": min((value for _, value, _ in values), default=None),
+                "max": peak[1] if peak else None,
+                "peak_segment_index": peak[0] if peak else None,
+                "unit": "ug/m3",
+                "coverage": coverage,
+            }
+    return {"status": "available", "total_distance_m": total, "segments": segments, "summary": summary}
 
 
 def road_alerts(roads, legs, now):
@@ -207,15 +301,15 @@ class JourneyPlanner:
         self.router = router or OpenRouteService()
         self.daqi = daqi or DAQI()
 
-    def _context(self, db, start, end, now):
-        result = {"start": {}, "end": {}, "daqi": self.daqi.current()}
+    def _air_snapshot(self, db, now):
+        air = {}
         for metric in METRICS:
-            for source in ("laqn", "breathe"):
+            air[metric] = {}
+            for source in AIR_SOURCES:
                 features, _ = self.analysis.air_features(db, {"metric": metric, "source": source,
                                                                "period": "3600"}, now-timedelta(hours=4), now, None)
-                result["start"].setdefault(metric, {})[source] = estimate(features, start)
-                result["end"].setdefault(metric, {})[source] = estimate(features, end)
-        return result
+                air[metric][source] = features
+        return air
 
     def plan(self, payload):
         if not isinstance(payload, dict):
@@ -235,7 +329,8 @@ class JourneyPlanner:
             db.execute("BEGIN")
             bikes, bike_info = self.analysis.traffic(db, "bikes")
             roads, road_info = self.analysis.traffic(db, "roads")
-            context = self._context(db, start, end, now)
+            air = self._air_snapshot(db, now)
+        context = {"start": estimate_air(air, start), "end": estimate_air(air, end), "daqi": self.daqi.current()}
         result = {"mode": mode, "start": start, "end": end, "bike_info": bike_info,
                   "road_info": road_info, "context": context, "alternatives": [], "legs": [],
                   "alerts": [], "routing_error": None, "message": None}
@@ -301,4 +396,5 @@ class JourneyPlanner:
         except RoutingUnavailable as exc:
             result["routing_error"] = str(exc)
             result["legs"] = []
+        context["route_air"] = route_air_context(result["legs"], air)
         return result

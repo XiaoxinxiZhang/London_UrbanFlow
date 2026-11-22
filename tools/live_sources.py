@@ -8,10 +8,9 @@ from datetime import datetime, timezone
 
 POLLUTANTS = {"PM25", "PM10", "NO2", "O3"}
 LAQN_CSV_SPECIES = {"PM2.5": "PM25", "PM10": "PM10", "NO2": "NO2", "O3": "O3"}
-BREATHE_MAP_FIELDS = {
-    "NO2": "LatestNO2Value", "NO2Index": "LatestNO2Index",
-    "PM25": "LatestPM25Value", "PM25Index": "LatestPM25Index",
-}
+EXCLUDED_INDEX_METRICS = ("PM25_INDEX", "NO2_INDEX", "PM25INDEX", "NO2INDEX")
+BREATHE_MAP_FIELDS = {"NO2": "LatestNO2Value", "PM25": "LatestPM25Value"}
+BREATHE_INDEX_FIELDS = {"LatestNO2Index", "LatestNO2IndexUpdate", "LatestPM25Index", "LatestPM25IndexUpdate"}
 BREATHE_MAP_BASIS = "breathe_website_map"
 BREATHE_CHART_BASIS = "breathe_website_chart"
 WEATHER_FIELDS = {"weather_code", "wind_direction", "wind_gust", "visibility", "humidity",
@@ -142,10 +141,13 @@ def laqn_indices(payload):
                 continue
             for p in many(s.get("Species",s.get("species"))):
                 species = p.get("@SpeciesCode")
-                n = number(p.get("@AirQualityIndex"))
-                if not species or n is None or not 1 <= n <= 10:
+                metric = f"{species}_INDEX"
+                if not species or metric in EXCLUDED_INDEX_METRICS:
                     continue
-                out.append(dict(sid=sid,metric=species+"_INDEX",source_time=t,
+                n = number(p.get("@AirQualityIndex"))
+                if n is None or not 1 <= n <= 10:
+                    continue
+                out.append(dict(sid=sid,metric=metric,source_time=t,
                                 valid_at=utc(t),period=3600,basis="bulletin_gmt",
                                 value_num=n,unit=None,quality="U",
                                 index_source=p.get("@IndexSource")))
@@ -162,18 +164,18 @@ def breathe_datetime(value):
 
 
 def breathe_observation(sid, species, value, source_time, stamp, basis):
-    is_index = species.endswith("Index")
-    return dict(sid=sid, metric=species.upper()+("" if is_index else "_CONCENTRATION"),
+    return dict(sid=sid, metric=species+"_CONCENTRATION",
                 source_time=source_time, valid_at=stamp.isoformat(timespec="seconds"),
                 period=3600, basis=basis, value_num=value,
-                unit=None if is_index else "ug/m3", quality="U")
+                unit="ug/m3", quality="U")
 
 
-def breathe_value(species, value):
-    n = number(value) if not isinstance(value, bool) else None
-    if n is not None and (not species.endswith("Index") or (n.is_integer() and 1 <= n <= 10)):
-        return n
-    return None
+def breathe_value(value):
+    return number(value) if not isinstance(value, bool) else None
+
+
+def breathe_site_metadata(row):
+    return {key: value for key, value in row.items() if key not in BREATHE_INDEX_FIELDS}
 
 
 def breathe_web_map(payload, now):
@@ -203,11 +205,11 @@ def breathe_web_map(payload, now):
         if (lat is not None and not -90 <= lat <= 90) or (lon is not None and not -180 <= lon <= 180):
             raise ValueError(f"invalid coordinates for {sid}")
         sites.append(dict(sid=sid, name=row["SiteName"], kind=row.get("SiteClassification"),
-                          lat=lat, lon=lon, active=active, metadata=row))
+                          lat=lat, lon=lon, active=active, metadata=breathe_site_metadata(row)))
         if not active:
             continue
         for species, field in BREATHE_MAP_FIELDS.items():
-            value = breathe_value(species, row[field])
+            value = breathe_value(row[field])
             source_time = row[field+"Update"]
             if value is None or not source_time:
                 continue
@@ -243,7 +245,7 @@ def breathe_web_chart(payload, sid, start, end):
         seen.add(timestamp)
         stamp = datetime.fromtimestamp(timestamp/1000, tz=timezone.utc)
         for species in BREATHE_MAP_FIELDS:
-            value = breathe_value(species, row[species])
+            value = breathe_value(row[species])
             if value is not None:
                 observations.append(breathe_observation(sid, species, value, timestamp,
                                                          stamp, BREATHE_CHART_BASIS))
