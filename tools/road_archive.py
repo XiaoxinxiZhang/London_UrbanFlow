@@ -3,10 +3,12 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import hashlib
+import http.client
 import json
 import math
 import re
 import sys
+import time
 from urllib.parse import urlencode
 
 import live_store as store
@@ -17,14 +19,31 @@ REPOSITORY = "farhanmunim/london-buses"
 SNAPSHOT_PATH = "data/api/roadworks.json"
 SOURCE = "public_road_archive"
 HISTORY_DAYS = 7
+READ_ATTEMPTS = 3
 
 
 def read_url(url):
-    status, payload = open_https(url, {"User-Agent": "LondonUrbanFlow/1.0"}, timeout=12,
-                                 prefer_curl=sys.platform == "win32")
-    if status != 200:
-        raise OSError(f"road archive HTTP {status}")
-    return payload
+    """Read a public GitHub file, retrying truncated or timed-out responses.
+
+    On Windows the HTTPS path may fall back from curl to urllib; a proxy that
+    closes early then surfaces as ``http.client.IncompleteRead``. That failure
+    is transient, so each revision gets a few fresh attempts before the caller
+    records it as an error.
+    """
+    headers = {"User-Agent": "LondonUrbanFlow/1.0"}
+    last = None
+    for attempt in range(READ_ATTEMPTS):
+        try:
+            status, payload = open_https(url, headers, timeout=20,
+                                         prefer_curl=sys.platform == "win32")
+            if status != 200:
+                raise OSError(f"road archive HTTP {status}")
+            return payload
+        except (OSError, TimeoutError, http.client.HTTPException) as error:
+            last = error
+            if attempt < READ_ATTEMPTS - 1:
+                time.sleep(0.5 * (attempt + 1))
+    raise OSError(f"road archive read failed: {type(last).__name__}") from last
 
 
 def parse_snapshot(payload):
@@ -98,7 +117,7 @@ def backfill(db, now, read=read_url):
                                               (stamp.isoformat(timespec="seconds"), revision, len(events),
                                                json.dumps(events, ensure_ascii=False)))
                         added += inserted.rowcount
-            except (OSError, ValueError, TypeError, KeyError) as error:
+            except (OSError, ValueError, TypeError, KeyError, http.client.HTTPException) as error:
                 errors.append(f"{revision[:12]}: {error}")
     if errors:
         raise RuntimeError(f"road archive added {added} snapshots; {len(errors)} failures; first: {errors[0]}")

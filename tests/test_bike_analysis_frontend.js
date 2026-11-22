@@ -73,12 +73,26 @@ async function testReplay() {
     },
     addEventListener(name, callback) { events.set(name, callback); },
   };
-  vm.runInNewContext(fs.readFileSync(require.resolve("../assets/bike-analysis.js"), "utf8"), {
+  const source = fs.readFileSync(require.resolve("../assets/bike-analysis.js"), "utf8")
+    .replace("window.AirWatchBikeAnalysis = {", "window.bikeTest = {tier, S};\n  window.AirWatchBikeAnalysis = {");
+  vm.runInNewContext(source, {
     window, document: {getElementById: node}, requestAnimationFrame: run => run(),
     setTimeout(run, delay) { timers.set(++lastId, {run, time: now + delay}); return lastId; },
     clearTimeout(id) { timers.delete(id); },
   });
   const controller = window.AirWatchBikeAnalysis;
+  const {tier, S} = window.bikeTest;
+  assert.deepEqual([0, 1, 2, 3, 5, 6, 9, 10, 15, 16, 20, 21, 30].map(value => tier(value).label),
+    ["0", "1–2", "1–2", "3–5", "3–5", "6–9", "6–9", "10–15", "10–15", "16–20", "16–20", "21+", "21+"]);
+  assert.equal(tier(null).label, "未知");
+  assert.ok(tier(3).radius < tier(6).radius && tier(6).radius < tier(10).radius &&
+    tier(10).radius < tier(16).radius && tier(16).radius < tier(21).radius);
+  assert.notEqual(tier(3).color, tier(6).color);
+  const legend = node("bikeLegendClasses").innerHTML;
+  for (const label of ["0", "1–2", "3–5", "6–9", "10–15", "16–20", "21+", "未知"])
+    assert.ok(legend.includes(label), label + " legend entry is rendered");
+  assert.match(legend, /#7dd4e2/);
+  assert.match(legend, /#1a5e77/);
   function seek(capturedAt) {
     node("bikeTimeSlider").input({target: {value: Date.parse(capturedAt) / 1000}});
   }
@@ -113,7 +127,10 @@ async function testReplay() {
   seek(new Date(Date.parse(at(50)) + 1000).toISOString());
   assert.match(node("bikeCapture").textContent, /缺测/);
   assert.equal(node("bikeArchiveCredit").hidden, true);
+  assert.equal(S.gap, true, "a gap dims the adjacent previous batch");
+  assert.equal(S.frame.capturedAt, fourth);
   seek(fourth);
+  assert.equal(S.gap, false, "returning to the previous batch clears the stale state");
   node("bikeStation").change({target: {value: "A"}});
   await flush();
   assert.match(node("bikeNearbyStatus").textContent, /1 \/ 1/);
@@ -135,6 +152,9 @@ async function testReplay() {
   await advance(85);
   seek(second);
   await advance(85);
+  assert.equal(S.frame.capturedAt, fourth, "loading keeps the previously painted frame");
+  assert.equal(node("bikeCurrentBikes").textContent, 4, "the side panel keeps the previous values while loading");
+  assert.match(node("bikeCapture").textContent, /正在读取/);
   await resolveFrame(second, 8);
   await resolveFrame(first, 3);
   assert.equal(node("bikeCurrentBikes").textContent, 8, "a slow earlier frame cannot replace the latest selection");
@@ -151,7 +171,10 @@ async function testReplay() {
   assert.match(node("bikeCapture").textContent, /缺测/);
   assert.equal(node("bikeCurrentBikes").textContent, "—");
   assert.equal(node("bikeNeighborTable").hidden, true);
+  assert.equal(S.gap, true);
+  assert.equal(S.frame.capturedAt, third);
   seek(third);
+  assert.equal(S.gap, false);
   node("bikePlay").click();
   await advance(700);
   assert.match(node("bikeCapture").textContent, /缺测/);
@@ -181,5 +204,5 @@ async function testReplay() {
   assert.equal(node("bikeCurrentBikes").textContent, 7);
 }
 
-testReplay().then(() => console.log("PASS bicycle analysis views, replay, gaps, metric switch, timezone and refresh without a map"))
+testReplay().then(() => console.log("PASS bicycle analysis tiers, legend, smooth replay, gaps, metric switch, timezone and refresh without a map"))
   .catch(error => { console.error(error); process.exitCode = 1; });

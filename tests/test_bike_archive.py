@@ -141,3 +141,64 @@ class BikeArchiveTests(unittest.TestCase):
         self.assertEqual(restored["bikes"]["features"][0]["properties"]["snapshot_source"], "public_archive")
         self.assertTrue(map_at(cutoff + timedelta(seconds=1))["bike_info"]["gap"])
         self.assertEqual(self.api.map(end)["bike_info"]["captured_at"], local.isoformat())
+
+    def test_zero_inventory_batches_are_rejected(self):
+        good = self.now - timedelta(hours=3)
+        bad = self.now - timedelta(hours=2)
+        mixed = self.now - timedelta(hours=1)
+        rows = ["query_time,place_id,bikes,empty_docks,docks"]
+        for stamp, counts in ((good, ((5, 10), (1, 15))),
+                              (bad, ((0, 0), (0, 0))),
+                              (mixed, ((0, 0), (3, 4)))):
+            clock = stamp.replace(tzinfo=None).isoformat()
+            for site, (bikes, empty) in zip(("BikePoints_1", "BikePoints_2"), counts):
+                rows.append(f"{clock},{site},{bikes},{empty},20")
+        payload = ("\n".join(rows) + "\n").encode()
+        rejected = []
+        batches, future = bike_archive.parse_snapshots(
+            payload, good.date(), bike_archive.station_versions(STATIONS),
+            self.now - timedelta(days=7), self.now, rejected)
+        self.assertFalse(future)
+        self.assertEqual(sorted(batches), [good.isoformat(), mixed.isoformat()])
+        self.assertEqual(rejected, [bad.isoformat()])
+
+        bike_archive.save_file(self.db, "archive.csv", "1", payload, batches)
+        stamps = [row[0] for row in self.db.execute(
+            "SELECT captured_at_utc FROM bike_archive_batches ORDER BY captured_at_utc")]
+        self.assertEqual(stamps, [good.isoformat(), mixed.isoformat()])
+        with self.assertRaises(LookupError):
+            self.api.bike_frame({"captured_at": bad.isoformat()})
+        mixed_frame = self.api.bike_frame({"captured_at": mixed.isoformat()})
+        self.assertEqual({row["id"]: row["bikes"] for row in mixed_frame["stations"]},
+                         {"BikePoints_1": 0, "BikePoints_2": 3})
+
+    def test_purge_invalid_removes_legacy_batches(self):
+        good = self.now - timedelta(hours=3)
+        bad = self.now - timedelta(hours=2)
+        bad_stamp = bad.isoformat()
+        self.db.execute("INSERT INTO bike_archive_files VALUES(?,?,?,?)",
+                        ("legacy.csv", "1", "sha", store.utcnow()))
+        self.db.execute("INSERT INTO bike_archive_batches VALUES(?,?,?,?)",
+                        (bad_stamp, "legacy.csv", "1", 2))
+        self.db.executemany("INSERT INTO bike_archive_snapshots VALUES(?,?,?,?,?,?,?,?)",
+                            ((bad_stamp, "BikePoints_1", "Old dock", -0.1, 51.5, 0, 0, 20),
+                             (bad_stamp, "BikePoints_2", "Nearby dock", -0.1, 51.501, 0, 0, 20)))
+        self.db.commit()
+        payload = inventory(good)
+        batches, _ = bike_archive.parse_snapshots(
+            payload, good.date(), bike_archive.station_versions(STATIONS),
+            self.now - timedelta(days=7), self.now)
+        bike_archive.save_file(self.db, "ok.csv", "1", payload, batches)
+
+        self.assertEqual(bike_archive.purge_invalid(self.db), [bad_stamp])
+        self.assertEqual(self.db.execute(
+            "SELECT COUNT(*) FROM bike_archive_snapshots WHERE captured_at_utc=?",
+            (bad_stamp,)).fetchone()[0], 0)
+        self.assertEqual(self.db.execute(
+            "SELECT COUNT(*) FROM bike_archive_batches WHERE captured_at_utc=?",
+            (bad_stamp,)).fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM bike_archive_files").fetchone()[0], 2)
+        timeline = self.api.bike_timeline({"end": self.now.isoformat()})
+        self.assertEqual(timeline["batches"], [good.isoformat()])
+        with self.assertRaises(LookupError):
+            self.api.bike_frame({"captured_at": bad_stamp})

@@ -22,6 +22,14 @@ ARCHIVE_SOURCE = "public_archive"
 ARCHIVE_FRESH_SECONDS = 20 * 60
 OBSERVATION_COLUMNS = ("query_time", "place_id", "bikes", "empty_docks", "docks")
 STATION_COLUMNS = ("place_id", "common_name", "lat", "lon", "valid_from", "valid_to")
+# A batch with no bike and no free dock anywhere is an upstream feed failure,
+# not an inventory state: TfL cannot have 0 bikes and 0 free docks for every
+# station while the static dock count is still populated.
+INVALID_INVENTORY_SQL = """
+    SELECT captured_at_utc FROM bike_archive_snapshots
+    GROUP BY captured_at_utc
+    HAVING SUM(COALESCE(bikes,0))=0 AND SUM(COALESCE(empty_docks,0))=0
+"""
 
 
 def read_url(url):
@@ -68,7 +76,19 @@ def archive_count(value):
     return int(value)
 
 
-def parse_snapshots(payload, day, versions, start, end):
+def inventory_missing(stations):
+    """Return True when no station in the batch reports a bike or a free dock.
+
+    The archive reproduced a TfL BikePoint outage where every station reported
+    ``bikes=0`` and ``empty_docks=0`` while ``docks`` stayed correct. A real
+    station network cannot have zero bikes and zero free docks everywhere, so
+    the whole batch is treated as missing instead of "0 available".
+    """
+    return bool(stations) and not any(
+        (row[3] or 0) > 0 or (row[4] or 0) > 0 for row in stations.values())
+
+
+def parse_snapshots(payload, day, versions, start, end, rejected=None):
     batches = defaultdict(dict)
     seen = False
     future = False
@@ -93,6 +113,11 @@ def parse_snapshots(payload, day, versions, start, end):
         stations[site] = record
     if not seen:
         raise ValueError("empty archive snapshot file")
+    missing = sorted(stamp for stamp, stations in batches.items() if inventory_missing(stations))
+    for stamp in missing:
+        del batches[stamp]
+    if rejected is not None:
+        rejected.extend(missing)
     return batches, future
 
 
@@ -142,9 +167,30 @@ def save_file(db, path, version, payload, batches):
     return added
 
 
+def purge_invalid(db):
+    """Delete archive batches that report no bike and no free dock anywhere.
+
+    File rows stay in place: they record the source version and SHA, prevent
+    the same bad file from being downloaded again, and let a corrected file
+    version import its valid batches. Returns the removed capture stamps.
+    """
+    stamps = sorted(row[0] for row in db.execute(INVALID_INVENTORY_SQL))
+    if stamps:
+        with db:
+            db.executemany("DELETE FROM bike_archive_snapshots WHERE captured_at_utc=?",
+                           ((stamp,) for stamp in stamps))
+            db.executemany("DELETE FROM bike_archive_batches WHERE captured_at_utc=?",
+                           ((stamp,) for stamp in stamps))
+    return stamps
+
+
 def backfill(db, now, read=read_url):
     now = now.astimezone(timezone.utc).replace(microsecond=0)
     start = now - timedelta(days=BIKE_HISTORY_DAYS)
+    removed = purge_invalid(db)
+    if removed:
+        print(f"purged {len(removed)} zero-inventory archive batches "
+              f"({removed[0]} .. {removed[-1]})", file=sys.stderr)
     days = days_with_gaps(db, start, now)
     if not days:
         return 0, None
@@ -164,6 +210,7 @@ def backfill(db, now, read=read_url):
             if day != now.date() or getattr(error, "code", None) != 404:
                 errors.append(f"{day}: {error}")
     added = 0
+    rejected = []
     if pending:
         versions = station_versions(read(download+"stations.csv"))
         for day, path, version, size in pending:
@@ -171,11 +218,14 @@ def backfill(db, now, read=read_url):
                 payload = read(download+path)
                 if len(payload) != size:
                     raise ValueError("incomplete archive file download")
-                batches, future = parse_snapshots(payload, day, versions, start, now)
+                batches, future = parse_snapshots(payload, day, versions, start, now, rejected)
                 if not future:
                     added += save_file(db, path, version, payload, batches)
             except (OSError, ValueError, csv.Error, KeyError) as error:
                 errors.append(f"{path}: {error}")
+    if rejected:
+        print(f"skipped {len(rejected)} zero-inventory archive batches "
+              f"({min(rejected)} .. {max(rejected)})", file=sys.stderr)
     if errors:
         raise RuntimeError(f"archive added {added} batches; {len(errors)} failures; first: {errors[0]}")
     latest = db.execute("SELECT MAX(captured_at_utc) FROM bike_archive_batches").fetchone()[0]

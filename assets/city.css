@@ -1788,15 +1788,19 @@ dialog {
 .bike-low { color:#efba62; }
 .bike-available { color:#70cfdc; }
 .bike-unknown, .bike-cluster-key { color:var(--muted); }
-.bike-analysis-legend span:not(.bike-cluster-key)::before {
+.bike-legend-classes { display:flex; flex-wrap:wrap; align-items:center; gap:6px 11px; }
+.bike-legend-entry { display:inline-flex; align-items:center; gap:4px; white-space:nowrap; }
+.bike-legend-entry::before {
   content:"";
-  width:8px;
-  height:8px;
-  margin-right:5px;
-  display:inline-block;
+  width:var(--bike-dot-size, 8px);
+  height:var(--bike-dot-size, 8px);
+  flex:none;
   border-radius:50%;
-  background:currentColor;
+  border:1px solid #f1f8fe;
+  box-sizing:border-box;
+  background:var(--bike-dot, #8194a4);
 }
+.bike-legend-hint { color:var(--muted); }
 .bike-cluster-key { margin-left:auto; }
 #bikeMap { height:var(--bike-map-height); background:#dce6ea; }
 .bike-analysis-cluster {
@@ -1811,6 +1815,7 @@ dialog {
   box-shadow:0 1px 4px #162b4470;
 }
 .bike-analysis-cluster.has-tight { background:#6a491f; color:#fff3d9; }
+.bike-analysis-cluster.is-stale { opacity:.32; }
 .bike-replay { padding:10px 13px; }
 .bike-replay-header, .bike-replay-range {
   display:flex;

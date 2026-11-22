@@ -7,11 +7,22 @@
     borrow: {field: "bikes", label: "可用车辆", action: "借车"},
     return: {field: "empty_docks", label: "空位", action: "还车"},
   };
-  const colors = {zero: "#e77d8d", low: "#efba62", available: "#42a9ba", unknown: "#8194a4"};
+  // Fixed inventory bins shared by both metrics. The first two bands mirror the
+  // API's tight_max (BIKE_TIGHT_MAX = 2); keep them in sync if the backend changes.
+  const tiers = [
+    {label: "0", max: 0, color: "#e77d8d", radius: 6},
+    {label: "1–2", max: 2, color: "#efba62", radius: 6},
+    {label: "3–5", max: 5, color: "#7dd4e2", radius: 6.5},
+    {label: "6–9", max: 9, color: "#55bfd2", radius: 7.25},
+    {label: "10–15", max: 15, color: "#37a2ba", radius: 8},
+    {label: "16–20", max: 20, color: "#277e99", radius: 8.75},
+    {label: "21+", max: Infinity, color: "#1a5e77", radius: 9.5},
+  ];
+  const unknownTier = {label: "未知", color: "#8194a4", radius: 6};
   const emptyGeoJSON = {type: "FeatureCollection", features: []};
   const S = {
     visible: false, view: "map", mode: "borrow", site: "", timeline: null, batches: [],
-    cursor: null, target: null, frame: null, frameStatus: "", stationStatus: "",
+    cursor: null, target: null, frame: null, frameStatus: "", stationStatus: "", gap: false,
     frames: new Map(), points: null, charts: [], markers: [],
   };
   const viewObserver = typeof window.ResizeObserver === "function" ? new window.ResizeObserver(resize) : null;
@@ -21,12 +32,15 @@
   const at = ms => ms === null ? "—" : time(stamp(ms));
   const sourceLabel = source => source === "public_archive" ? "公开归档" : "TfL 本地采集";
   const expiresAt = batch => batch.ms + batch.freshnessSeconds * 1000;
-  const currentPoint = () => S.points?.get(S.target);
+  const currentPoint = () => S.points?.get(S.frame?.capturedAt);
   const currentStation = () => S.frame?.stations.get(S.site);
   const mode = () => metrics[S.mode];
   const windowParams = () => ({start: S.timeline.start, end: S.timeline.end});
+  const settled = () => !S.target || S.frame?.capturedAt === S.target;
   const status = value => value === null ? "unknown"
     : value === 0 ? "zero" : value <= S.timeline.tight_max ? "low" : "available";
+  const tier = value => value === null || value === undefined ? unknownTier
+    : tiers.find(entry => value <= entry.max) ?? unknownTier;
 
   function frameAt(ms) {
     let lo = 0, hi = S.batches.length;
@@ -55,6 +69,13 @@
       `<span style="left:${100 * (left - S.start) / (S.end - S.start)}%;width:${100 * (right - left) / (S.end - S.start)}%"></span>`).join("");
   }
 
+  function renderLegend() {
+    const node = $("bikeLegendClasses");
+    if (!node) return;
+    node.innerHTML = [...tiers, unknownTier].map(({label, color, radius}) =>
+      `<span class="bike-legend-entry" style="--bike-dot:${color};--bike-dot-size:${Math.round(radius * 1.3)}px">${esc(label)}</span>`).join("");
+  }
+
   function renderTime() {
     const slider = $("bikeTimeSlider");
     const active = S.cursor !== null;
@@ -69,9 +90,12 @@
     const capture = $("bikeCapture");
     capture.title = S.frame?.capturedAt || "";
     capture.textContent = S.timelineStatus || (!S.batches.length ? "最近 7 天没有自行车快照。"
-      : !S.target ? "缺测 · 该时刻没有可用快照。"
-      : S.frameStatus || sourceLabel(S.frame.source) + " · " + time(S.frame.capturedAt) + " · " + S.frame.stations.size + " 个站点");
-    $("bikeArchiveCredit").hidden = S.frame?.source !== "public_archive";
+      : !S.target ? (S.gap ? "缺测 · 该时刻没有可用快照，地图变淡显示上一批点位。"
+        : "缺测 · 该时刻没有可用快照。")
+      : S.frameStatus || (S.frame ? sourceLabel(S.frame.source) + " · " + time(S.frame.capturedAt) + " · " + S.frame.stations.size + " 个站点"
+        : "正在读取该批快照…"));
+    $("bikeArchiveCredit").hidden = !S.target || !S.frame
+      || S.frame.capturedAt !== S.target || S.frame.source !== "public_archive";
     capture.classList.toggle("bike-gap-message", active && !S.target);
     const trendStatus = $("bikeTrendStatus");
     trendStatus.textContent = S.timelineStatus;
@@ -79,7 +103,7 @@
   }
 
   function renderNearby() {
-    const selected = currentStation(), point = currentPoint();
+    const selected = S.gap ? null : currentStation(), point = S.gap ? null : currentPoint();
     $("bikeCurrent").hidden = !S.site;
     $("bikeCurrentName").textContent = selected?.name || S.catalog?.get(S.site) || "";
     $("bikeCurrentBikes").textContent = display(selected?.bikes);
@@ -89,7 +113,9 @@
     $("bikeNeighborTable").hidden = !neighbors.length;
     const ratio = point?.[S.mode];
     $("bikeNearbyStatus").textContent = !S.site ? "选择站点后显示邻站。"
-      : !S.frame ? S.frameStatus || "该时刻无可用快照。"
+      : S.frameStatus ? S.frameStatus
+      : S.gap ? "该时刻缺测，地图变淡显示上一批站点。"
+      : !S.frame ? "该时刻无可用快照。"
       : !selected ? "该批快照未记录所选站点。"
       : !selected.coordinates ? "该批快照缺少所选站点坐标。"
       : S.stationStatus ? S.stationStatus
@@ -112,27 +138,38 @@
     drawMap();
   }
 
-  function loadFrame(target) {
+  function loadFrame(target, ghost = false) {
     clearTimeout(S.dragTimer);
     const token = S.frameToken = {};
     if (!target) {
-      S.frame = null;
+      S.gap = Boolean(ghost && S.frame);
+      if (!S.gap) S.frame = null;
+      S.frameStatus = "";
+      repaintFrame();
+      return;
+    }
+    const source = S.timeline.batch_meta?.[target]?.source || "tfl";
+    if (S.frame?.capturedAt === target && S.frame.source === source) {
+      S.gap = false;
       S.frameStatus = "";
       repaintFrame();
       return;
     }
     const cached = S.frames.get(target);
-    if (cached && cached.source === (S.timeline.batch_meta?.[target]?.source || "tfl")) {
+    if (cached && cached.source === source) {
       S.frames.delete(target);
       S.frames.set(target, cached);
       S.frame = cached;
+      S.gap = false;
       S.frameStatus = "";
       repaintFrame();
       return;
     }
-    S.frame = null;
+    // Keep the previous frame on screen while the next batch loads; only the
+    // caption and side panel acknowledge the pending target.
     S.frameStatus = "正在读取该批快照…";
-    repaintFrame();
+    renderTime();
+    renderNearby();
     S.dragTimer = setTimeout(async () => {
       try {
         const data = await api(endpoint + "frame", {captured_at: target});
@@ -141,10 +178,13 @@
           stations: new Map(data.stations.map(station => [station.id, station]))};
         S.frames.set(target, S.frame);
         if (S.frames.size > 12) S.frames.delete(S.frames.keys().next().value);
+        S.gap = false;
         S.frameStatus = "";
       } catch (error) {
         if (S.frameToken !== token) return;
         S.frameStatus = "快照读取失败 · " + error.message;
+        S.frame = null;
+        S.gap = false;
         stop();
       }
       repaintFrame();
@@ -155,9 +195,14 @@
     S.cursor = ms;
     const batch = ms === null ? null : frameAt(ms);
     const target = batch && ms <= expiresAt(batch) ? batch.capturedAt : null;
+    const gap = target === null && Boolean(S.frame) && S.frame.capturedAt === batch?.capturedAt;
     if (S.target !== target || retry) {
       S.target = target;
-      loadFrame(target);
+      loadFrame(target, gap);
+    } else if (target === null && S.gap !== gap) {
+      S.gap = gap;
+      if (!gap) S.frame = null;
+      repaintFrame();
     } else {
       renderTime();
     }
@@ -179,7 +224,7 @@
     else if (S.target && !S.frame) loadFrame(S.target);
     const advance = () => {
       if (!S.visible || !S.playing) return stop();
-      if (S.target && !S.frame) {
+      if (!settled()) {
         S.playTimer = setTimeout(advance, 150);
         return;
       }
@@ -350,14 +395,18 @@
     map.addSource("bike-analysis-points", {type: "geojson", data: emptyGeoJSON});
     map.addSource("bike-analysis-selection", {type: "geojson", data: emptyGeoJSON});
     map.addLayer({id: "bike-analysis-area-fill", type: "fill", source: "bike-analysis-selection",
-      filter: ["==", "$type", "Polygon"], paint: {"fill-color": "#258b8a", "fill-opacity": 0.12}});
+      filter: ["==", "$type", "Polygon"], paint: {"fill-color": "#258b8a",
+        "fill-opacity": ["case", ["boolean", ["get", "stale"], false], 0.04, 0.12]}});
     map.addLayer({id: "bike-analysis-area-line", type: "line", source: "bike-analysis-selection",
-      filter: ["==", "$type", "Polygon"], paint: {"line-color": "#226b70", "line-dasharray": [2, 2], "line-width": 2}});
-    const pointPaint = {"circle-color": ["get", "color"], "circle-radius": 6,
-      "circle-stroke-color": "#f1f8fe", "circle-stroke-width": 1.5};
+      filter: ["==", "$type", "Polygon"], paint: {"line-color": "#226b70", "line-dasharray": [2, 2], "line-width": 2,
+        "line-opacity": ["case", ["boolean", ["get", "stale"], false], 0.3, 1]}});
+    const pointPaint = {"circle-color": ["get", "color"], "circle-radius": ["get", "radius"],
+      "circle-opacity": ["case", ["boolean", ["get", "stale"], false], 0.32, 1],
+      "circle-stroke-color": "#f1f8fe", "circle-stroke-width": 1.5,
+      "circle-stroke-opacity": ["case", ["boolean", ["get", "stale"], false], 0.35, 1]};
     map.addLayer({id: "bike-analysis-stations", type: "circle", source: "bike-analysis-points", paint: pointPaint});
     map.addLayer({id: "bike-analysis-selected", type: "circle", source: "bike-analysis-selection",
-      filter: ["==", "$type", "Point"], paint: {...pointPaint, "circle-radius": 10,
+      filter: ["==", "$type", "Point"], paint: {...pointPaint,
         "circle-stroke-width": 2.5, "circle-stroke-color": "#163a46"}});
   }
 
@@ -402,13 +451,14 @@
     for (const point of displayed) {
       const props = point.properties;
       if (!props.cluster) {
-        points.push({...point, properties: {...props, color: colors[status(props[mode().field])]}});
+        const style = tier(props[mode().field]);
+        points.push({...point, properties: {...props, color: style.color, radius: style.radius, stale: S.gap}});
         continue;
       }
       const tight = props[S.mode + "Tight"], valid = props[S.mode + "Valid"];
       const element = document.createElement("button");
       element.type = "button";
-      element.className = tight ? "bike-analysis-cluster has-tight" : "bike-analysis-cluster";
+      element.className = "bike-analysis-cluster" + (tight ? " has-tight" : "") + (S.gap ? " is-stale" : "");
       element.textContent = tight + " / " + valid;
       element.title = `${mode().action}紧张 ${tight} 个，有效 ${valid} 个，共 ${props.point_count} 站。点击展开`;
       element.setAttribute("aria-label", element.title);
@@ -421,9 +471,11 @@
     pointsSource.setData({type: "FeatureCollection", features: points});
     const selected = currentStation(), selection = [];
     if (selected?.coordinates) {
-      selection.push({type: "Feature", geometry: radiusPolygon(selected.coordinates, S.timeline.radius_m), properties: {}},
+      const style = tier(selected[mode().field]);
+      selection.push({type: "Feature", geometry: radiusPolygon(selected.coordinates, S.timeline.radius_m),
+          properties: {stale: S.gap}},
         {type: "Feature", geometry: {type: "Point", coordinates: selected.coordinates},
-          properties: {id: selected.id, color: colors[status(selected[mode().field])]}});
+          properties: {id: selected.id, color: style.color, radius: style.radius + 4, stale: S.gap}});
     }
     selectionSource.setData({type: "FeatureCollection", features: selection});
     if (selected?.coordinates && S.focusStation) {
@@ -583,6 +635,7 @@
       drawCharts();
     }
   });
+  renderLegend();
   window.AirWatchBikeAnalysis = {
     show() {
       if (S.visible) return;
