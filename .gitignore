@@ -4,7 +4,7 @@
 # Local rollback archives
 /backups/
 
-# 2025 observation data and legacy assets
+# 2025 observation data (kept locally, not loaded by the live dashboard)
 /data.js
 /data/hourly_v2.csv
 /data/quality_summary.csv
@@ -13,25 +13,6 @@
 /data/stations.json
 /seed/
 /photos/
-/config.js
-/assets/app.js
-/assets/core.js
-/assets/map.js
-/assets/styles.css
-/assets/photo-unavailable.svg
-/tools/update_data.py
-/tools/migrate_existing.py
-/tools/repair_photos.py
-/tools/report_2025.js
-/tests/test_parser.py
-/tests/test_core.js
-/tests/core_browser_tests.html
-/00_COPY_FROM_EXISTING_V2.bat
-/01_UPDATE_DATA.bat
-/03_IMPORT_OFFLINE.bat
-/04_REPAIR_PHOTOS.bat
-/README_Install_CN.md
-/README_Photo_Fix.txt
 /docs/Course_Report_CN.md
 /docs/Methods_CN.md
 /docs/Test_Report_CN.md
@@ -44,6 +25,7 @@
 /docs/unit_test_output.txt
 __pycache__/
 *.py[cod]
+.venv/
 .env
 .env.*
 *.log

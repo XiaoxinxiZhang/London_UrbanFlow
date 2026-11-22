@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 import pathlib,subprocess,sys,shutil
 root=pathlib.Path(__file__).resolve().parents[1]
+try:
+    import flask
+except ImportError:
+    sys.exit('缺少 Flask。请先运行: python -m pip install -r requirements.txt')
 a=subprocess.run([sys.executable,'-m','unittest','discover','-s','tests','-p','test_*.py','-v'],cwd=root)
 if a.returncode:sys.exit(a.returncode)
 node=shutil.which('node')

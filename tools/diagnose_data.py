@@ -31,7 +31,7 @@ def table_exists(db, name):
 def http_check(name, url):
     curl = shutil.which('curl.exe') or shutil.which('curl')
     if not curl:
-        print(f'{name}: curl.exe 未找到（跳过联网检测）')
+        print(f'{name}: curl 未找到（跳过联网检测）')
         return None
     with tempfile.TemporaryDirectory(prefix='urbanflow_diag_') as folder:
         target = str(Path(folder) / 'response.bin')

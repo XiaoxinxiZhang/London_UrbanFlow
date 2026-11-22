@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
-"""Loopback web server for the SQLite data browser."""
+"""Flask web application for the London UrbanFlow dashboard.
+
+The same entrypoint works on Windows and Linux.  Waitress is used when it is
+installed; otherwise Flask's threaded development server is used as a fallback.
+Only files in STATIC are ever served, so the SQLite database, collector tools
+and historical data files cannot be downloaded through the web server.
+"""
+from __future__ import annotations
+
 import argparse
 from contextlib import closing
-import http.server
 import json
+import mimetypes
+import os
 from pathlib import Path
-import sqlite3
 import socket
+import sqlite3
+import sys
 import threading
-from urllib.parse import parse_qs, unquote, urlsplit
 import webbrowser
+
+from flask import Flask, abort, jsonify, request, send_from_directory
 
 from live_api import LiveAPI, UpdateManager
 import live_sources as parsers
@@ -18,168 +29,322 @@ import traffic_history
 from journey import JourneyPlanner
 
 ROOT = Path(__file__).resolve().parents[1]
-STATIC = {"/index.html", "/assets/live.css", "/assets/live.js", "/assets/city.css", "/assets/city.js", "/assets/journey.js", "/assets/insights.js",
-          "/assets/bike-analysis.js",
-          "/assets/vendor/maplibre-gl-5.6.2.js", "/assets/vendor/maplibre-gl-5.6.2.css",
-          "/assets/vendor/supercluster-8.0.1.min.js",
-          "/assets/vendor/echarts-5.6.0.min.js",
-          "/data/london_region_2025.geojson", "/data/london_boroughs_2025.geojson",
-          }
+STATIC = {
+    "/index.html",
+    "/assets/live.css",
+    "/assets/live.js",
+    "/assets/city.css",
+    "/assets/city.js",
+    "/assets/journey.js",
+    "/assets/insights.js",
+    "/assets/bike-analysis.js",
+    "/assets/vendor/maplibre-gl-5.6.2.js",
+    "/assets/vendor/maplibre-gl-5.6.2.css",
+    "/assets/vendor/supercluster-8.0.1.min.js",
+    "/assets/vendor/echarts-5.6.0.min.js",
+    "/data/london_region_2025.geojson",
+    "/data/london_boroughs_2025.geojson",
+}
+DEFAULT_PORT = 8765
+MAX_REQUEST_BYTES = 2048
+MAX_CONTENT_LENGTH = 4096
+
+# Windows' mimetypes database does not know .geojson; browsers parse it as
+# JSON either way, but MapLibre and developer tools prefer the correct type.
+mimetypes.add_type("application/geo+json", ".geojson")
 
 
-class LocalServer(http.server.ThreadingHTTPServer):
-    allow_reuse_address = False
-
-    def server_bind(self):
-        if hasattr(socket,"SO_EXCLUSIVEADDRUSE"):
-            self.socket.setsockopt(socket.SOL_SOCKET,socket.SO_EXCLUSIVEADDRUSE,1)
-        super().server_bind()
-
-
-class Handler(http.server.SimpleHTTPRequestHandler):
-    def end_headers(self):
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        super().end_headers()
-
-    def valid_host(self):
-        return self.headers.get("Host") == f"127.0.0.1:{self.server.server_port}"
-
-    def reply(self, data, code=200):
-        raw = json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-
-    def do_GET(self):
-        if not self.valid_host():
-            self.send_error(403)
-            return
-        path = urlsplit(self.path).path
-        if path.startswith("/api/"):
-            self.api_get(path)
-            return
-        if path == "/":
-            path = "/index.html"
-        if unquote(path) not in STATIC:
-            self.send_error(404)
-            return
-        self.path = path
-        super().do_GET()
-
-    def do_HEAD(self):
-        path = urlsplit(self.path).path
-        if not self.valid_host() or path not in STATIC | {"/"}:
-            self.send_error(404)
-            return
-        self.path = "/index.html" if path == "/" else path
-        super().do_HEAD()
-
-    def api_get(self, path):
-        params = {key: values[-1] for key, values in parse_qs(urlsplit(self.path).query).items()}
-        routes = {"/api/status": lambda: self.server.api.status(),
-                  "/api/health": lambda: self.server.journeys.daqi.current(),
-                  "/api/locations": lambda: self.server.api.locations(params),
-                  "/api/measurements": lambda: self.server.api.measurements(params),
-                  "/api/road-events": lambda: self.server.api.roads(params),
-                  "/api/map": lambda: self.server.api.analysis.map(params),
-                  "/api/analysis/series": lambda: self.server.api.analysis.series(params),
-                  "/api/analysis/bikes/timeline": lambda: self.server.api.analysis.bike_timeline(params),
-                  "/api/analysis/bikes/frame": lambda: self.server.api.analysis.bike_frame(params),
-                  "/api/analysis/bikes/station": lambda: self.server.api.analysis.bike_station(params),
-                  "/api/analysis/nearby": lambda: self.server.api.analysis.nearby(params),
-                  "/api/analysis/weather": lambda: self.server.api.analysis.weather(params)}
-        try:
-            if path.startswith("/api/update/"):
-                result = self.server.updates.get(path.rsplit("/", 1)[-1])
-            elif path in routes:
-                result = routes[path]()
-            else:
-                self.reply({"error": "接口不存在"}, 404)
-                return
-            self.reply(result)
-        except (ValueError, TypeError, OverflowError) as exc:
-            self.reply({"error": str(exc)}, 400)
-        except LookupError as exc:
-            self.reply({"error": str(exc)}, 404)
-        except sqlite3.Error:
-            self.reply({"error": "数据库暂时无法读取，请稍后刷新"}, 503)
-
-    def do_POST(self):
-        origin = f"http://127.0.0.1:{self.server.server_port}"
-        if not self.valid_host() or self.headers.get("Origin") != origin:
-            self.reply({"error": "请求必须来自本地页面"}, 403)
-            return
-        if self.path not in ("/api/update", "/api/journeys/plan"):
-            self.reply({"error": "接口不存在"}, 404)
-            return
-        if self.headers.get("Transfer-Encoding"):
-            self.close_connection = True
-            self.reply({"error": "不支持分块请求体"}, 400)
-            return
-        if self.path == "/api/update":
-            if self.headers.get("Content-Length", "0") != "0":
-                self.reply({"error": "更新请求无需请求体"}, 400)
-                return
-            self.reply(self.server.updates.start(), 202)
-            return
-        try:
-            size = int(self.headers.get("Content-Length", "0"))
-            if not 1 <= size <= 2048 or self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json":
-                raise ValueError("路线请求须为不超过 2 KB 的 JSON")
-            payload = json.loads(self.rfile.read(size))
-            self.reply(self.server.journeys.plan(payload))
-        except (ValueError, TypeError, json.JSONDecodeError) as exc:
-            self.reply({"error": str(exc)}, 400)
-        except sqlite3.Error:
-            self.reply({"error": "数据库暂时无法读取，请稍后刷新"}, 503)
-
-    def log_message(self, fmt, *args):
-        if args and "favicon" in str(args[0]):
-            return
-        super().log_message(fmt, *args)
+def _env_int(name, default):
+    value = os.environ.get(name)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
-def create_server(port=8765, database=store.DB):
+def _env_list(name):
+    raw = os.environ.get(name, "")
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+def _bare_host(host):
+    """Return a Host header without its port, including IPv6 bracket form."""
+    if host.startswith("["):
+        return host.split("]", 1)[0] + "]"
+    return host.rsplit(":", 1)[0] if ":" in host else host
+
+
+def _json_error(message, code):
+    return jsonify(error=message), code
+
+
+def create_app(database=store.DB, *, static_root=ROOT, trusted_hosts=(), trusted_origins=()):
+    static_root = Path(static_root).resolve()
+    database = Path(database).resolve()
+
+    # Keep the original startup behaviour: create the schema when needed, repair
+    # an interrupted traffic-history write and backfill Met Office units once.
     with closing(store.connect(database)) as db:
         db.commit()
         traffic_history.recover(db)
         store.backfill_met_units(db, parsers.WEATHER_UNITS)
-    server = LocalServer(("127.0.0.1", port),
-        lambda *args, **kwargs: Handler(*args, directory=str(ROOT), **kwargs))
-    server.api = LiveAPI(database)
-    server.journeys = JourneyPlanner(server.api.analysis)
-    server.updates = UpdateManager(database)
-    return server
+
+    app = Flask(__name__, static_folder=None)
+    app.config.update(
+        URBANFLOW_DATABASE=str(database),
+        # Do not use the key TRUSTED_HOSTS: Flask 3.1 owns that name and
+        # rejects the request with 400 before our own handler can run.
+        URBANFLOW_TRUSTED_HOSTS=tuple(trusted_hosts),
+        URBANFLOW_TRUSTED_ORIGINS=tuple(origin.rstrip("/") for origin in trusted_origins),
+        MAX_CONTENT_LENGTH=MAX_CONTENT_LENGTH,
+    )
+    app.json.ensure_ascii = False
+    app.api = LiveAPI(database)
+    app.journeys = JourneyPlanner(app.api.analysis)
+    app.updates = UpdateManager(database)
+
+    def require_same_origin():
+        """Reject cross-site POSTs; browser same-origin requests include Origin."""
+        origin = request.headers.get("Origin")
+        if not origin:
+            return _json_error("请求必须来自本地页面", 403)
+        allowed = {request.host_url.rstrip("/")}
+        allowed.update(app.config["URBANFLOW_TRUSTED_ORIGINS"])
+        if origin.rstrip("/") not in allowed:
+            return _json_error("请求必须来自本地页面", 403)
+        return None
+
+    @app.before_request
+    def validate_host():
+        allowed = app.config["URBANFLOW_TRUSTED_HOSTS"]
+        if not allowed:
+            return None
+        host = request.host
+        if host in allowed or _bare_host(host) in allowed:
+            return None
+        if request.path.startswith("/api/"):
+            return _json_error("请求来源不受信任", 403)
+        return "Forbidden host", 403
+
+    @app.after_request
+    def security_headers(response):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+
+    @app.get("/")
+    def index():
+        return send_from_directory(static_root, "index.html")
+
+    @app.get("/<path:filename>")
+    def static_file(filename):
+        if "/" + filename not in STATIC:
+            abort(404)
+        return send_from_directory(static_root, filename)
+
+    def query_params():
+        return {key: values[-1] for key, values in request.args.lists()}
+
+    @app.get("/api/status")
+    def api_status():
+        return app.api.status()
+
+    @app.get("/api/health")
+    def api_health():
+        return app.journeys.daqi.current()
+
+    @app.get("/api/locations")
+    def api_locations():
+        return app.api.locations(query_params())
+
+    @app.get("/api/measurements")
+    def api_measurements():
+        return app.api.measurements(query_params())
+
+    @app.get("/api/road-events")
+    def api_road_events():
+        return app.api.roads(query_params())
+
+    @app.get("/api/map")
+    def api_map():
+        return app.api.analysis.map(query_params())
+
+    @app.get("/api/analysis/series")
+    def api_analysis_series():
+        return app.api.analysis.series(query_params())
+
+    @app.get("/api/analysis/bikes/timeline")
+    def api_analysis_bike_timeline():
+        return app.api.analysis.bike_timeline(query_params())
+
+    @app.get("/api/analysis/bikes/frame")
+    def api_analysis_bike_frame():
+        return app.api.analysis.bike_frame(query_params())
+
+    @app.get("/api/analysis/bikes/station")
+    def api_analysis_bike_station():
+        return app.api.analysis.bike_station(query_params())
+
+    @app.get("/api/analysis/nearby")
+    def api_analysis_nearby():
+        return app.api.analysis.nearby(query_params())
+
+    @app.get("/api/analysis/weather")
+    def api_analysis_weather():
+        return app.api.analysis.weather(query_params())
+
+    @app.get("/api/update/<identifier>")
+    def api_update_status(identifier):
+        return app.updates.get(identifier)
+
+    @app.post("/api/update")
+    def api_update():
+        denied = require_same_origin()
+        if denied:
+            return denied
+        if request.headers.get("Transfer-Encoding"):
+            return _json_error("不支持分块请求体", 400)
+        if request.get_data(cache=True):
+            return _json_error("更新请求无需请求体", 400)
+        return jsonify(app.updates.start()), 202
+
+    @app.post("/api/journeys/plan")
+    def api_journey_plan():
+        denied = require_same_origin()
+        if denied:
+            return denied
+        if request.headers.get("Transfer-Encoding"):
+            return _json_error("不支持分块请求体", 400)
+        if request.mimetype != "application/json":
+            return _json_error("路线请求须为不超过 2 KB 的 JSON", 400)
+        body = request.get_data(cache=True)
+        if not 1 <= len(body) <= MAX_REQUEST_BYTES:
+            return _json_error("路线请求须为不超过 2 KB 的 JSON", 400)
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            return _json_error("路线请求须为不超过 2 KB 的 JSON", 400)
+        return app.journeys.plan(payload)
+
+    @app.route("/api/<path:rest>", methods=["GET", "POST", "HEAD"])
+    def api_missing(rest):
+        return _json_error("接口不存在", 404)
+
+    @app.errorhandler(ValueError)
+    def handle_value_error(error):
+        return _json_error(str(error), 400)
+
+    @app.errorhandler(TypeError)
+    @app.errorhandler(OverflowError)
+    def handle_type_error(error):
+        return _json_error(str(error), 400)
+
+    @app.errorhandler(LookupError)
+    def handle_lookup_error(error):
+        return _json_error(str(error), 404)
+
+    @app.errorhandler(sqlite3.Error)
+    def handle_database_error(error):
+        return _json_error("数据库暂时无法读取，请稍后刷新", 503)
+
+    @app.errorhandler(413)
+    def handle_too_large(error):
+        return _json_error("请求体过大", 400)
+
+    @app.errorhandler(405)
+    def handle_method_not_allowed(error):
+        if request.path.startswith("/api/"):
+            return _json_error("接口不存在", 404)
+        return "Method Not Allowed", 405
+
+    return app
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--open", action="store_true")
-    parser.add_argument("--db", default=str(store.DB))
-    args = parser.parse_args()
+def _listen_url(host, port):
+    if host in ("0.0.0.0", "::"):
+        return f"http://<服务器IP>:{port}/"
+    return f"http://{host}:{port}/"
+
+
+def _browse_url(host, port):
+    if host in ("0.0.0.0", "::"):
+        return f"http://127.0.0.1:{port}/"
+    return f"http://{host}:{port}/"
+
+
+def _port_in_use(host, port):
+    """Detect an existing listener before waitress starts.
+
+    Windows allows two sockets to bind the same address when SO_REUSEADDR is
+    set, so a failed bind alone is not a reliable signal there.
+    """
+    probe = "127.0.0.1" if host in ("0.0.0.0", "") else ("::1" if host == "::" else host)
+    probe = probe.strip("[]")
+    family = socket.AF_INET6 if ":" in probe else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            return sock.connect_ex((probe, port)) == 0
+    except OSError:
+        return False
+
+
+def _run_server(app, host, port):
+    try:
+        from waitress import serve
+    except ImportError:
+        print("waitress 未安装，使用 Flask 开发服务器；生产部署请运行: python -m pip install waitress", flush=True)
+        app.run(host=host, port=port, threaded=True, use_reloader=False)
+        return
+    serve(app, host=host, port=port, threads=8)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="London UrbanFlow web server")
+    parser.add_argument("--host", default=os.environ.get("URBANFLOW_HOST", "127.0.0.1"),
+                        help="绑定地址，默认 127.0.0.1；服务器部署可用 0.0.0.0")
+    parser.add_argument("--port", type=int, default=_env_int("URBANFLOW_PORT", DEFAULT_PORT),
+                        help="监听端口，默认 8765")
+    parser.add_argument("--db", default=os.environ.get("URBANFLOW_DB", str(store.DB)),
+                        help="SQLite 数据库路径")
+    parser.add_argument("--open", action="store_true", help="启动后打开浏览器")
+    parser.add_argument("--trusted-host", action="append", default=None,
+                        help="允许的 Host（可重复；默认不限制，配合回环监听）")
+    parser.add_argument("--trusted-origin", action="append", default=None,
+                        help="额外允许的 POST Origin（可重复）")
+    args = parser.parse_args(argv)
+
     if not 1024 <= args.port <= 65535:
         parser.error("Port must be 1024..65535")
-    try:
-        server = create_server(args.port, args.db)
-    except OSError:
-        server = create_server(0, args.db)
-    url = f"http://127.0.0.1:{server.server_port}/index.html"
-    print("london UrbanFlow: " + url, flush=True)
-    print("Keep this window open. Ctrl+C stops the server.", flush=True)
+    if _port_in_use(args.host, args.port):
+        print(f"端口 {args.port} 已被占用（{args.host}）。请换一个端口：--port {args.port + 1}",
+              file=sys.stderr, flush=True)
+        return 2
+
+    trusted_hosts = set(args.trusted_host or _env_list("URBANFLOW_TRUSTED_HOSTS"))
+    trusted_origins = set(args.trusted_origin or _env_list("URBANFLOW_TRUSTED_ORIGINS"))
+    app = create_app(args.db, trusted_hosts=trusted_hosts, trusted_origins=trusted_origins)
+
+    print("London UrbanFlow: " + _listen_url(args.host, args.port), flush=True)
+    print("数据库: " + str(Path(args.db).resolve()), flush=True)
+    if args.host in ("0.0.0.0", "::"):
+        print("警告：服务监听所有网卡且没有身份验证；请仅向可信网络开放，或使用 SSH 隧道/反向代理。", flush=True)
+    print("按 Ctrl+C 停止服务。", flush=True)
+
     if args.open:
-        threading.Timer(.4, lambda: webbrowser.open(url)).start()
+        threading.Timer(.4, lambda: webbrowser.open(_browse_url(args.host, args.port))).start()
+
     try:
-        server.serve_forever()
+        _run_server(app, args.host, args.port)
     except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
+        print("\n已停止。", flush=True)
+        return 0
+    except OSError as exc:
+        print(f"无法监听 {args.host}:{args.port}（{exc}）。请换一个端口：--port 8766", file=sys.stderr, flush=True)
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

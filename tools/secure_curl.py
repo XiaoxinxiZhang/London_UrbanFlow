@@ -68,7 +68,7 @@ def curl_https(url, headers, timeout=25, data=None):
         raise ValueError("curl fallback only accepts HTTPS URLs")
     curl = _curl_binary()
     if not curl:
-        raise OSError("curl fallback unavailable: Windows curl.exe not found")
+        raise OSError("curl fallback unavailable: curl not found")
     header_lines = []
     for name, value in headers.items():
         name, value = str(name), str(value)

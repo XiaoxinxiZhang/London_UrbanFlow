@@ -509,7 +509,7 @@
     }
   };
   if (location.protocol === "file:") {
-    errorAt("startupError", "请双击项目中的 02_OPEN_DASHBOARD.bat，通过本地服务打开 index.html。");
+    errorAt("startupError", "请通过本地服务打开 index.html（例如在项目根目录运行 python run.py）。");
     $("updateButton").disabled = true;
     $("dataTable").setAttribute("aria-busy", "false");
   } else {

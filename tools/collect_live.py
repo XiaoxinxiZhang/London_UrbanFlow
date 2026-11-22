@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect London observations once; Windows Task Scheduler runs this every 5 minutes.
+"""Collect London observations once; Windows Task Scheduler or Linux cron runs this every 5 minutes.
 
 Python 3.10+ standard library only. This module never modifies 2025 dashboard data.
 """

@@ -1,7 +1,6 @@
 """Contract tests for the local database browser and collector coordination."""
 from contextlib import closing
 from datetime import datetime, timezone
-import http.client
 import json
 from pathlib import Path
 import subprocess
@@ -17,7 +16,7 @@ import live_store as store
 from collector_lock import CollectorLock
 from live_api import LiveAPI, UpdateManager
 from live_sources import WEATHER_UNITS
-from server import create_server
+from server import create_app
 
 
 class LiveAPITests(unittest.TestCase):
@@ -156,54 +155,74 @@ class LiveAPITests(unittest.TestCase):
         lock.release()
 
     def test_http_security_and_query_errors(self):
-        server = create_server(0,self.path)
-        thread = threading.Thread(target=server.serve_forever,daemon=True)
-        thread.start()
-        connection = http.client.HTTPConnection("127.0.0.1",server.server_port)
-        try:
-            for url,code in [("/index.html",200),
-                             ("/data.js",404),
-                             ("/assets/insights.js",200),
-                             ("/assets/journey.js",200),
-                             ("/data/london_region_2025.geojson",200),
-                             ("/data/london_boroughs_2025.geojson",200),
-                             ("/data/london_thames_rivers.geojson",404),
-                             ("/api/status",200),
-                             ("/api/measurements?source=laqn",200),
-                             ("/api/locations?source=invalid",400),
-                             ("/api/road-events?id=missing",404),
-                             ("/data/live/airwatch_live.sqlite3",404),
-                             ("/tools/collect_live.py",404)]:
-                connection.request("GET",url)
-                response = connection.getresponse()
-                self.assertEqual(response.status,code,url)
-                response.read()
-            connection.request("POST","/api/update")
-            response = connection.getresponse()
-            self.assertEqual(response.status,403)
-            response.read()
-            with patch.object(server.updates,"start",return_value={"id":"test","state":"running"}):
-                connection.request("POST","/api/update",headers={"Origin":f"http://127.0.0.1:{server.server_port}"})
-                response = connection.getresponse()
-                self.assertEqual(response.status,202)
-                self.assertEqual(json.loads(response.read())["id"],"test")
-            route = {"start": [-.15, 51.5], "end": [-.1, 51.5], "mode": "walk"}
-            with patch.object(server.journeys,"plan",return_value={"legs": []}) as planned:
-                connection.request("POST","/api/journeys/plan",body=json.dumps(route),headers={
-                    "Origin":f"http://127.0.0.1:{server.server_port}","Content-Type":"application/json"})
-                response = connection.getresponse()
-                self.assertEqual(response.status,200)
-                self.assertEqual(json.loads(response.read())["legs"],[])
-                planned.assert_called_once_with(route)
-            connection.request("POST","/api/journeys/plan",body="{}",headers={"Content-Type":"application/json"})
-            response = connection.getresponse()
-            self.assertEqual(response.status,403)
-            response.read()
-        finally:
-            connection.close()
-            server.shutdown()
-            server.server_close()
-            thread.join()
+        app = create_app(self.path)
+        client = app.test_client()
+        for url,code in [("/index.html",200),
+                         ("/data.js",404),
+                         ("/assets/insights.js",200),
+                         ("/assets/journey.js",200),
+                         ("/data/london_region_2025.geojson",200),
+                         ("/data/london_boroughs_2025.geojson",200),
+                         ("/README.md",404),
+                         ("/api/status",200),
+                         ("/api/measurements?source=laqn",200),
+                         ("/api/locations?source=invalid",400),
+                         ("/api/road-events?id=missing",404),
+                         ("/api/does-not-exist",404),
+                         ("/data/live/airwatch_live.sqlite3",404),
+                         ("/tools/collect_live.py",404)]:
+            response = client.get(url)
+            self.assertEqual(response.status_code,code,url)
+            response.close()
+        response = client.get("/index.html")
+        self.assertEqual(response.headers["Cache-Control"],"no-store")
+        self.assertEqual(response.headers["X-Content-Type-Options"],"nosniff")
+        response.close()
+        response = client.get("/api/does-not-exist")
+        self.assertEqual(response.get_json()["error"],"接口不存在")
+        response = client.post("/api/update")
+        self.assertEqual(response.status_code,403)
+        response.close()
+        response = client.post("/api/update",headers={"Origin":"http://evil.example"})
+        self.assertEqual(response.status_code,403)
+        response.close()
+        response = client.post("/api/update",data=b"x",headers={"Origin":"http://localhost"})
+        self.assertEqual(response.status_code,400)
+        response.close()
+        with patch.object(app.updates,"start",return_value={"id":"test","state":"running"}):
+            response = client.post("/api/update",headers={"Origin":"http://localhost"})
+            self.assertEqual(response.status_code,202)
+            self.assertEqual(response.get_json()["id"],"test")
+        route = {"start": [-.15, 51.5], "end": [-.1, 51.5], "mode": "walk"}
+        with patch.object(app.journeys,"plan",return_value={"legs": []}) as planned:
+            response = client.post("/api/journeys/plan",json=route,headers={"Origin":"http://localhost"})
+            self.assertEqual(response.status_code,200)
+            self.assertEqual(response.get_json()["legs"],[])
+            planned.assert_called_once_with(route)
+        response = client.post("/api/journeys/plan",json={})
+        self.assertEqual(response.status_code,403)
+        response.close()
+        response = client.post("/api/journeys/plan",data="{}",content_type="application/json",
+                               headers={"Origin":"http://localhost"})
+        self.assertEqual(response.status_code,400)
+        response.close()
+        response = client.post("/api/journeys/plan",data=b"x"*2049,content_type="application/json",
+                               headers={"Origin":"http://localhost"})
+        self.assertEqual(response.status_code,400)
+        response.close()
+
+    def test_trusted_hosts_and_origins(self):
+        app = create_app(self.path,trusted_hosts={"dashboard.local"},
+                         trusted_origins={"https://dashboard.example"})
+        client = app.test_client()
+        self.assertEqual(client.get("/api/status").status_code,403)
+        self.assertEqual(client.get("/api/status",headers={"Host":"dashboard.local"}).status_code,200)
+        self.assertEqual(client.get("/api/status",headers={"Host":"dashboard.local:8765"}).status_code,200)
+        with patch.object(app.updates,"start",return_value={"id":"test","state":"running"}):
+            response = client.post("/api/update",headers={
+                "Host":"dashboard.local","Origin":"https://dashboard.example"})
+            self.assertEqual(response.status_code,202)
+            self.assertEqual(response.get_json()["id"],"test")
 
     def test_update_manager_reports_partial_and_reuses_active_run(self):
         manager = UpdateManager(self.path)
