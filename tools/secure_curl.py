@@ -1,4 +1,4 @@
-"""HTTPS fallback for Windows machines whose Python SSL stack fails.
+"""Verified HTTPS transport with a curl path for proxy and TLS compatibility.
 
 Use the system curl's normal certificate verification.  Auth headers are sent
 through stdin, not on the process command line, and are never printed.
@@ -17,6 +17,7 @@ import urllib.request
 from pathlib import Path
 
 _TLS_WORDS = ("ssl", "tls", "certificate verify failed", "certificate error", "handshake")
+PROJECT_PROXY_FILE = Path(__file__).resolve().parents[1] / "data" / "live" / "outbound_proxy.txt"
 
 
 def _is_tls_error(exc):
@@ -36,17 +37,22 @@ def _curl_binary():
 
 
 def _system_proxy_for(url):
-    """Return a credential-free system proxy suitable for curl.
+    """Return a credential-free system or project proxy suitable for curl.
 
     Python's urllib reads the Windows Internet Settings proxy, while the
-    Windows curl build does not.  Reusing that setting keeps both transports
-    on the same network path.  Credential-bearing proxy URLs are deliberately
-    ignored so secrets never appear in curl's process arguments.
+    Windows curl build does not. A project file covers scheduled processes
+    that do not inherit the interactive shell's proxy environment. Credential-
+    bearing URLs are ignored so secrets never appear in curl's arguments.
     """
     parsed_url = urllib.parse.urlsplit(url)
     if not parsed_url.hostname or urllib.request.proxy_bypass(parsed_url.hostname):
         return None
     proxy = urllib.request.getproxies().get(parsed_url.scheme.lower())
+    if not proxy and parsed_url.scheme.lower() == "https":
+        try:
+            proxy = PROJECT_PROXY_FILE.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            pass
     if not proxy:
         return None
     candidate = proxy if "://" in proxy else "http://" + proxy

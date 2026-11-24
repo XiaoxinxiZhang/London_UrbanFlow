@@ -35,13 +35,14 @@ ANCHORS = ((51.51,-0.13),(51.60,-0.35),(51.60,0.05),(51.40,-0.35),(51.40,0.05))
 SCHEDULE = (("tfl_bikes","tfl",300),("laqn_sites","laqn",86400),("breathe_web_hourly","breathe",3600),
             ("met_sites","metoffice",86400),("laqn_hourly","laqn",3600),
             ("laqn_15min","laqn",3600),
-            ("met_hourly","metoffice",86400),
+            ("met_hourly","metoffice",3600),("met_other_daily","metoffice",86400),
             ("tfl_roads","tfl",300),("breathe_web_reconcile","breathe",300),
             ("tfl_bike_archive","public_archive",3600),
             ("tfl_road_archive","public_road_archive",10800))
 KEYS = {"metoffice":"MET_OFFICE_API_KEY"}
 CREDENTIALS_FILE = Path(os.environ.get("APPDATA") or (Path.home()/".config"))/"LondonAirWatch"/"credentials.txt"
 MIN_REQUEST_GAP = 1.25  # At most 48 requests/minute from this process.
+BREATHE_CHART_BATCH_LIMIT = 12
 MET_OFFICE_DAILY_REQUEST_BUDGET = 300  # Free tier is 360; reserve room for checks outside this collector.
 
 
@@ -300,9 +301,19 @@ def breathe_web_reconcile(db, fetcher, now):
       LEFT JOIN breathe_chart_state s ON s.site_id=l.source_id
       WHERE l.source='breathe' AND l.active=1
         AND (s.last_attempt_utc IS NULL OR s.last_attempt_utc<=?)
-        AND (s.last_success_utc IS NULL OR s.last_success_utc<=?)
-      ORDER BY s.last_attempt_utc,l.source_id LIMIT 4""",
-      (iso(now-timedelta(hours=1)), iso(now-timedelta(hours=24)))).fetchall()
+        AND (s.last_success_utc IS NULL OR s.last_success_utc<=?
+          OR (s.last_success_utc<=? AND (
+            COALESCE((SELECT MAX(m.valid_at_utc) FROM measurements m
+              WHERE m.source='breathe' AND m.source_id=l.source_id
+                AND m.metric='PM25_CONCENTRATION'), '')<=?
+            OR COALESCE((SELECT MAX(m.valid_at_utc) FROM measurements m
+              WHERE m.source='breathe' AND m.source_id=l.source_id
+                AND m.metric='NO2_CONCENTRATION'), '')<=?)))
+      ORDER BY CASE WHEN s.last_success_utc IS NULL THEN 0 ELSE 1 END,
+               s.last_attempt_utc,l.source_id LIMIT ?""",
+      (iso(now-timedelta(hours=1)), iso(now-timedelta(hours=24)),
+       iso(now-timedelta(hours=1)), iso(now-timedelta(hours=3)),
+       iso(now-timedelta(hours=3)), BREATHE_CHART_BATCH_LIMIT)).fetchall()
     end = now.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
     start = end-timedelta(hours=48)
     times = dict(startTime=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -361,7 +372,7 @@ def tfl_bikes(db,fetcher,now):
 
 
 def tfl_roads(db,fetcher,now):
-    payload,sha=fetcher.get("tfl","tfl_roads",TFL+"/Road/all/Disruption")
+    payload,sha=fetcher.get("tfl","tfl_roads",TFL+"/Road/all/Disruption?stripContent=false")
     rows=parsers.tfl_events(payload)
     # [] is a valid, complete response: it closes events absent from the current feed.
     seen=iso(now);ids=set();count=0;last=None
@@ -395,22 +406,34 @@ def met_sites(db,fetcher,now):
 
 
 def met_hourly(db,fetcher,now):
-    ids=[r["source_id"] for r in db.execute("SELECT source_id FROM locations WHERE source='metoffice' AND active=1")]
-    if not ids:
-        raise ValueError("Met Office geohashes not discovered")
+    return met_observations(db,fetcher,"met_hourly",london=True)
+
+
+def met_other_daily(db,fetcher,now):
+    return met_observations(db,fetcher,"met_other_daily",london=False)
+
+
+def met_observations(db,fetcher,job,london):
+    london_sql="(coalesce(lower(json_extract(metadata_json,'$.area')),'') IN ('greater london','london') " \
+               "OR coalesce(lower(json_extract(metadata_json,'$.region')),'')='london')"
+    ids=[r["source_id"] for r in db.execute(
+        "SELECT source_id FROM locations WHERE source='metoffice' AND active=1 AND " +
+        (london_sql if london else "NOT " + london_sql) + " ORDER BY source_id")]
+    if london and not ids:
+        raise ValueError("Met Office London geohashes not discovered")
     count=0;last=None;errors=[]
     for sid in ids:
         try:
-            payload,sha=fetcher.get("metoffice","met_hourly",MET+"/"+urllib.parse.quote(sid),met_headers())
+            payload,sha=fetcher.get("metoffice",job,MET+"/"+urllib.parse.quote(sid),met_headers())
             rows=parsers.weather_measurements(payload,sid)
             count+=save_measurements(db,"metoffice",rows,sha)
-            fetcher.mark("met_hourly",sha,len(rows),latest(rows))
+            fetcher.mark(job,sha,len(rows),latest(rows))
             last=max(filter(None,(last,latest(rows))),default=None)
             db.commit()
         except (RuntimeError,ValueError,KeyError) as exc:
             errors.append(sid+":"+str(exc))
     if errors:
-        raise RuntimeError(f"{len(errors)} Met Office sites failed; first: {errors[0]}")
+        raise RuntimeError(f"{len(errors)} Met Office {job} sites failed; first: {errors[0]}")
     return count,last
 
 
@@ -481,12 +504,13 @@ def status(db,now=None):
                     state="pending_credentials"
             except (RuntimeError,ValueError):
                 state="credentials_error"
-        elif row and row["last_success_utc"] and now-datetime.fromisoformat(row["last_success_utc"]) > timedelta(seconds=interval*2+300):
+        if row and row["last_success_utc"] and now-datetime.fromisoformat(row["last_success_utc"]) > timedelta(seconds=interval*2+300):
             state="stale" if state=="success" else state+"; stale"
         if row and row["latest_observation_utc"] and name not in ("tfl_roads","tfl_bike_archive","tfl_road_archive"):
             age=now-datetime.fromisoformat(row["latest_observation_utc"])
             limit=(timedelta(minutes=15) if name=="tfl_bikes" else
-                   timedelta(hours=27) if name=="met_hourly" else timedelta(hours=3))
+                   timedelta(hours=4) if name=="met_hourly" else
+                   timedelta(hours=27) if name=="met_other_daily" else timedelta(hours=3))
             if age>limit:
                 state+="; stale_data"
         elif name in ("laqn_15min", "breathe_web_hourly") and row and row["status"]=="success":
@@ -521,7 +545,7 @@ def main(argv=None):
     backfill_jobs = {"backfill-bikes":"tfl_bike_archive", "backfill-roads":"tfl_road_archive"}
     ap.add_argument("command",choices=("run-once",*backfill_jobs,"status","prune"))
     ap.add_argument("--force",action="store_true",help="run all configured feeds even if not due")
-    ap.add_argument("--db",default=str(store.DB),help="SQLite path (for tests or separate workspace)")
+    ap.add_argument("--db",default=str(store.default_db()),help="SQLite path (for tests or separate workspace)")
     ap.add_argument("--json-progress",action="store_true",help="emit one JSON object per job transition")
     args=ap.parse_args(argv)
     lock=CollectorLock(args.db)

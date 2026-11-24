@@ -109,6 +109,14 @@
     $("bikeCurrentBikes").textContent = display(selected?.bikes);
     $("bikeCurrentDocks").textContent = display(selected?.empty_docks);
     $("bikeCurrentCapacity").textContent = display(selected?.capacity);
+    const sourceTime = $("bikeSourceTime");
+    const modified = selected?.source_modified;
+    const age = modified && S.frame ? Date.parse(S.frame.capturedAt) - Date.parse(modified) : NaN;
+    sourceTime.hidden = !selected || S.frame.source !== "tfl";
+    sourceTime.textContent = !selected || S.frame.source !== "tfl" ? ""
+      : modified ? "TfL 站点来源更新：" + time(modified)
+        + (Number.isFinite(age) && age > 3600000 ? " · 比本批快照早超过 1 小时" : "")
+      : "TfL 未提供站点来源更新时间";
     const neighbors = S.frame && selected ? point?.neighbors || [] : [];
     $("bikeNeighborTable").hidden = !neighbors.length;
     const ratio = point?.[S.mode];
@@ -632,6 +640,7 @@
     if (S.visible && S.timeline) {
       renderRange();
       renderTime();
+      renderNearby();
       drawCharts();
     }
   });

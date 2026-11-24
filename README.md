@@ -127,6 +127,6 @@ data/               伦敦行政边界及本地运行数据
 docs/               部署、采集、指标说明和界面示例
 ```
 
-本地数据库位于 `data/live/airwatch_live.sqlite3`，原始响应和年度 ZIP 也保存在 `data/live/`。该目录已由 `.gitignore` 排除，不会进入远程仓库。`data.js`、`data/hourly_v2.csv`、`seed/` 等是本地历史 2025 数据，当前实时页面不加载它们；缺少这些文件不影响服务启动。
+本地数据库位于 `data/live/airwatch_live.sqlite3`，原始响应和年度 ZIP 也保存在 `data/live/`。该目录已由 `.gitignore` 排除，不会进入远程仓库。数据库路径可用 `URBANFLOW_DB` 覆盖；部署在网络盘上时，建议把整个 `data/live` 目录迁到本地磁盘并在原位置保留目录软链接（步骤见[部署说明](docs/Deploy_CN.md)）。`python tools/backup_db.py` 可在服务运行中生成一致性快照并保留最近几份。`data.js`、`data/hourly_v2.csv`、`seed/` 等是本地历史 2025 数据，当前实时页面不加载它们；缺少这些文件不影响服务启动。
 
 各数据源、图表计算口径及历史快照见[数据与可视化说明](docs/Current_Data_Visualization_CN.md)。前端库许可证在 [assets/vendor](assets/vendor/)。

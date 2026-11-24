@@ -101,7 +101,8 @@ async function testReplay() {
     assert.ok(resolve, capturedAt + " was requested");
     pendingFrames.delete(capturedAt);
     resolve({captured_at: capturedAt, source: capturedAt === fourth ? "public_archive" : "tfl", stations: [
-      {...sites[0], coordinates: [0, 51.5], bikes, empty_docks: 12, capacity: 20},
+      {...sites[0], coordinates: [0, 51.5], bikes, empty_docks: 12, capacity: 20,
+        source_modified: capturedAt === fourth ? null : first},
       {...sites[1], coordinates: [0, 51.501], bikes: 1, empty_docks: 4, capacity: 5},
     ]});
     await flush();
@@ -159,9 +160,12 @@ async function testReplay() {
   await resolveFrame(first, 3);
   assert.equal(node("bikeCurrentBikes").textContent, 8, "a slow earlier frame cannot replace the latest selection");
   assert.match(node("bikeCapture").textContent, /12:05/);
+  assert.match(node("bikeSourceTime").textContent, /TfL 站点来源更新/);
+  assert.equal(node("bikeSourceTime").hidden, false);
   zone = "China";
   events.get("airwatch:timezone")();
   assert.match(node("bikeCapture").textContent, /China/);
+  assert.match(node("bikeSourceTime").textContent, /China/);
 
   seek(at(19));
   await advance(85);

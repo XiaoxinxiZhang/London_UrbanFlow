@@ -233,7 +233,8 @@ class LiveAPI:
                 success = row.get("last_success_utc")
                 row["stale_run"] = bool(success and now-datetime.fromisoformat(success)>timedelta(seconds=2*interval+300))
                 last = row.get("latest_observation_utc")
-                threshold = 15*60 if name=="tfl_bikes" else 27*3600 if name=="met_hourly" else 3*3600
+                threshold = (15*60 if name=="tfl_bikes" else 4*3600 if name=="met_hourly"
+                             else 27*3600 if name=="met_other_daily" else 3*3600)
                 row["stale_data"] = bool(last and name not in ("tfl_roads","tfl_bike_archive","tfl_road_archive") and
                                          now-datetime.fromisoformat(last)>timedelta(seconds=threshold))
                 jobs.append(row)

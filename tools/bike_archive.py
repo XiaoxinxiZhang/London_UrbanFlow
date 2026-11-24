@@ -4,11 +4,13 @@ from collections import defaultdict
 import csv
 from datetime import date, datetime, timedelta, timezone
 import hashlib
+import http.client
 import io
 import json
 import math
 import re
 import sys
+import time
 from urllib.error import HTTPError
 
 import live_store as store
@@ -22,6 +24,8 @@ ARCHIVE_SOURCE = "public_archive"
 ARCHIVE_FRESH_SECONDS = 20 * 60
 OBSERVATION_COLUMNS = ("query_time", "place_id", "bikes", "empty_docks", "docks")
 STATION_COLUMNS = ("place_id", "common_name", "lat", "lon", "valid_from", "valid_to")
+READ_ATTEMPTS = 3
+RETRY_HTTP_STATUSES = {429, 500, 502, 503, 504}
 # A batch with no bike and no free dock anywhere is an upstream feed failure,
 # not an inventory state: TfL cannot have 0 bikes and 0 free docks for every
 # station while the static dock count is still populated.
@@ -33,11 +37,25 @@ INVALID_INVENTORY_SQL = """
 
 
 def read_url(url):
-    status, payload = open_https(url, {"User-Agent": "LondonUrbanFlow/1.0"}, timeout=12,
-                                 prefer_curl=sys.platform == "win32")
-    if status != 200:
-        raise HTTPError(url, status, "archive request failed", None, None)
-    return payload
+    last_error = None
+    for attempt in range(READ_ATTEMPTS):
+        try:
+            status, payload = open_https(url, {"User-Agent": "LondonUrbanFlow/1.0"},
+                                         timeout=20, prefer_curl=True)
+            if status == 200:
+                return payload
+            last_error = HTTPError(url, status, "archive request failed", None, None)
+            if status not in RETRY_HTTP_STATUSES:
+                raise last_error
+        except HTTPError as error:
+            if error.code not in RETRY_HTTP_STATUSES:
+                raise
+            last_error = error
+        except (OSError, TimeoutError, http.client.HTTPException) as error:
+            last_error = error
+        if attempt < READ_ATTEMPTS - 1:
+            time.sleep(0.5 * (attempt + 1))
+    raise last_error
 
 
 def csv_rows(payload, columns):

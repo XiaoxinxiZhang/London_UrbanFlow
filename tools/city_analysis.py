@@ -1,8 +1,10 @@
 """Time-aligned observations and spatial queries for the city dashboard."""
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 import json
 import math
+from pathlib import Path
 
 from bike_archive import ARCHIVE_FRESH_SECONDS, ARCHIVE_SOURCE
 from live_sources import POLLUTANTS, WEATHER_UNITS
@@ -174,6 +176,43 @@ def ring_contains(point, ring):
     return inside
 
 
+@lru_cache(maxsize=1)
+def borough_boundaries():
+    path = Path(__file__).resolve().parents[1] / "data" / "london_boroughs_2025.geojson"
+    with path.open(encoding="utf-8") as handle:
+        features = json.load(handle)["features"]
+    boundaries = []
+    for feature in features:
+        name = feature["properties"]["LAD25NM"]
+        geometry = feature["geometry"]
+        polygons = [geometry["coordinates"]] if geometry["type"] == "Polygon" else geometry["coordinates"]
+        for rings in polygons:
+            outer = rings[0]
+            bounds = (min(p[0] for p in outer), min(p[1] for p in outer),
+                      max(p[0] for p in outer), max(p[1] for p in outer))
+            boundaries.append((name, bounds, rings))
+    return boundaries
+
+
+def borough_at(longitude, latitude):
+    if not valid_coordinate(longitude, latitude):
+        return None
+    point = (longitude, latitude)
+    for name, (west, south, east, north), rings in borough_boundaries():
+        if (west <= longitude <= east and south <= latitude <= north
+                and ring_contains(point, rings[0])
+                and not any(ring_contains(point, hole) for hole in rings[1:])):
+            return name
+    return None
+
+
+def location_borough(location):
+    metadata = json.loads(location["metadata_json"])
+    if location["source"] == "laqn":
+        return borough_at(location["longitude"], location["latitude"]) or metadata.get("Borough")
+    return metadata.get("Borough")
+
+
 def polygon_distance(point, rings):
     if not rings:
         return math.inf
@@ -337,9 +376,8 @@ class CityAnalysis:
                 candidates = [r for r in rows if r["value_num"] is not None and
                               (location["source"]!="laqn" or r["period_seconds"]==period)]
                 point = candidates[-1] if candidates else None
-            metadata = json.loads(location["metadata_json"])
             properties = dict(source=location["source"],id=location["source_id"],name=location["name"],
-                              kind=location["kind"],borough=metadata.get("Borough"),metric=metric,
+                              kind=location["kind"],borough=location_borough(location),metric=metric,
                               value=point["value_num"] if point else None,
                               observed_at=(point.get("time") or point["valid_at_utc"]) if point else None,
                               unit=point["unit"] if point else None,quality=point["quality"] if point else None,
@@ -557,9 +595,11 @@ class CityAnalysis:
             table = BIKE_SNAPSHOT_TABLES[source]
             stations = [dict(id=row["source_id"], name=row["name"] or row["source_id"],
                              coordinates=bike_coordinates(row), bikes=bike_count(row["bikes"]),
-                             empty_docks=bike_count(row["empty_docks"]), capacity=bike_count(row["capacity"]))
+                             empty_docks=bike_count(row["empty_docks"]), capacity=bike_count(row["capacity"]),
+                             source_modified=row["source_modified_utc"] if source == "tfl" else None)
                         for row in db.execute(f"""
-                SELECT source_id,name,longitude,latitude,bikes,empty_docks,capacity
+                SELECT source_id,name,longitude,latitude,bikes,empty_docks,capacity,
+                       {"source_modified_utc" if source == "tfl" else "NULL AS source_modified_utc"}
                 FROM {table} WHERE captured_at_utc=? ORDER BY source_id""", (captured_at,))]
         return dict(captured_at=captured_at, stations=stations, **bike_batch_metadata(source))
 
@@ -669,7 +709,7 @@ class CityAnalysis:
             hourly_total = max(1,math.ceil(((cursor or end)-start).total_seconds()/3600))
             boroughs = {}
             for location in capable:
-                borough = json.loads(location["metadata_json"]).get("Borough") or "行政区未提供"
+                borough = location_borough(location) or "行政区未提供"
                 item = boroughs.setdefault(borough,dict(name=borough,stations=0,valid_hours=0))
                 item["stations"]+=1
                 item["valid_hours"]+=len(hourly(groups.get(location["source_id"],[])))

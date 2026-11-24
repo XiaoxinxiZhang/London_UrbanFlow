@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import bike_archive
@@ -36,6 +37,14 @@ class BikeArchiveTests(unittest.TestCase):
         self.addCleanup(self.db.close)
         self.api = LiveAPI(self.path).analysis
         self.now = datetime(2026, 11, 22, 12, tzinfo=timezone.utc)
+
+    def test_download_retries_network_error_with_curl(self):
+        with patch.object(bike_archive, "open_https", side_effect=[OSError("network unreachable"),
+                                                                    (200, b"archive")]) as request:
+            with patch.object(bike_archive.time, "sleep"):
+                self.assertEqual(bike_archive.read_url("https://example.test/data.csv"), b"archive")
+        self.assertEqual(request.call_count, 2)
+        self.assertTrue(all(call.kwargs["prefer_curl"] for call in request.call_args_list))
 
     def test_retries_failed_files_and_deduplicates_a_compacted_day(self):
         older = self.now - timedelta(days=5)

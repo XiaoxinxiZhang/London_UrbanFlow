@@ -1,5 +1,10 @@
 # Runtime observations and local collector state
+# `/data/live` (no trailing slash) also ignores the symlink used when the data
+# directory lives on a local disk; `/data/live.nfs-*` keeps migration rollback
+# copies out of the repository.
 /data/live/
+/data/live
+/data/live.nfs-*
 
 # Local rollback archives
 /backups/
@@ -28,6 +33,8 @@ __pycache__/
 .venv/
 .env
 .env.*
+# Local FRP tunnel configuration: contains relay credentials, never commit it.
+/frpc.toml
 *.log
 *.bak
 *.tmp

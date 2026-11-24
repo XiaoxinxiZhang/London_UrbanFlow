@@ -11,7 +11,10 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 
 ROOT = Path(__file__).resolve().parent.parent
-DB = ROOT / 'data' / 'live' / 'airwatch_live.sqlite3'
+sys.path.insert(0, str(ROOT / 'tools'))
+import live_store as store  # noqa: E402 - tools/ is not an importable package
+
+DB = store.default_db()
 NOW = datetime.now(timezone.utc)
 CUTOFF = (NOW - timedelta(hours=48)).isoformat(timespec='seconds')
 

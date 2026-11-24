@@ -13,7 +13,7 @@ import unittest
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"tools"))
 import live_store as store
 from live_api import LiveAPI
-from city_analysis import EARTH_RADIUS_M, hourly, distance, geometry_distance
+from city_analysis import EARTH_RADIUS_M, borough_at, hourly, distance, geometry_distance
 import live_sources as parsers
 import traffic_history
 
@@ -53,6 +53,18 @@ class CityAnalysisTests(unittest.TestCase):
         self.db.close()
         self.temp.cleanup()
 
+    def test_laqn_borough_coverage_uses_station_coordinates(self):
+        self.assertEqual(borough_at(-.1, 51.5), "Southwark")
+        self.assertEqual(borough_at(-.1276, 51.5074), "Westminster")
+        self.assertIsNone(borough_at(.055657, 50.91122))
+
+        series = self.api.series(self.params)
+        self.assertEqual(series["boroughs"], [
+            {"name": "Southwark", "stations": 1, "valid_hours": 30, "coverage": 1}
+        ])
+        feature = self.api.map(self.params)["air"]["features"][0]
+        self.assertEqual(feature["properties"]["borough"], "Southwark")
+
     def test_hourly_preference_and_minimum_quarter_capture(self):
         def row(minute,value,period=900):
             return dict(value_num=value,valid_at_utc=(self.base+timedelta(minutes=minute)).isoformat(),
@@ -67,12 +79,12 @@ class CityAnalysisTests(unittest.TestCase):
         def at(minute):
             return (self.base + timedelta(minutes=minute)).isoformat()
 
-        def add_station(minute, site, meters, bikes, docks, name=None):
+        def add_station(minute, site, meters, bikes, docks, name=None, modified=None):
             latitude = 51.5001 + math.degrees(meters / EARTH_RADIUS_M)
             self.db.execute("INSERT INTO bike_snapshots VALUES(?,?,?,?,?,?,?,?,?,?)",
-                            (at(minute), site, name or site, latitude, -.1, bikes, docks, 20, None, "sha"))
+                            (at(minute), site, name or site, latitude, -.1, bikes, docks, 20, modified, "sha"))
 
-        add_station(5, "empty", 50, 0, 3)
+        add_station(5, "empty", 50, 0, 3, modified=at(0))
         add_station(5, "low", 100, 2, 1)
         add_station(5, "full", 150, 3, 0)
         add_station(5, "unknown", 200, None, -1)
@@ -92,6 +104,8 @@ class CityAnalysisTests(unittest.TestCase):
         unknown = next(row for row in frame["stations"] if row["id"] == "unknown")
         self.assertIsNone(unknown["bikes"])
         self.assertIsNone(unknown["empty_docks"])
+        first_frame = self.api.bike_frame({"captured_at": at(5)})
+        self.assertEqual(next(row for row in first_frame["stations"] if row["id"] == "empty")["source_modified"], at(0))
         with self.assertRaises(LookupError):
             self.api.bike_frame({"captured_at": at(16)})
 
@@ -336,7 +350,7 @@ class CityAnalysisTests(unittest.TestCase):
         self.assertEqual([station["id"] for station in result["stations"]],["A"])
         self.assertEqual([row["total"] for row in result["coverage"]],[1])
         self.assertEqual([(row["name"],row["stations"]) for row in result["boroughs"]],
-                         [("行政区未提供",1)])
+                         [("Southwark",1)])
         # A site that never measured this pollutant is dropped rather than
         # charted as an empty line, and the default site stays comparable.
         result=self.api.series({**params,"sites":"B,C,A"})

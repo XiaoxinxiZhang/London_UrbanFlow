@@ -110,7 +110,7 @@ def main(argv=None):
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--year",type=int,default=datetime.now(timezone.utc).year)
     ap.add_argument("--file",type=Path,help="official Westminster ZIP file")
-    ap.add_argument("--db",type=Path,default=store.DB)
+    ap.add_argument("--db",type=Path,default=store.default_db())
     args=ap.parse_args(argv)
     path=args.file or store.LIVE/"imports"/f"westminster_{args.year}.zip"
     db=store.connect(args.db)

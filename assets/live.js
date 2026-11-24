@@ -92,7 +92,7 @@
   }
   function measurementCell(row) {
     if (!row) return '<span class="muted">—</span>';
-    const limit = state.source === "tfl" ? 15 * 60 : state.source === "metoffice" ? 27 * 3600 : 3 * 3600;
+    const limit = state.source === "tfl" ? 15 * 60 : state.source === "metoffice" ? 4 * 3600 : 3 * 3600;
     const stale = Date.now() - Date.parse(row.valid_at_utc) > limit * 1000;
     const value = row.value_num === null ? row.value_text : Number(row.value_num).toLocaleString("zh-CN", { maximumFractionDigits: 5 });
     const unit = row.unit || (state.source === "metoffice" ? "单位未提供" : "");

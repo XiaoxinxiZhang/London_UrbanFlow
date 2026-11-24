@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -8,6 +9,16 @@ import secure_curl
 
 
 class SystemProxyTests(unittest.TestCase):
+    @mock.patch.object(secure_curl.urllib.request, "proxy_bypass", return_value=False)
+    @mock.patch.object(secure_curl.urllib.request, "getproxies", return_value={})
+    def test_project_proxy_used_when_scheduled_process_has_no_proxy_env(self, _proxies, _bypass):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "outbound_proxy.txt"
+            path.write_text("http://127.0.0.1:17898\n", encoding="utf-8")
+            with mock.patch.object(secure_curl, "PROJECT_PROXY_FILE", path):
+                self.assertEqual(secure_curl._system_proxy_for("https://api.tfl.gov.uk/BikePoint"),
+                                 "http://127.0.0.1:17898")
+
     @mock.patch.object(secure_curl.urllib.request, "proxy_bypass", return_value=False)
     @mock.patch.object(secure_curl.urllib.request, "getproxies",
                        return_value={"https": "127.0.0.1:7890"})

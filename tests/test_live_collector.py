@@ -140,6 +140,35 @@ class ParserTests(unittest.TestCase):
 
 
 class StoreTests(unittest.TestCase):
+    def test_metoffice_london_refreshes_hourly_and_other_sites_daily(self):
+        now = datetime.now(timezone.utc)
+        for sid, area in (("london", "Greater London"), ("surrey", "Surrey")):
+            s.location(self.db, "metoffice", sid, metadata={"area": area})
+        calls = []
+
+        class WeatherFetcher:
+            raw_root = Path(self.temp.name)
+
+            def get(self, source, job, url, headers):
+                calls.append((job, url.rsplit("/", 1)[-1]))
+                return [{"datetime": now.replace(minute=0, second=0, microsecond=0).isoformat(),
+                         "temperature": 10}], "sample-sha"
+
+            def mark(self, *args):
+                pass
+
+        scheduled = tuple(row for row in collector.SCHEDULE if row[0] in ("met_hourly", "met_other_daily"))
+        self.assertEqual([(job, interval) for job, _, interval in scheduled],
+                         [("met_hourly", 3600), ("met_other_daily", 86400)])
+        fetcher = WeatherFetcher()
+        with patch.object(collector, "SCHEDULE", scheduled), patch.object(collector, "credential", return_value="key"):
+            collector.run_once(self.db, fetcher, now)
+            self.assertEqual(calls, [("met_hourly", "london"), ("met_other_daily", "surrey")])
+            self.assertEqual(self.db.execute("SELECT COUNT(*) FROM measurements WHERE source='metoffice'").fetchone()[0], 2)
+            calls.clear()
+            collector.run_once(self.db, fetcher, now + timedelta(hours=1, seconds=5))
+            self.assertEqual(calls, [("met_hourly", "london")])
+
     def test_due_bikes_refresh_before_slow_collection_jobs(self):
         now = datetime.now(timezone.utc)
         fetcher = collector.Fetcher(self.db, raw_root=Path(self.temp.name))
@@ -175,7 +204,7 @@ class StoreTests(unittest.TestCase):
                                            "to":args["endTime"][0],
                                            "cols":["ts","NO2","NO2Index","PM25","PM25Index"]},
                                     "data":[[1794920400000,6.0,1,3.47,2]]}).encode()
-        with patch.object(collector,"MIN_REQUEST_GAP",0):
+        with patch.object(collector,"MIN_REQUEST_GAP",0), patch.object(collector,"BREATHE_CHART_BATCH_LIMIT",4):
             f = collector.Fetcher(self.db, raw_root=Path(self.temp.name), transport=transport)
             self.assertEqual(collector.breathe_web_hourly(self.db, f, now)[0],10)
             self.assertEqual(collector.breathe_web_reconcile(self.db, f, now)[0],4)
@@ -192,6 +221,36 @@ class StoreTests(unittest.TestCase):
           FROM measurements WHERE source_id='BL0027' AND time_basis=? ORDER BY metric""",
           (p.BREATHE_CHART_BASIS,))], [("NO2_CONCENTRATION",6.0,2),("PM25_CONCENTRATION",3.47,1)])
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM measurement_versions").fetchone()[0],5)
+
+    def test_breathe_chart_rechecks_stale_sites_before_daily_cooldown(self):
+        now = datetime(2026, 11, 17, 15, tzinfo=timezone.utc)
+        for sid in ("BL0001", "BL0002", "BL0003", "BL0004"):
+            s.location(self.db, "breathe", sid, active=True)
+        for sid, hour in (("BL0001", 10), ("BL0002", 14), ("BL0004", 10)):
+            stamp = now.replace(hour=hour).isoformat(timespec="seconds")
+            for metric in ("PM25_CONCENTRATION", "NO2_CONCENTRATION"):
+                s.measurement(self.db, "breathe", sid, metric, stamp, stamp, 3600,
+                              p.BREATHE_MAP_BASIS, value_num=5)
+        for sid, attempt in (("BL0001", 13), ("BL0002", 13), ("BL0004", 14)):
+            stamp = now.replace(hour=attempt, minute=30 if sid == "BL0004" else 0).isoformat(timespec="seconds")
+            self.db.execute("INSERT INTO breathe_chart_state VALUES(?,?,?,NULL)", (sid, stamp, stamp))
+        self.db.commit()
+        calls = []
+
+        class Fetcher:
+            def get(self, source, job, url):
+                args = parse_qs(urlsplit(url).query)
+                sid = args["SiteCode"][0]
+                calls.append(sid)
+                return {"meta": {"site": sid, "from": args["startTime"][0],
+                                 "to": args["endTime"][0], "cols": ["ts", "NO2", "PM25"]},
+                        "data": []}, "sha"
+
+            def mark(self, *args):
+                pass
+
+        self.assertEqual(collector.breathe_web_reconcile(self.db, Fetcher(), now), (0, None))
+        self.assertEqual(calls, ["BL0003", "BL0001"])
 
     def test_breathe_chart_access_errors_end_batch_and_timeout_preserves_data(self):
         now = datetime(2026,11,17,15,tzinfo=timezone.utc)
@@ -304,10 +363,13 @@ class StoreTests(unittest.TestCase):
 
     def test_road_job_uses_source_update_time(self):
         payload=[{"id":"E1","status":"Active","lastModifiedTime":"2026-11-17T01:00:00Z"}]
+        requested=[]
         def transport(url,headers):
+            requested.append(url)
             return 200,json.dumps(payload).encode()
         f=collector.Fetcher(self.db,raw_root=Path(self.temp.name),transport=transport)
         count,latest=collector.tfl_roads(self.db,f,datetime(2026,11,17,3,tzinfo=timezone.utc))
+        self.assertEqual(requested,[collector.TFL+"/Road/all/Disruption?stripContent=false"])
         self.assertEqual(count,1)
         self.assertEqual(latest,"2026-11-17T01:00:00+00:00")
         self.assertEqual(self.db.execute("SELECT latest_observation_utc FROM fetch_runs").fetchone()[0],latest)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,6 +12,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LIVE = ROOT / "data" / "live"
 DB = LIVE / "airwatch_live.sqlite3"
+
+
+def default_db():
+    """Return the database path, honouring the URBANFLOW_DB override.
+
+    The dashboard, the scheduled collector and the maintenance tools all use
+    this helper so a database kept outside the project directory (for example
+    a local disk instead of a network share) has one documented switch.
+    """
+    return Path(os.environ.get("URBANFLOW_DB") or DB)
 
 
 def utcnow():
@@ -28,7 +39,12 @@ def utc_or_none(value):
 
 def connect(path=DB):
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    parent = path.parent
+    if parent.is_symlink() and not parent.resolve().exists():
+        # The data directory was moved but its symlink target is gone: report
+        # the real cause instead of a bare FileExistsError from mkdir().
+        raise RuntimeError(f"数据库目录的软链接目标不存在: {parent.resolve()}")
+    parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path, timeout=30)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")

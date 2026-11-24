@@ -41,6 +41,8 @@ Linux 服务器用 cron 定时采集：
 */5 * * * * cd /path/to/London_UrbanFlow && bash scripts/collector.sh >> data/live/collector.log 2>&1
 ```
 
+若服务器直连 TfL 或 Hugging Face 被拒绝，但本机 HTTP 代理可用，可在 `data/live/outbound_proxy.txt` 中只写一行代理地址，例如 `http://127.0.0.1:17898`。该文件已被 Git 忽略；采集器在没有系统 HTTPS 代理环境变量时读取它，并只接受不含用户名和密码的代理地址。TfL 实时采集与自行车公开归档下载都优先使用 curl，因此网页更新和 cron 启动的采集子进程也能使用此代理。先确认代理服务长期运行，再配置该文件。
+
 Windows 用任务计划程序：
 
 ```powershell
@@ -51,18 +53,18 @@ powershell -ExecutionPolicy Bypass -File tools\install_live_task.ps1 -Python .\.
 
 ## 数据与时间
 
-数据库是 `data/live/airwatch_live.sqlite3`；压缩原始响应在 `data/live/raw/<来源>/<UTC日期>/`，默认保留 90 天。结构化记录长期保留。站点以 `(source, source_id)` 区分，不因名称相同而合并。数据库采用 UTC ISO 时间，同时保留原始时间文本和 `time_basis`。TfL 停靠站如无源时间，则以获取时间记一条快照并标记 `retrieval_time`；这不代表设备实际观测时间。气象局的 geohash/区域名不等于气象站精确经纬度，因此坐标保持空值。
+数据库默认是 `data/live/airwatch_live.sqlite3`（可用 `URBANFLOW_DB` 覆盖，Web 服务、采集、`diagnose_data.py` 和备份工具统一读取该变量）；压缩原始响应在 `data/live/raw/<来源>/<UTC日期>/`，默认保留 90 天。`tools/backup_db.py` 可在采集运行时生成一致性备份。结构化记录长期保留。站点以 `(source, source_id)` 区分，不因名称相同而合并。数据库采用 UTC ISO 时间，同时保留原始时间文本和 `time_basis`。TfL 停靠站如无源时间，则以获取时间记一条快照并标记 `retrieval_time`；这不代表设备实际观测时间。气象局的 geohash/区域名不等于气象站精确经纬度，因此坐标保持空值。
 
 `measurements` 按指标保存浓度、指数、气象值或自行车数。浓度和指数使用不同 `metric`；缺失或负值不填零。LAQN 小时浓度接口未提供逐值质量标记，因此存 `U`；15 分钟 CSV 则保留 `P`（暂定）或 `R`（已审定）。两种浓度使用同一 `metric`，以 `period_seconds=3600` 或 `900` 区分。`road_events` 保存当前道路事件，`event_versions` 和 `measurement_versions` 保存变更前的版本。`fetch_runs` 留存每次请求的 HTTP 状态、耗时（`duration_ms`）、解析计数、最新观测时间和响应 SHA256；`job_state` 供到期判断与 `status` 命令使用。
 
 ## 来源与限制
 
 - LAQN：[接口目录](https://api.erg.ic.ac.uk/AirQuality/help)与[15 分钟 CSV 说明](https://www.londonair.org.uk/london/asp/datadownload.asp)。每日动态发现伦敦组活动站。每小时收录 PM₁₀ 和 O₃ 的最新小时指数，获取最近约 48 小时的小时浓度，并逐站下载四种污染物的 15 分钟 CSV。CSV 首次补取最近 7 天，之后每小时重取最近约 48 小时以接收修订。CSV 的 `ReadingDateTime` 是观测时段开始时间，但无时区标识；经与 LAQN GMT 小时标签及英国夏令时切换日的 96 个时段核对后，按 GMT 解释，并在 `time_basis` 标记该推断。普通质量浓度单位规范为 `ug/m3`；若颗粒物的单位注明 `reference equiv by VCM` 等换算信息，则原样保留。CSV 的 15 分钟粒度不保证 15 分钟发布延迟；各站是否有值以原始文件为准。该来源建议由单一采集端代理和缓存，勿让每个浏览器直接轮询。
-- Breathe London：`breathe_web_hourly` 每小时读取[官网地图数据](https://www.breathelondon.org/api/air-quality.json)，更新站点目录和 PM₂.₅、NO₂ 浓度。每个指标使用自己的来源时间。随后 `breathe_web_reconcile` 每次最多为 4 个活动站补查最近 48 小时的[站点曲线](https://www.breathelondon.org/sensors/sensor-profile?sitecode=BL0027)。补查成功后间隔至少 24 小时，单站失败后间隔至少 1 小时。SQLite 保存每站进度。相同观测优先使用曲线记录，保留修订历史，质量状态为 `U`。用 `status` 查看最新观测和 `breathe_web_coverage`，后者统计过去 24 小时成功补查的活动站及最近一次补查失败的活动站。成功补查也可能返回空序列。
+- Breathe London：`breathe_web_hourly` 每小时读取[官网地图数据](https://www.breathelondon.org/api/air-quality.json)，更新站点目录和 PM₂.₅、NO₂ 浓度。每个指标使用自己的来源时间。随后 `breathe_web_reconcile` 每次最多为 12 个活动站补查最近 48 小时的[站点曲线](https://www.breathelondon.org/sensors/sensor-profile?sitecode=BL0027)。优先补查尚未检查的站；已检查站在观测超过 3 小时且距上次成功补查至少 1 小时后可再次补查，其他成功站至少间隔 24 小时，单站失败后至少间隔 1 小时。SQLite 保存每站进度。相同观测优先使用曲线记录，保留修订历史，质量状态为 `U`。用 `status` 查看最新观测和 `breathe_web_coverage`，后者统计过去 24 小时成功补查的活动站及最近一次补查失败的活动站。成功补查也可能返回空序列。
 
 旧版写入的 PM₂.₅ 和 NO₂ 指数留存于 SQLite，数据中心查询会滤掉这两项。上游原始响应按现有保留期归档。
-- TfL：[统一 API](https://api.tfl.gov.uk/) 与 [API 产品说明](https://api-portal.tfl.gov.uk/products)。匿名访问目前限每分钟 50 次，本项目每 5 分钟仅请求自行车和道路各一次，因此无需密钥。Windows 上优先使用系统 `curl.exe`，Linux 使用 `curl`；Windows 若 Internet Settings 配置了不含账号密码的代理，采集器会让 curl 显式复用该代理（curl 本身不会自动读取此设置）。TLS 证书验证保持开启。采集停靠站状态与当前道路扰动；事件不是交通流量。道路接口失败时不会把旧事件误判为已结束。
-- 英国气象局：[地面观测](https://datahub.metoffice.gov.uk/docs/o/category/observations/overview)。首次全国采集运行 `python tools/collect_met_all.py`：通过英国范围坐标及每次最多五个邻近 geohash 发现站点，去重后逐站获取最近 48 小时的小时观测；进度保存在 `data/live/metoffice_national_bootstrap.json`，中断后可重跑。已发现且有观测的站点进入常规每日采集；中心与四方锚点仍每日检查伦敦附近站点。九项天气字段按官方样本解析；数值单位按 Met Office Land Observations 产品 Glossary 固定写入（温度 °C、湿度 %、气压 hPa、风速与阵风 m/s、能见度 m），风向、天气代码和气压倾向属于代码值，单位留空。启动服务时会把历史气象记录中缺失的单位补齐一次。
+- TfL：[统一 API](https://api.tfl.gov.uk/) 与 [API 产品说明](https://api-portal.tfl.gov.uk/products)。匿名访问目前限每分钟 50 次，本项目每 5 分钟仅请求自行车和道路各一次，因此无需密钥。采集器优先使用系统 curl；Windows 若 Internet Settings 配置了不含账号密码的代理，采集器会让 curl 显式复用该代理（curl 本身不会自动读取此设置）。TLS 证书验证保持开启。采集停靠站状态与当前道路扰动；事件不是交通流量。道路接口失败时不会把旧事件误判为已结束。
+- 英国气象局：[地面观测](https://datahub.metoffice.gov.uk/docs/o/category/observations/overview)。官方逐小时发布最近 48 小时的观测；项目每小时采集 Greater London 站点，其他已收录站点每日采集，中心与四方锚点每日检查伦敦附近站点。按当前伦敦 3 站计算，逐小时采集约用 72 次/天；API 免费配额为 360 次/天，本地采集器限制为 300 次/天。首次全国采集运行 `python tools/collect_met_all.py`：通过英国范围坐标及每次最多五个邻近 geohash 发现站点，去重后逐站获取最近 48 小时的小时观测；进度保存在 `data/live/metoffice_national_bootstrap.json`，中断后可重跑。九项天气字段按官方样本解析；数值单位按 Met Office Land Observations 产品 Glossary 固定写入（温度 °C、湿度 %、气压 hPa、风速与阵风 m/s、能见度 m），风向、天气代码和气压倾向属于代码值，单位留空。启动服务时会把历史气象记录中缺失的单位补齐一次。
 
 气象局 Land Observations 免费套餐目前允许每天 360 次请求（UTC 日重置）。全国约 150 个站点每天各请求一次，加上 5 次每日伦敦站点查询，通常约 155 次/天；同一响应已包含最近 48 小时，不需要为每个小时单独请求。为给重试和人工检查留余量，常规采集器对自身气象局请求设置每天 300 次的本地上限；首次全国发现脚本的临时上限为每天 350 次，以便在免费额度内完成站点发现和下载。失败的网络尝试也计入，`status` 会显示当天用量。最近站点接口可能返回英国以外地点：这些响应保留在原始归档中，但境外站点不加入常规采集。观测接口返回 404 的站点保留元数据并标为不活动。人工从别的程序使用同一密钥不会出现在本地计数中，仍需留意平台总额度。
 

@@ -24,13 +24,13 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.sites < 1 or args.sites > 100:
         ap.error("--sites must be 1..100")
-    lock = CollectorLock(store.DB)
+    lock = CollectorLock(store.default_db())
     if not lock.acquire():
         print("Another collector is running; try again after it finishes.", flush=True)
         return 2
     db = None
     try:
-        db = store.connect(store.DB)
+        db = store.connect(store.default_db())
         fetcher = c.Fetcher(db)
         now = datetime.now(timezone.utc)
         print("[1/3] Download LAQN site catalogue...", flush=True)

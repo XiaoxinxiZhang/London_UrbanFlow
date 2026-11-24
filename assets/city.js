@@ -1320,7 +1320,9 @@
         (p.empty_docks ?? "—") +
         (archivedBike ? "\n公开归档 · 采集 " : "\n获取 ") +
         time(p.captured_at) +
-        (archivedBike ? "" : "\n来源修改 " + time(p.source_modified));
+        (archivedBike ? "" : "\n来源修改 " + time(p.source_modified)
+          + (p.source_modified && Date.parse(p.captured_at) - Date.parse(p.source_modified) > 3600000
+            ? " · 比快照早超过 1 小时" : ""));
     if (kind === "road") {
       const lines = [p.category, p.severity, p.status, "修改 " + time(p.modified_at)];
       lines.push(p.reconstructed ? "重建 · 无原始快照" :

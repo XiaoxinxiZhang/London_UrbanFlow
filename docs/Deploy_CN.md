@@ -157,7 +157,7 @@ python run.py --open
 | --- | --- | --- |
 | `URBANFLOW_HOST` | `127.0.0.1` | 监听地址；服务器用 `0.0.0.0` |
 | `URBANFLOW_PORT` | `8765` | 监听端口 |
-| `URBANFLOW_DB` | `data/live/airwatch_live.sqlite3` | SQLite 数据库路径 |
+| `URBANFLOW_DB` | `data/live/airwatch_live.sqlite3` | SQLite 数据库路径（Web 服务、采集、诊断和备份脚本统一读取） |
 | `URBANFLOW_TRUSTED_HOSTS` | 空 | 逗号分隔的允许 Host；为空时不限制 |
 | `URBANFLOW_TRUSTED_ORIGINS` | 空 | 逗号分隔的额外允许 POST Origin |
 | `URBANFLOW_PYTHON` | 自动查找 | `scripts/*.sh` 使用的 Python 解释器 |
@@ -234,7 +234,7 @@ python tools/collect_live.py run-once
 python tools/diagnose_data.py
 ```
 
-首次启动时 `data/live/` 可能不存在，Flask 会自动创建空数据库和表结构。打开页面后点击“更新数据”即可开始采集，或在终端运行 `run-once`。
+首次启动时 `data/live/` 可能不存在，Flask 会自动创建空数据库和表结构。如果 `data/live` 是指向本地磁盘的软链接而目标已经丢失，服务会明确报“数据库目录的软链接目标不存在”，不会静默创建空库。打开页面后点击“更新数据”即可开始采集，或在终端运行 `run-once`。
 
 ## 6. 常见问题
 
@@ -278,7 +278,63 @@ sed -i 's/\r$//' scripts/*.sh
 
 ### 数据库太大或需要备份
 
-停止服务后复制整个 `data/live/`。SQLite 使用 WAL 模式，在线备份建议使用 SQLite 的备份命令，或先停止采集和服务。
+SQLite 使用 WAL 模式，不要在服务运行时直接 `cp` 主库文件。用项目自带的在线备份工具生成一致性快照（内部调用 SQLite backup API，采集和服务可以继续运行）：
+
+```bash
+.venv/bin/python tools/backup_db.py                    # 写入 backups/，默认保留最近 7 份
+.venv/bin/python tools/backup_db.py --keep 14          # 调整保留份数
+.venv/bin/python tools/backup_db.py --db /path/to.sqlite3 --dest /path/to/backups
+```
+
+`backups/` 已被 `.gitignore` 忽略。建议加入 cron：
+
+```cron
+17 3 * * * cd /path/to/London_UrbanFlow && .venv/bin/python tools/backup_db.py >> backups/backup.log 2>&1
+```
+
+需要离线迁移或整目录备份时，先停服务、停 cron、等采集进程退出，再复制：
+
+```bash
+sqlite3 data/live/airwatch_live.sqlite3 "PRAGMA wal_checkpoint(TRUNCATE);"   # 首字段须为 0
+```
+
+### 把数据库放在本地磁盘（网络盘部署）
+
+SQLite 的 WAL 不适合放在 NFS 等网络文件系统上：锁语义不可靠，随机 I/O 也会明显变慢（同一份数据冷读可慢 10–100 倍）。推荐把整个 `data/live` 目录迁到本地 ext4/xfs，再在原位置保留目录软链接，这样 Web 服务、cron、`diagnose_data.py` 等入口都不需要改路径：
+
+```bash
+# 1) 停写：网页服务、cron、仍在运行的采集
+tmux kill-session -t urbanflow
+crontab -l > /tmp/crontab.backup
+crontab -l | sed 's|^\(\*/5 .*collector\.sh.*\)$|#\1|' | crontab -
+pgrep -af "run.py|collect_live.py" || echo "无写者"
+
+# 2) 确认干净的 WAL（首字段 0 = 没有其他连接持有数据库）
+sqlite3 data/live/airwatch_live.sqlite3 "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA integrity_check;"
+
+# 3) 复制并核对两侧统计
+DST=/var/tmp/london-urbanflow/live
+mkdir -p "$DST" && chmod 700 /var/tmp/london-urbanflow "$DST"
+cp -a data/live/. "$DST"/
+sqlite3 "$DST/airwatch_live.sqlite3" "PRAGMA quick_check;"
+
+# 4) 切换：旧目录留作回滚副本，原位置改成软链接
+mv data/live "data/live.nfs-$(date +%F)"
+ln -s "$DST" data/live
+readlink -f data/live
+
+# 5) 恢复 cron 并重启
+crontab /tmp/crontab.backup
+bash scripts/tmux.sh start
+```
+
+注意事项：
+
+- **必须整目录迁移**。只给 `airwatch_live.sqlite3` 文件做软链接时，SQLite 会按传入路径把 `-wal`/`-shm` 写回原目录，既没有提速也有损坏风险。
+- `/var/tmp` 在常见发行版上是本地磁盘（重启保留），但 `systemd-tmpfiles` 默认清理 30 天未访问的文件；持续采集的目录不会命中，长期停服前应改用管理员创建的 `/var/lib/<应用名>` 目录并把软链接指过去。
+- 迁移后 `data/live` 是软链接；`.gitignore` 同时忽略该软链接和 `data/live.nfs-*` 回滚副本。
+- 回滚：停服务 → 删除软链接 → 把 `data/live.nfs-<日期>` 改回 `data/live` → 恢复 cron → 重启。
+- 本地目录丢失时，用 `tools/backup_db.py` 生成在 `backups/` 的最新快照恢复。
 
 ## 7. 安全清单
 
