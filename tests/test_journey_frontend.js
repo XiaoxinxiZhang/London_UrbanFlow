@@ -8,6 +8,11 @@ async function testJourney() {
   const sources = new Map();
   const layers = new Map();
   const requests = [];
+  const windowListeners = {};
+  const win = {
+    AirWatchCity: {getMap: () => map, showPage() {}},
+    addEventListener(name, handler) { windowListeners[name] = handler; },
+  };
   let styleReady = true;
   let routeFits = 0;
   let focused;
@@ -35,9 +40,9 @@ async function testJourney() {
   element("journeyMode").value = "walk";
   element("maxWalk").value = "1000";
   vm.runInNewContext(fs.readFileSync(require.resolve("../assets/journey.js"), "utf8"), {
-    window: {AirWatchCity: {getMap: () => map, showPage() {}}},
+    window: win,
     document: {getElementById: element, querySelector: () => null},
-    AbortController,
+    AbortController, setTimeout, clearTimeout,
     fetch(_url, {body, signal}) {
       return new Promise(resolve => requests.push({payload: JSON.parse(body), signal, resolve}));
     },
@@ -162,6 +167,7 @@ async function testJourney() {
   };
   resolve({ok: true, json: async () => ({
     mode: "shared_bike", message: "自行车快照缺失或超过 15 分钟", alternatives: [], alerts: [],
+    fallback: {reason: "bike_unavailable"},
     legs: [{kind: "walk", distance_m: 850, duration_s: 600,
       geometry: {type: "LineString", coordinates: [payload.start, payload.end]}}],
     context: {route_air: routeAir, daqi: {status: "fresh", index: 2, band: "低", observed_at: observedAt}},
@@ -172,15 +178,23 @@ async function testJourney() {
   assert.doesNotMatch(result.innerHTML, /沿途浓度估计|DAQI/);
   const [table] = environment.innerHTML.match(/<table class="journey-air-table">[\s\S]*?<\/table>/);
   assert.match(table, /<th scope="col">LAQN<\/th><th scope="col">Breathe London<\/th>/);
-  assert.match(table, /PM₂.₅<\/th><td>[\s\S]*?0 µg\/m³[\s\S]*?覆盖 25%[\s\S]*?最高路段 0 米–213 米/);
+  assert.match(table, /PM<sub>2\.5<\/sub><\/th><td>[\s\S]*?0 µg\/m³[\s\S]*?覆盖 25%[\s\S]*?最高路段 0 米–213 米/);
   assert.match(table, /4–4.4 µg\/m³[\s\S]*?覆盖 100%[\s\S]*?最高路段 213 米–850 米/);
-  assert.match(table, /PM₁₀<\/th><td>.*站点不足.*覆盖 0%/);
+  assert.match(table, /PM<sub>10<\/sub><\/th><td>.*站点不足.*覆盖 0%/);
   assert.match(environment.innerHTML, /<summary>按距离查看各段/);
   assert.match(environment.innerHTML, /<summary>213 米–850 米 · 步行/);
   assert.match(environment.innerHTML, /14 站 · 最近 614 米 · 最新 2026-11-22T06:00:00Z/);
   assert.match(environment.innerHTML, /大伦敦官方 DAQI[\s\S]*?2 · 低[\s\S]*?查看 Defra 分人群指导/);
   assert.equal(environmentPanel.hidden, false);
   assert.equal(routeFits, previousFits);
+  // A display-timezone change reformats the visible route text without moving
+  // the map (no fitBounds) and without dropping the current result.
+  const timezoneFits = routeFits;
+  win.AirWatchData = {time: value => value ? "TZ:" + value : "—"};
+  windowListeners["airwatch:timezone"]();
+  assert.equal(routeFits, timezoneFits);
+  assert.match(environment.innerHTML, /TZ:2026-11-22T06:00:00Z/);
+  win.AirWatchData = undefined;
   assert.equal(layers.size, 0);
   styleReady = true;
   mapEvents.get("style.load")();
@@ -201,6 +215,86 @@ async function testJourney() {
   assert.match(environment.innerHTML, /大伦敦官方 DAQI[\s\S]*?缺失或过期/);
   assert.equal(environmentPanel.hidden, false);
   assert.equal(lines(), 0);
+
+  // A non-JSON gateway error must keep the HTTP status visible to the user.
+  const failedPlan = plan.click();
+  requests[5].resolve({ok: false, status: 502, json: async () => ({})});
+  await failedPlan;
+  assert.match(result.innerHTML, /规划失败（HTTP 502）/);
+  assert.match(environment.innerHTML, /路线规划失败/);
+  assert.equal(plan.disabled, false);
+
+  // Walking clearly beats the best shared-bike itinerary: show the walk and
+  // keep every station pair available as an explicit bike override.
+  const walkFallbackPlan = plan.click();
+  const walkPayload = requests[6].payload;
+  const stationPair = (index, bikes, spaces) => ({
+    pickup: {id: "p" + index, name: "取车站 " + index, bikes},
+    dropoff: {id: "d" + index, name: "还车站 " + index, empty_docks: spaces},
+    duration_s: 300, walk_distance_m: 307,
+  });
+  requests[6].resolve({ok: true, json: async () => ({
+    mode: "shared_bike", alerts: [],
+    message: "步行全程约 2 分钟，共享单车方案约 5 分钟（含取还车步行），已改用更快的步行路线",
+    fallback: {reason: "walk_better", walk_duration_s: 120, bike_duration_s: 300},
+    alternatives: [stationPair(1, 4, 2), stationPair(2, 6, 3)],
+    legs: [{kind: "walk", distance_m: 190, duration_s: 120,
+      geometry: {type: "LineString", coordinates: [walkPayload.start, walkPayload.end]}, steps: []}],
+    context: {route_air: {status: "unavailable"}, daqi: {status: "stale"}},
+  })});
+  await walkFallbackPlan;
+  assert.match(result.innerHTML, /<p class="journey-fallback">步行全程约 2 分钟/);
+  assert.doesNotMatch(result.innerHTML, /当前显示步行备选路线/);
+  assert.match(result.innerHTML, /仍可使用共享单车/);
+  assert.match(result.innerHTML, /data-pickup="p1"/);
+  assert.match(result.innerHTML, /data-pickup="p2"/);
+  assert.doesNotMatch(result.innerHTML, /journey-stops/);
+  assert.equal(lines(), 1);
+
+  const fallbackChoice = result.click({target: {closest: () =>
+    ({dataset: {pickup: "p1", dropoff: "d1"}})}});
+  assert.equal(requests[7].payload.pickup_id, "p1");
+  assert.equal(requests[7].payload.dropoff_id, "d1");
+  requests[7].resolve({ok: true, json: async () => ({
+    mode: "shared_bike", message: null, fallback: null, alerts: [],
+    alternatives: [stationPair(1, 4, 2), stationPair(2, 6, 3)],
+    legs: [
+      {kind: "walk_to_bike", distance_m: 125, duration_s: 120,
+        geometry: {type: "LineString", coordinates: [walkPayload.start, [-.1, 51.5]]}, steps: []},
+      {kind: "cycle", distance_m: 357, duration_s: 60,
+        geometry: {type: "LineString", coordinates: [[-.1, 51.5], [-.09, 51.5]]}, steps: []},
+      {kind: "walk_to_destination", distance_m: 182, duration_s: 180,
+        geometry: {type: "LineString", coordinates: [[-.09, 51.5], walkPayload.end]}, steps: []},
+    ],
+    context: {route_air: {status: "unavailable"}, daqi: {status: "stale"}},
+  })});
+  await fallbackChoice;
+  assert.match(result.innerHTML, /journey-stops/);
+  assert.match(result.innerHTML, /取车站 1/);
+  assert.match(result.innerHTML, /备选站点/);
+  assert.doesNotMatch(result.innerHTML, /journey-fallback/);
+  assert.equal(lines(), 3);
+
+  // Pickup and drop-off resolve to the same station: never show a zero-length
+  // ride. Fall back to walking and keep only distinct station pairs.
+  const sameStationPlan = plan.click();
+  requests[8].resolve({ok: true, json: async () => ({
+    mode: "shared_bike", alerts: [],
+    message: "取车与还车站为同一站点，无法形成共享单车路线，已改用步行路线",
+    fallback: {reason: "same_station"},
+    alternatives: [stationPair(2, 6, 3)],
+    legs: [{kind: "walk", distance_m: 190, duration_s: 120,
+      geometry: {type: "LineString", coordinates: [walkPayload.start, walkPayload.end]}, steps: []}],
+    context: {route_air: {status: "unavailable"}, daqi: {status: "stale"}},
+  })});
+  await sameStationPlan;
+  assert.match(result.innerHTML, /<p class="journey-warning">取车与还车站为同一站点/);
+  assert.doesNotMatch(result.innerHTML, /当前显示步行备选路线/);
+  assert.match(result.innerHTML, /仍可使用共享单车/);
+  assert.match(result.innerHTML, /data-pickup="p2"/);
+  assert.doesNotMatch(result.innerHTML, /data-pickup="p1"/);
+  assert.doesNotMatch(result.innerHTML, /journey-stops/);
+  assert.equal(lines(), 1);
 }
 
 testJourney().then(() => console.log("PASS journey cancels outdated results, preserves current requests and clears the map"))

@@ -1,12 +1,18 @@
 (() => {
   "use strict";
   const METRICS = {
-    PM25_CONCENTRATION: "PM₂.₅", PM10_CONCENTRATION: "PM₁₀", NO2_CONCENTRATION: "NO₂", O3_CONCENTRATION: "O₃",
-    PM10_INDEX: "PM₁₀ 指数", O3_INDEX: "O₃ 指数",
+    PM25_CONCENTRATION: "PM2.5", PM10_CONCENTRATION: "PM10", NO2_CONCENTRATION: "NO2", O3_CONCENTRATION: "O3",
+    PM10_INDEX: "PM10 指数", O3_INDEX: "O3 指数",
     BIKES_AVAILABLE: "可用车辆", DOCKS_EMPTY: "空位", DOCKS_TOTAL: "总停靠位",
     TEMPERATURE: "温度", HUMIDITY: "相对湿度", MSLP: "海平面气压", WIND_SPEED: "风速",
     WIND_DIRECTION: "风向", WIND_GUST: "阵风", VISIBILITY: "能见度", WEATHER_CODE: "天气代码",
     PRESSURE_TENDENCY: "气压变化趋势"
+  };
+  // HTML form for table cells; a real <sub> keeps the PM2.5 point with the digits.
+  const METRIC_HTML = {
+    PM25_CONCENTRATION: "PM<sub>2.5</sub>", PM10_CONCENTRATION: "PM<sub>10</sub>",
+    NO2_CONCENTRATION: "NO<sub>2</sub>", O3_CONCENTRATION: "O<sub>3</sub>",
+    PM10_INDEX: "PM<sub>10</sub> 指数", O3_INDEX: "O<sub>3</sub> 指数",
   };
   function calendarDate(date, zone) {
     const parts = new Intl.DateTimeFormat("en-CA", { timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(date);
@@ -44,8 +50,11 @@
   if (typeof document === "undefined") return;
 
   const $ = id => document.getElementById(id);
-  const state = { source: "laqn", page: 1, total: 0, items: [], status: null, generation: 0, detail: null, detailGeneration: 0, historyPage: 1, updating: false, lastUpdate: Date.now(), timer: null, boundaryPromise: null };
+  const state = { source: "laqn", page: 1, total: 0, items: [], status: null, generation: 0, detail: null, detailGeneration: 0, historyPage: 1, updating: false, lastUpdate: Date.now(), updateStartedAt: 0, updateFinishedAt: null, timer: null, boundaryPromise: null };
+  const DEFAULT_TIMEOUT_MS = 30000;
+  const UPDATE_POLL_MS = 2500, UPDATE_HIDDEN_POLL_MS = 10000, UPDATE_LIMIT_MS = 20 * 60000;
   const escape = value => String(value ?? "—").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
+  const metricHtml = metric => METRIC_HTML[metric] || escape(METRICS[metric] || metric);
   const zone = () => $("timezone").value;
   const roads = () => state.source === "tfl" && $("tflMode").value === "roads";
   function time(value, compact = false) {
@@ -63,11 +72,34 @@
     $(id).hidden = !message;
   }
   async function api(path, params = {}, options = {}) {
+    const { timeoutMs = DEFAULT_TIMEOUT_MS, signal: outerSignal, ...init } = options;
     const query = new URLSearchParams(params).toString();
-    const response = await fetch(path + (query ? "?" + query : ""), { cache: "no-store", ...options });
-    const data = await response.json().catch(() => ({ error: "本地服务返回了无法读取的响应" }));
-    if (!response.ok) throw new Error(data.error || "请求失败");
-    return data;
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+    const forwardAbort = () => controller.abort();
+    if (outerSignal) {
+      if (outerSignal.aborted) controller.abort();
+      else outerSignal.addEventListener("abort", forwardAbort, { once: true });
+    }
+    try {
+      const response = await fetch(path + (query ? "?" + query : ""), { cache: "no-store", ...init, signal: controller.signal });
+      const text = await response.text();
+      let data = null;
+      if (text) {
+        try { data = JSON.parse(text); } catch { data = null; }
+      }
+      if (!response.ok) throw new Error((data && data.error) || "请求失败（HTTP " + response.status + "）");
+      if (data === null) throw new Error("本地服务返回了无法读取的响应");
+      return data;
+    } catch (error) {
+      if (timedOut && error && error.name === "AbortError")
+        throw new Error("请求超时（" + Math.max(1, Math.round(timeoutMs / 1000)) + " 秒），请稍后重试");
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      outerSignal?.removeEventListener?.("abort", forwardAbort);
+    }
   }
   function params() {
     const value = { source: state.source, page: state.page, page_size: $("pageSize").value, active: $("showAll").checked ? "0" : "1", search: $("search").value.trim() };
@@ -103,8 +135,11 @@
       (row.time_basis === "retrieval_time" ? " · 以获取时间记快照" : "") + "</span></div>";
   }
   function responsiveTable(headings, rows, emptyMessage, tableClass = "") {
-    const labels = headings.map(escape);
-    const header = labels.map(label => "<th scope='col' role='columnheader'>" + label + "</th>").join("");
+    // A heading may be {text, html} when the header needs markup such as <sub>;
+    // the text form is reused for the mobile cell labels.
+    const labels = headings.map(heading => typeof heading === "string" ? escape(heading) : escape(heading.text));
+    const headerLabels = headings.map(heading => typeof heading === "string" ? escape(heading) : heading.html);
+    const header = headerLabels.map(label => "<th scope='col' role='columnheader'>" + label + "</th>").join("");
     const records = rows.map(cells => "<tr role='row'>" + cells.map((cell, index) =>
       "<td role='cell'><span class='data-cell-label' aria-hidden='true'>" + labels[index] + "</span>" + cell + "</td>"
     ).join("") + "</tr>").join("");
@@ -173,7 +208,10 @@
       ]);
     } else {
       const metrics = columns();
-      headings = ["站点", state.source === "tfl" ? "坐标" : "类型 / 区域", ...metrics.map(metric => METRICS[metric] || metric)];
+      headings = ["站点", state.source === "tfl" ? "坐标" : "类型 / 区域", ...metrics.map(metric => ({
+        text: METRICS[metric] || metric,
+        html: metricHtml(metric),
+      }))];
       rows = state.items.map((row, index) => {
         const meta = row.metadata || {};
         const info = state.source === "tfl" ? [row.latitude ?? "—", row.longitude ?? "—"].join(", ") : [row.kind, meta.Borough || meta.region || meta.area].filter(Boolean).join(" / ");
@@ -235,24 +273,25 @@
       }
     }
   }
-  const jobNames = { laqn_sites: "站点目录", laqn_hourly: "小时浓度与指数", laqn_15min: "15 分钟浓度", breathe_web_hourly: "官网地图", breathe_web_reconcile: "逐站曲线补查", tfl_bikes: "自行车", tfl_bike_archive: "自行车公开归档补录", tfl_roads: "道路列表", tfl_road_archive: "道路公开归档补录", met_sites: "站点发现", met_hourly: "气象观测" };
+  const jobNames = { laqn_sites: "站点目录", laqn_hourly: "小时浓度与指数", laqn_15min: "15 分钟浓度", laqn_bootstrap: "首次建库采集", breathe_web_hourly: "官网地图", breathe_web_reconcile: "逐站曲线补查", tfl_bikes: "自行车", tfl_bike_archive: "自行车公开归档补录", tfl_roads: "道路列表", tfl_road_archive: "道路公开归档补录", met_sites: "站点发现", met_hourly: "气象观测", met_other_daily: "全国气象站点日更" };
   function jobState(job) {
     const labels = { success: "成功", error: "失败", pending_credentials: "缺少密钥", credentials_error: "密钥配置错误", not_started: "尚未采集" };
     return (labels[job.status] || job.status) + (job.stale_run ? " · 采集过期" : "") + (job.stale_data ? " · 数据过期" : "");
   }
+  const jobParent = job => job.parent_source || job.source;
   function renderStatus() {
     if (!state.status) return;
     const data = state.status;
     for (const source of ["laqn", "breathe", "tfl", "metoffice"]) {
-      const jobs = data.jobs.filter(job => job.source === source);
+      const jobs = data.jobs.filter(job => jobParent(job) === source);
       const issues = jobs.filter(job => job.status !== "success" || job.stale_data || job.stale_run);
-      $("badge-" + source).textContent = issues.length ? issues.length + " 项需关注" : "采集正常";
+      $("badge-" + source).textContent = issues.length ? issues.length + " 项需关注" : jobs.length ? "采集正常" : "暂无任务";
       $("badge-" + source).classList.toggle("warning", issues.length > 0);
     }
-    const jobs = data.jobs.filter(job => job.source === state.source);
+    const jobs = data.jobs.filter(job => jobParent(job) === state.source);
     $("statusSummary").textContent = data.collector_running ? "正在采集" : "按来源采集频率更新";
     const headings = ["任务", "状态", "最近成功", "最新观测 / 修改", "说明"];
-    const rows = jobs.map(job => [escape(jobNames[job.job] || job.job), escape(jobState(job)),
+    const rows = jobs.map(job => [escape(job.display_name || jobNames[job.job] || job.job), escape(jobState(job)),
       escape(time(job.last_success_utc)), escape(time(job.latest_observation_utc)),
       job.error ? "<span class='job-error'>" + escape(job.error) + "</span>" : "—"]);
     let extra = "";
@@ -262,14 +301,23 @@
       responsiveTable(headings, rows, "暂无采集任务", "jobs") + "</div>" + extra;
   }
   async function loadStatus() {
-    state.status = await api("/api/status");
-    const selected = $("region").value;
-    $("region").innerHTML = "<option value=''>全部区域</option>" + state.status.regions.map(region => "<option>" + escape(region) + "</option>").join("");
-    $("region").value = selected;
-    renderStatus();
+    try {
+      const data = await api("/api/status", {}, { timeoutMs: 10000 });
+      state.status = data;
+      const selected = $("region").value;
+      $("region").innerHTML = "<option value=''>全部区域</option>" + data.regions.map(region => "<option>" + escape(region) + "</option>").join("");
+      $("region").value = selected;
+      renderStatus();
+      errorAt("statusError", "");
+    } catch (error) {
+      // Keep the last known jobs on screen: a status read failure must not hide
+      // a successful table update or make an update look failed.
+      errorAt("statusError", "采集状态读取失败：" + error.message);
+      if (!state.status) $("statusSummary").textContent = "状态读取失败";
+    }
   }
   async function refresh(notify = true) {
-    await Promise.all([loadTable(), loadStatus()]);
+    await Promise.allSettled([loadTable(), loadStatus()]);
     if (notify) window.dispatchEvent(new CustomEvent("airwatch:refreshed"));
   }
 
@@ -307,6 +355,23 @@
     $("detail").showModal();
     $("detail").scrollTop = 0;
   }
+  function roadDetailMarkup(data) {
+    const labels = { event_id: "事件 ID", category: "类别", severity: "严重程度", status: "状态", location_text: "道路范围", starts_at_utc: "开始", ends_at_utc: "结束", modified_at_utc: "来源修改", last_seen_utc: "最近见于列表" };
+    if (data.replay_mode === "reconstructed") labels.replayed_at_utc = "回放重建于";
+    const revisions = data.versions.map(version => "<details><summary>版本 " + escape(version.old_revision) +
+      " · 替换于 " + escape(time(version.replaced_at_utc)) + "</summary><pre class='raw-data'>" +
+      escape(prettyJSON(version.old_payload_json)) + "</pre></details>").join("");
+    return (data.replay_mode === "reconstructed" ?
+      "<p class='muted'>该小时没有原始列表快照，事件按前后两次列表的交集重建。</p>" : "") +
+      (data.snapshot_source === "public_road_archive" ?
+        "<p class='muted'>位置和事件状态来自 <a href='https://github.com/farhanmunim/london-buses/commits/main/data/api/roadworks.json' target='_blank' rel='noopener'>公开归档</a> · Powered by TfL Open Data</p>" : "") +
+      "<div class='road-summary'>" + Object.entries(labels).map(([key, label]) => "<p><span>" + label +
+        "</span>" + escape(key.endsWith("_utc") ? time(data[key]) : data[key]) + "</p>").join("") +
+      "</div><details class='road-detail-section'><summary>几何范围</summary><pre class='raw-data'>" +
+      escape(prettyJSON(data.geometry_json)) + "</pre></details>" +
+      (revisions ? "<details class='road-detail-section'><summary>历史版本（" + data.versions.length +
+        "）</summary>" + revisions + "</details>" : "<p class='muted'>暂无修订记录</p>");
+  }
   async function openDetail(index, suppliedRow = null, suppliedSource = null, suppliedRoad = null, initialRange = null) {
     const row = suppliedRow || state.items[index];
     if (!row) return;
@@ -329,21 +394,8 @@
       try {
         const data = await api("/api/road-events", { id: row.event_id, ...(initialRange?.at ? {at: initialRange.at} : {}) });
         if (generation !== state.detailGeneration) return;
-        const labels = { event_id: "事件 ID", category: "类别", severity: "严重程度", status: "状态", location_text: "道路范围", starts_at_utc: "开始", ends_at_utc: "结束", modified_at_utc: "来源修改", last_seen_utc: "最近见于列表" };
-        if (data.replay_mode === "reconstructed") labels.replayed_at_utc = "回放重建于";
-        const revisions = data.versions.map(version => "<details><summary>版本 " + escape(version.old_revision) +
-          " · 替换于 " + escape(time(version.replaced_at_utc)) + "</summary><pre class='raw-data'>" +
-          escape(prettyJSON(version.old_payload_json)) + "</pre></details>").join("");
-        $("roadDetail").innerHTML = (data.replay_mode === "reconstructed" ?
-          "<p class='muted'>该小时没有原始列表快照，事件按前后两次列表的交集重建。</p>" : "") +
-          (data.snapshot_source === "public_road_archive" ?
-            "<p class='muted'>位置和事件状态来自 <a href='https://github.com/farhanmunim/london-buses/commits/main/data/api/roadworks.json' target='_blank' rel='noopener'>公开归档</a> · Powered by TfL Open Data</p>" : "") +
-          "<div class='road-summary'>" + Object.entries(labels).map(([key, label]) => "<p><span>" + label +
-            "</span>" + escape(key.endsWith("_utc") ? time(data[key]) : data[key]) + "</p>").join("") +
-          "</div><details class='road-detail-section'><summary>几何范围</summary><pre class='raw-data'>" +
-          escape(prettyJSON(data.geometry_json)) + "</pre></details>" +
-          (revisions ? "<details class='road-detail-section'><summary>历史版本（" + data.versions.length +
-            "）</summary>" + revisions + "</details>" : "<p class='muted'>暂无修订记录</p>");
+        state.detail.road = data;
+        $("roadDetail").innerHTML = roadDetailMarkup(data);
       } catch (error) {
         if (generation === state.detailGeneration) {
           $("roadDetail").textContent = "";
@@ -361,6 +413,7 @@
     $("historyNext").disabled = true;
     state.detail.range = initialRange || recentWindow();
     $("historyMetric").innerHTML = "<option value=''>全部指标</option>";
+    window.AirWatchSelect?.refresh($("historyMetric"));
     $("historyPeriod").value = "";
     state.historyPage = 1;
     await loadHistory(true);
@@ -381,10 +434,11 @@
       if (populate) {
         const metrics = [...new Set(data.metrics.map(row => row.metric))];
         $("historyMetric").innerHTML = "<option value=''>全部指标</option>" + metrics.map(metric => "<option value='" + escape(metric) + "'>" + escape(METRICS[metric] || metric) + "</option>").join("");
+        window.AirWatchSelect?.refresh($("historyMetric"));
       }
       $("historyBounds").textContent = "查询范围 " + time(range.start) + " 至 " + time(range.end);
       const headings = ["观测时间", "指标", "数值", "单位", "时长", "质量", "获取时间", "时间依据"];
-      const rows = data.items.map(row => [escape(time(row.valid_at_utc)), escape(METRICS[row.metric] || row.metric),
+      const rows = data.items.map(row => [escape(time(row.valid_at_utc)), metricHtml(row.metric),
         escape(row.value_num ?? row.value_text), escape(row.unit || "单位未提供"),
         row.period_seconds ? row.period_seconds / 60 + " 分钟" : "快照", escape(row.quality),
         escape(time(row.fetched_at_utc)), escape(row.time_basis)]);
@@ -409,6 +463,7 @@
   };
   function renderUpdate(updateState, jobs = {}, message = "", finishedAt = null) {
     $("updateProgress").hidden = false;
+    if (finishedAt) state.updateFinishedAt = finishedAt;
     const summary = updateLabels[updateState] || updateState;
     if ($("updateStatus").textContent !== summary) $("updateStatus").textContent = summary;
 
@@ -427,25 +482,40 @@
     errorAt("updateMessage", message || (rows.length === 0 ? emptyMessages[updateState] : ""));
     errorAt("updateFinished", finishedAt ? "完成时间 " + time(finishedAt) : "");
   }
+  function elapsedLabel(milliseconds) {
+    const seconds = Math.max(0, Math.round(milliseconds / 1000));
+    return "已等待 " + (seconds >= 60 ? Math.floor(seconds / 60) + " 分 " + (seconds % 60) + " 秒" : seconds + " 秒");
+  }
   async function update() {
     if (state.updating) return;
     state.updating = true;
     state.lastUpdate = Date.now();
+    state.updateFinishedAt = null;
     $("updateButton").disabled = true;
     $("updateButton").textContent = "更新中…";
     renderUpdate("checking");
     let run;
+    let stoppedWaiting = false;
     try {
-      run = await api("/api/update", {}, { method: "POST" });
+      run = await api("/api/update", {}, { method: "POST", timeoutMs: 15000 });
+      const started = state.updateStartedAt = Date.now();
+      // Poll only the run status here: the collector writes to the database, so
+      // re-reading the table every few seconds would show no new rows anyway.
       while (run.state === "running" || run.state === "waiting") {
-        renderUpdate(run.state, run.jobs);
-        await refresh(false);
-        await wait(2500);
-        run = await api("/api/update/" + run.id);
+        renderUpdate(run.state, run.jobs, elapsedLabel(Date.now() - started));
+        if (Date.now() - started > UPDATE_LIMIT_MS) {
+          stoppedWaiting = true;
+          renderUpdate("waiting", run.jobs, "采集仍在后台运行，已停止自动等待；可稍后点击更新查看结果。");
+          break;
+        }
+        await wait(document.hidden ? UPDATE_HIDDEN_POLL_MS : UPDATE_POLL_MS);
+        run = await api("/api/update/" + run.id, {}, { timeoutMs: 10000 });
       }
-      await refresh();
-      if ($("detail").open && !state.detail.isRoad && !state.detail.isBoundary) await refreshHistory();
-      renderUpdate(run.state, run.jobs, run.error, run.finished_at);
+      if (!stoppedWaiting) {
+        await refresh();
+        if ($("detail").open && !state.detail.isRoad && !state.detail.isBoundary) await refreshHistory();
+        renderUpdate(run.state, run.jobs, run.error, run.finished_at);
+      }
     } catch (error) {
       renderUpdate("error", run?.jobs, error.message + "。可重新点击检查更新。", run?.finished_at);
     } finally {
@@ -484,7 +554,11 @@
   $("historyNext").addEventListener("click", () => { state.historyPage++; loadHistory(); });
   $("timezone").addEventListener("change", () => {
     renderTable(); renderStatus();
-    if ($("detail").open && !state.detail.isRoad && !state.detail.isBoundary) { state.historyPage = 1; loadHistory(); }
+    if ($("detail").open) {
+      if (state.detail?.isRoad && state.detail.road) $("roadDetail").innerHTML = roadDetailMarkup(state.detail.road);
+      else if (!state.detail?.isBoundary) { state.historyPage = 1; loadHistory(); }
+    }
+    if (state.updateFinishedAt) errorAt("updateFinished", "完成时间 " + time(state.updateFinishedAt));
     window.dispatchEvent(new CustomEvent("airwatch:timezone"));
   });
   $("updateButton").addEventListener("click", update);

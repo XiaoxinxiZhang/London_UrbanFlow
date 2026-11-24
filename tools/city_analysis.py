@@ -7,9 +7,11 @@ import math
 from pathlib import Path
 
 from bike_archive import ARCHIVE_FRESH_SECONDS, ARCHIVE_SOURCE
+from caching import TTLCache
 from live_sources import POLLUTANTS, WEATHER_UNITS
+from live_store import LIVE
 from road_archive import SOURCE as ROAD_ARCHIVE_SOURCE
-from traffic_history import BIKE_HISTORY_DAYS, BIKE_LIVE_FRESH_SECONDS
+from traffic_history import BIKE_HISTORY_DAYS, BIKE_LIVE_FRESH_SECONDS, road_events
 
 UTC = timezone.utc
 LONDON = (-.55, 51.28, .34, 51.72)
@@ -29,6 +31,14 @@ EARTH_RADIUS_M = 6371008.8
 BIKE_RADIUS_M = 500
 BIKE_TIGHT_MAX = 2
 BIKE_SNAPSHOT_TABLES = {"tfl": "bike_snapshots", ARCHIVE_SOURCE: "bike_archive_snapshots"}
+# Only these columns are read by the air pipeline. Selecting them explicitly
+# keeps the 48 hour map query about a third faster than SELECT *.
+AIR_ROW_COLUMNS = ("source,source_id,metric,valid_at_utc,period_seconds,"
+                   "value_num,unit,quality,fetched_at_utc")
+# Class breaks are quantiles over the whole window, so they stay identical
+# while a replay scrubs through the same window. The window end moves whenever
+# the dashboard refreshes, which naturally expires the entry.
+BREAKS_CACHE_TTL = 30.0
 BIKE_BATCH_SELECTION = """
     WITH selected_bike_batches AS (
         SELECT captured_at_utc, 'tfl' AS source
@@ -328,11 +338,23 @@ def local_hours(rows):
 
 
 class CityAnalysis:
-    def __init__(self, connect):
+    def __init__(self, connect, raw_root=None, breaks_ttl=BREAKS_CACHE_TTL):
         self.connect = connect
+        # Live road batches keep their event JSON in raw/tfl instead of SQLite;
+        # the database's sibling directory is the archive root.
+        self.raw_root = Path(raw_root) if raw_root is not None else LIVE
+        self.breaks_ttl = breaks_ttl
+        self._breaks_cache = TTLCache(max_entries=32)
 
-    def locations(self, db, source=None, include_archival=False):
+    def clear_caches(self):
+        """Drop cached window statistics after a data update."""
+        self._breaks_cache.clear()
+
+    def locations(self, db, source=None, include_archival=False, extra_sources=()):
         sources = [source] if source else ["laqn","breathe"]
+        for extra in extra_sources:
+            if extra and extra not in sources:
+                sources.append(extra)
         if any(s not in AIR_SOURCES for s in sources):
             raise ValueError("未知空气数据来源")
         where = "source IN ("+",".join("?" for _ in sources)+")"
@@ -341,38 +363,91 @@ class CityAnalysis:
         rows = db.execute("SELECT * FROM locations WHERE "+where+" ORDER BY source,source_id",sources)
         return [dict(row) for row in rows if valid_coordinate(row["longitude"],row["latitude"])]
 
-    def air_rows(self, db, source, metric, start, end, site=None):
-        sql = """SELECT * FROM measurements WHERE source=? AND metric=?
-          AND valid_at_utc>=? AND valid_at_utc<? AND period_seconds IN (900,3600)"""
-        values = [source,metric+"_CONCENTRATION",iso(start),iso(end)]
+    def air_rows_many(self, db, source, metrics, start, end, site=None):
+        """Read several pollutant codes in one query, ordered by observation time.
+
+        Combining metrics keeps the map request from scanning the same source
+        window once per pollutant. ``idx_measurements_source_time`` still serves
+        the range, so no extra index is needed for the small metric set.
+        """
+        metrics = list(dict.fromkeys(metrics))
+        if not metrics:
+            return []
+        placeholders = ",".join("?" for _ in metrics)
+        sql = (f"SELECT {AIR_ROW_COLUMNS} FROM measurements"
+               f" WHERE source=? AND metric IN ({placeholders})"
+               " AND valid_at_utc>=? AND valid_at_utc<? AND period_seconds IN (900,3600)")
+        values = [source,*(metric+"_CONCENTRATION" for metric in metrics),iso(start),iso(end)]
         if site:
             sql += " AND source_id=?"
             values.append(site)
         return [dict(row) for row in db.execute(sql+" ORDER BY valid_at_utc,period_seconds",values)]
 
+    def air_rows(self, db, source, metric, start, end, site=None):
+        return self.air_rows_many(db, source, [metric], start, end, site)
+
     def air_features(self, db, params, start, end, cursor):
         metric = pollutant(params)
+        features, values = self.air_features_many(
+            db, params, start, end, cursor, [metric])[metric]
+        return features, quantiles(value for rows in values.values() for value in rows)
+
+    def air_features_many(self, db, params, start, end, cursor, metrics, include_sources=()):
+        """Build station features for several pollutant codes at once.
+
+        Returns ``{metric: (features, values_by_source)}`` where the second item
+        keeps the per-source value lists used for the map's class breaks. One
+        query per source is issued instead of one per source and metric.
+
+        Replay frames only need the hour under the cursor: the class breaks for
+        the surrounding window are cached, so scrubbing does not rescan 48 hours
+        per frame.
+        """
+        metrics = list(dict.fromkeys(metrics))
+        if not metrics:
+            return {}
         source = params.get("source") or None
-        locations = self.locations(db,source,source=="breathe_wcc" or cursor is not None)
+        include_archival = (source == "breathe_wcc" or cursor is not None
+                            or "breathe_wcc" in include_sources)
+        locations = self.locations(db, source, include_archival,
+                                   extra_sources=include_sources)
+        sources = sorted({item["source"] for item in locations})
+        cache_key = (tuple(sources),tuple(metrics),iso(start),iso(end))
+        cached = self._breaks_cache.get(cache_key) if self.breaks_ttl > 0 else None
+        if cursor is not None and cached is not None:
+            hour = cursor.replace(minute=0,second=0,microsecond=0)
+            query_start = max(hour,start)
+            query_end = min(hour+timedelta(hours=1),end)
+        else:
+            query_start,query_end = start,end
         grouped = {}
-        all_values = []
-        for current_source in sorted({item["source"] for item in locations}):
-            rows = self.air_rows(db,current_source,metric,start,end)
-            for row in rows:
-                grouped.setdefault((current_source,row["source_id"]),[]).append(row)
-                if row["value_num"] is not None:
-                    all_values.append(row["value_num"])
+        values_by_source = cached if cached is not None else {}
+        for current_source in sources:
+            for row in self.air_rows_many(db,current_source,metrics,query_start,query_end):
+                grouped.setdefault((row["metric"],current_source,row["source_id"]),[]).append(row)
+                if cached is None and row["value_num"] is not None:
+                    values_by_source.setdefault(row["metric"],{}).setdefault(
+                        current_source,[]).append(row["value_num"])
+        if cached is None and self.breaks_ttl > 0:
+            self._breaks_cache.put(cache_key,values_by_source,self.breaks_ttl)
+        return {metric: (self._air_feature_list(locations,grouped,metric,params,cursor,end),
+                         values_by_source.get(metric+"_CONCENTRATION",{}))
+                for metric in metrics}
+
+    def _air_feature_list(self, locations, grouped, metric, params, cursor, end):
+        code = metric + "_CONCENTRATION"
+        period = None
         features = []
         for location in locations:
-            key = (location["source"],location["source_id"])
-            rows = grouped.get(key,[])
+            rows = grouped.get((code,location["source"],location["source_id"]),[])
             if cursor:
                 target = iso(cursor.replace(minute=0,second=0,microsecond=0))
                 # Do not use any observation timestamp after the replay cursor.
                 candidates = hourly([r for r in rows if dt(r["valid_at_utc"])<=cursor])
                 point = next((p for p in candidates if p["time"]==target),None)
             else:
-                period = int(params.get("period","900"))
+                if period is None:
+                    period = int(params.get("period","900"))
                 candidates = [r for r in rows if r["value_num"] is not None and
                               (location["source"]!="laqn" or r["period_seconds"]==period)]
                 point = candidates[-1] if candidates else None
@@ -387,7 +462,7 @@ class CityAnalysis:
                               age_minutes=round(((cursor or end)-dt(point["valid_at_utc"])).total_seconds()/60,1) if point else None)
             properties["stale"] = properties["age_minutes"] is not None and properties["age_minutes"]>180
             features.append(feature(dict(type="Point",coordinates=[location["longitude"],location["latitude"]]),properties))
-        return features,quantiles(all_values)
+        return features
 
     def reconstructed_roads(self, db, at):
         """Replay events present in both complete lists around a collection gap.
@@ -399,9 +474,9 @@ class CityAnalysis:
         being guessed. Properties and geometries come from the earlier list.
         """
         stamp = iso(at)
-        before = db.execute("""SELECT captured_at_utc,payload_json FROM traffic_batches
+        before = db.execute("""SELECT captured_at_utc,raw_sha256,payload_json FROM traffic_batches
           WHERE kind='roads' AND captured_at_utc<=? ORDER BY captured_at_utc DESC LIMIT 1""",(stamp,)).fetchone()
-        after = db.execute("""SELECT captured_at_utc,payload_json FROM traffic_batches
+        after = db.execute("""SELECT captured_at_utc,raw_sha256,payload_json FROM traffic_batches
           WHERE kind='roads' AND captured_at_utc>? ORDER BY captured_at_utc LIMIT 1""",(stamp,)).fetchone()
         archive_before = db.execute("""SELECT captured_at_utc,payload_json FROM road_archive_batches
           WHERE captured_at_utc<=? ORDER BY captured_at_utc DESC LIMIT 1""", (stamp,)).fetchone()
@@ -414,8 +489,14 @@ class CityAnalysis:
             after, after_source = archive_after, ROAD_ARCHIVE_SOURCE
         if before is None or after is None:
             return [],None
-        earlier = {event["id"]:event for event in json.loads(before["payload_json"] or "[]") if event.get("id")}
-        later = {event["id"] for event in json.loads(after["payload_json"] or "[]") if event.get("id")}
+        earlier_events = road_events(before, self.raw_root)
+        later_events = road_events(after, self.raw_root)
+        # A batch without its database payload or raw archive cannot support a
+        # conservative reconstruction: report the gap instead of guessing.
+        if not earlier_events or not later_events:
+            return [],None
+        earlier = {event["id"]:event for event in earlier_events if event.get("id")}
+        later = {event["id"] for event in later_events if event.get("id")}
         features = []
         for event_id in sorted(earlier.keys() & later):
             event = earlier[event_id]
@@ -511,7 +592,11 @@ class CityAnalysis:
                          snapshot_source=source, source_modified=bike["source_modified_utc"] if source == "tfl" else None,
                          ratio=bikes/bike["capacity"] if bikes is not None and bike["capacity"] else None)))
         else:
-            for event in json.loads(row["payload_json"] or "[]"):
+            events = road_events(row, self.raw_root)
+            if events is None:
+                info.update(gap=True,mode="missing",payload_missing=True)
+                return [],info
+            for event in events:
                 geometry = geometry_from_payload(event)
                 if geometry:
                     features.append(feature(geometry,dict(id=event["id"],name=event.get("location") or event["id"],
@@ -528,20 +613,39 @@ class CityAnalysis:
             raise ValueError("地图范围无效")
         layers = set(params.get("layers","air,bikes,roads").split(","))
         metric = pollutant(params)
-        # KPI counts always cover both networks, even when the map filters a source.
-        kpi_params = {key:value for key,value in params.items() if key != "source"}
+        requested = params.get("source") or None
         with closing(self.connect()) as db:
             db.execute("BEGIN")
-            air,breaks = self.air_features(db,params,start,end,cursor)
+            if requested == "breathe_wcc":
+                # The Westminster archive is only requested explicitly, and the
+                # KPI pair always covers the two live networks, so this rare
+                # case keeps its own two passes.
+                air,values_by_source = self.air_features_many(
+                    db,{**params,"source":"breathe_wcc"},start,end,cursor,[metric])[metric]
+                breaks = quantiles(value for rows in values_by_source.values() for value in rows)
+                kpi = self.air_features_many(db,{**params,"source":""},start,end,cursor,
+                                             list(KPI_AIR_METRICS))
+                kpi_features = {current:kpi[current][0] for current in KPI_AIR_METRICS}
+            else:
+                metrics = list(dict.fromkeys([metric,*KPI_AIR_METRICS]))
+                features = self.air_features_many(db,{**params,"source":""},
+                                                  start,end,cursor,metrics)
+                air_all,values_by_source = features[metric]
+                if requested:
+                    air = [item for item in air_all
+                           if item["properties"]["source"]==requested]
+                    breaks = quantiles(values_by_source.get(requested,()))
+                else:
+                    air = air_all
+                    breaks = quantiles(value for rows in values_by_source.values()
+                                       for value in rows)
+                # KPI counts always cover both networks, even when the map
+                # filters a source.
+                kpi_features = {current:[item for item in features[current][0]
+                                         if item["properties"]["source"] in ("laqn","breathe")]
+                                for current in KPI_AIR_METRICS}
             bikes,bike_info = self.traffic(db,"bikes",cursor,include_bike_archive=True)
             roads,road_info = self.traffic(db,"roads",cursor)
-            kpi_features = {}
-            for current in KPI_AIR_METRICS:
-                if current == metric and not params.get("source"):
-                    kpi_features[current] = air
-                else:
-                    kpi_features[current] = self.air_features(
-                        db,{**kpi_params,"metric":current},start,end,cursor)[0]
         result = {}
         for name,features in (("air",air),("bikes",bikes),("roads",roads)):
             result[name] = dict(type="FeatureCollection",features=[

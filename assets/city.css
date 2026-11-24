@@ -2,6 +2,102 @@
   --panel-heading-background: linear-gradient(125deg, #1b3c40, #172b3b);
 }
 
+/* Pollutant labels use <sub>2.5</sub> so the decimal point is lowered together
+   with the digits. Unicode has subscript digits (₂, ₅) but no subscript period,
+   which is why a literal "PM₂.₅" leaves the point on the normal baseline. */
+sub {
+  position: relative;
+  bottom: -0.24em;
+  font-size: 0.7em;
+  line-height: 0;
+  vertical-align: baseline;
+}
+
+/* Native <select> options are plain text. The shell (wrapper, button and
+   label) is rendered in index.html so the first paint already looks like the
+   final control instead of the native select; city.js only adds behavior.
+   Keep the native select as the layout/state element and open a small custom
+   listbox whose options can contain <sub>2.5</sub> and <sub>10</sub>. */
+.rich-select {
+  position: relative;
+  display: inline-flex;
+  min-width: 0;
+  vertical-align: middle;
+}
+.rich-select > select {
+  width: 100%;
+  /* The native control is only the layout/state element; the button and
+     listbox below provide the visible control and options. */
+  text-indent: -9999px;
+}
+.rich-select > select option { text-indent: 0; }
+.rich-select-button {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  margin: 0;
+  padding: 0 28px 0 9px;
+  border: 1px solid #344b60;
+  border-radius: 6px;
+  background: #102131;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+}
+/* Before enhancement the button is only a visual shell (aria-hidden): clicks
+   must reach the native select underneath so the control still works. */
+.rich-select-button[aria-hidden="true"] { pointer-events: none; }
+.rich-select-button:hover { background: #102131; }
+.rich-select-value {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rich-select-arrow {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid #bac8d6;
+  border-bottom: 1.5px solid #bac8d6;
+  transform: translateY(-65%) rotate(45deg);
+  pointer-events: none;
+}
+.rich-select-menu {
+  position: fixed;
+  z-index: 100;
+  width: max-content;
+  max-width: min(18rem, 80vw);
+  max-height: 15rem;
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid #344b60;
+  border-radius: 6px;
+  background: #102131;
+  box-shadow: 0 10px 24px #00000080;
+}
+.rich-select-menu:focus { outline: none; }
+.rich-select-option {
+  padding: 6px 10px;
+  border-radius: 4px;
+  color: var(--ink);
+  font: inherit;
+  line-height: 1.35;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.rich-select-option.active,
+.rich-select-option:hover { background: #1d3a4f; }
+.rich-select-option[aria-selected="true"] { color: var(--accent); }
+
 .panel-title,
 .advice-heading,
 .city-kpi > h2,
@@ -395,8 +491,6 @@
 .map-attribution-card :is(.map-source-label, .map-attribution-separator),
 .map-source-summary > br,
 .map-quality-summary > br,
-.map-basemap-live:empty,
-.map-basemap-live:not(:empty) + .map-basemap-fallback,
 .map-journey-credit { display: none; }
 .map-shows-journey .map-journey-credit { display: block; }
 .map-attribution-card :is(.map-source-links, .map-quality-legend) {
@@ -1238,6 +1332,7 @@ dialog {
 .journey-result p { margin: 8px 0; }
 .journey-result .journey-status { margin: 0; padding: 12px; border-radius: 9px; background: #172938; color: #bbccdc; }
 .journey-result .journey-warning { margin: 0 0 12px; padding: 10px 12px; border-left: 3px solid #e9bc70; border-radius: 6px; background: #403827; }
+.journey-result .journey-fallback { margin: 0 0 12px; padding: 10px 12px; border-left: 3px solid var(--accent); border-radius: 6px; background: #173a39; }
 .journey-result .journey-error { border-color: #ef8b8b; background: #38282c; }
 .journey-total {
   display: grid;
@@ -1351,9 +1446,6 @@ dialog {
 .road-point-symbol { background: #e9bc70; }
 .road-area-symbol { background: #e9bc70; opacity: .7; }
 @media (min-width: 1600px) {
-  #cityMap {
-    height: 650px;
-  }
   .chart {
     height: 330px;
   }
@@ -1371,6 +1463,14 @@ dialog {
   #cityMap {
     height: 500px;
   }
+  .overview-rail { overflow: visible; }
+  .overview-rail .linkage {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    overflow: visible;
+    flex: none;
+  }
+  #cityOverview #cityMap { min-height: 460px; }
   .linkage {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -1536,7 +1636,7 @@ dialog {
   h3 { font-size: 16px; }
   header { height: 60px; padding: 5px 20px; }
   .brand { gap: 10px; }
-  .brandmark { width: 40px; height: 40px; font-size: 32px; }
+  .brandmark { width: 40px; height: 40px; }
   .wordmark { font-size: 21px; letter-spacing: .6px; }
   header h1 { font-size: 13px; margin: 0; }
   .updates { gap: 10px; }
@@ -1609,16 +1709,20 @@ dialog {
 :root { --line:#29414e; --accent:#7ae0c8; }
 .panel { border-radius:14px; box-shadow:0 5px 24px #020b121c; }
 .page-tabs button { transition:color .18s, background .18s; }
-.city-grid { grid-template-columns:minmax(0, 2.45fr) minmax(345px, 1fr); gap:16px; align-items:stretch; }
+@media (min-width: 1351px) {
+  .city-grid { grid-template-columns:minmax(0, 2.45fr) minmax(345px, 1fr); gap:16px; align-items:stretch; }
+}
 .geo-panel { height:100%; }
 .overview-rail { min-height:0; display:flex; flex-direction:column; overflow:hidden; }
-.overview-rail .linkage {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-height: 0;
-  overflow: hidden;
-  margin: 0;
+@media (min-width: 1351px) {
+  .overview-rail .linkage {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    margin: 0;
+  }
 }
 .overview-rail .linkage > .advice-heading,
 .overview-rail .linkage > .outlook-tabs { flex: none; }

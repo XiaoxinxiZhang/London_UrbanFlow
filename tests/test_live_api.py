@@ -1,6 +1,7 @@
 """Contract tests for the local database browser and collector coordination."""
 from contextlib import closing
 from datetime import datetime, timezone
+import gzip
 import json
 from pathlib import Path
 import subprocess
@@ -12,6 +13,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"tools"))
+import collect_live as collector
 import live_store as store
 from collector_lock import CollectorLock
 from live_api import LiveAPI, UpdateManager
@@ -142,6 +144,28 @@ class LiveAPITests(unittest.TestCase):
             self.assertIsNone(units["WIND_DIRECTION"])
             self.assertEqual(store.backfill_met_units(db, WEATHER_UNITS), 0)
 
+    def test_status_exposes_parent_source_and_display_names(self):
+        with closing(store.connect(self.path)) as db:
+            store.set_job(db, "tfl_bike_archive", "public_archive", "error", error="offline")
+            store.set_job(db, "tfl_road_archive", "public_road_archive", "success", 3)
+            store.set_job(db, "met_other_daily", "metoffice", "success", 1)
+            store.set_job(db, "breathe_wcc_2026_import", "breathe_wcc", "success", 1)
+            db.commit()
+        data = self.api.status()
+        jobs = {job["job"]: job for job in data["jobs"]}
+        self.assertEqual(jobs["tfl_bike_archive"]["parent_source"], "tfl")
+        self.assertEqual(jobs["tfl_road_archive"]["parent_source"], "tfl")
+        self.assertEqual(jobs["breathe_wcc_2026_import"]["parent_source"], "breathe")
+        self.assertEqual(jobs["breathe_wcc_2026_import"]["display_name"],
+                         "breathe_wcc_2026_import")
+        self.assertEqual(jobs["met_other_daily"]["display_name"], "全国气象站点日更")
+        self.assertEqual(jobs["tfl_bike_archive"]["error"], "offline")
+        badges = {"laqn", "breathe", "tfl", "metoffice"}
+        self.assertEqual(len(data["jobs"]), len(collector.SCHEDULE) + 1)
+        for job in data["jobs"]:
+            self.assertIn(job["parent_source"], badges, job["job"])
+            self.assertTrue(job["display_name"], job["job"])
+
     def test_lock_blocks_another_collector_process(self):
         lock = CollectorLock(self.path)
         self.assertTrue(lock.acquire())
@@ -175,8 +199,28 @@ class LiveAPITests(unittest.TestCase):
             self.assertEqual(response.status_code,code,url)
             response.close()
         response = client.get("/index.html")
-        self.assertEqual(response.headers["Cache-Control"],"no-store")
+        self.assertEqual(response.headers["Cache-Control"],"no-cache")
         self.assertEqual(response.headers["X-Content-Type-Options"],"nosniff")
+        response.close()
+        response = client.get("/index.html", headers={"Accept-Encoding": "gzip"})
+        self.assertEqual(response.headers["Cache-Control"], "no-cache")
+        self.assertEqual(response.headers["Content-Encoding"], "gzip")
+        self.assertIn(b"?v=", gzip.decompress(response.get_data()))
+        response.close()
+        vendor = "/assets/vendor/echarts-5.6.0.min.js"
+        response = client.get(vendor, headers={"Accept-Encoding": "gzip"})
+        self.assertEqual(response.headers["Cache-Control"],
+                         "public, max-age=31536000, immutable")
+        self.assertEqual(response.headers["Vary"], "Accept-Encoding")
+        etag = response.headers["ETag"]
+        response.close()
+        response = client.get(vendor, headers={"Accept-Encoding": "gzip",
+                                               "If-None-Match": etag})
+        self.assertEqual(response.status_code, 304)
+        response.close()
+        response = client.get("/api/status", headers={"Accept-Encoding": "gzip"})
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual(response.headers["Content-Encoding"], "gzip")
         response.close()
         response = client.get("/api/does-not-exist")
         self.assertEqual(response.get_json()["error"],"接口不存在")
@@ -272,6 +316,60 @@ class LiveAPITests(unittest.TestCase):
         while manager.get(first["id"])["state"]=="waiting" and time.monotonic()<deadline:
             time.sleep(.02)
         self.assertEqual(manager.get(first["id"])["state"],"completed_external")
+
+    def test_latest_reads_the_page_in_one_measurement_query(self):
+        statements = []
+        original = self.api.connect
+        def connect():
+            db = original()
+            db.set_trace_callback(statements.append)
+            return db
+        self.api.connect = connect
+        try:
+            data = self.api.measurements({"source":"laqn","page_size":25})
+        finally:
+            del self.api.connect
+        self.assertEqual(len(data["items"]),1)
+        values = [sql for sql in statements
+                  if "FROM measurements" in sql and "COUNT" not in sql]
+        self.assertEqual(len(values),1,values)
+
+    def test_map_response_is_cached_and_can_be_invalidated(self):
+        app = create_app(self.path)
+        client = app.test_client()
+        calls = []
+        original = app.api.analysis.map
+        def counting(params):
+            calls.append(params)
+            return original(params)
+        app.api.analysis.map = counting
+        url = "/api/map?start=2026-11-17T00:00:00Z&end=2026-11-19T00:00:00Z&metric=PM25&period=900"
+        first = client.get(url)
+        second = client.get(url)
+        self.assertEqual(first.status_code,200)
+        self.assertEqual(second.status_code,200)
+        self.assertEqual(first.get_json(),second.get_json())
+        self.assertEqual(len(calls),1)
+        app.map_cache.clear()
+        self.assertEqual(client.get(url).status_code,200)
+        self.assertEqual(len(calls),2)
+
+    def test_update_manager_notifies_before_publishing_completion(self):
+        cleared = []
+        manager = UpdateManager(self.path, on_finished=lambda: cleared.append(True))
+        class Process:
+            stdout = ()
+            def __init__(self,*args,**kwargs): pass
+            def __enter__(self): return self
+            def __exit__(self,*args): return False
+            def wait(self): return 0
+        with patch("live_api.subprocess.Popen", Process):
+            manager.start()
+            deadline = time.monotonic()+5
+            while manager.current["state"]=="running" and time.monotonic()<deadline:
+                time.sleep(.01)
+        self.assertEqual(cleared,[True])
+        self.assertEqual(manager.current["state"],"completed")
 
 
 if __name__=="__main__":

@@ -9,7 +9,7 @@ a=subprocess.run([sys.executable,'-m','unittest','discover','-s','tests','-p','t
 if a.returncode:sys.exit(a.returncode)
 node=shutil.which('node')
 if node:
-    for test in ('tests/test_live_time.js','tests/test_insights.js','tests/test_borough_coverage_frontend.js','tests/test_city_frontend.js',
+    for test in ('tests/test_live_time.js','tests/test_insights.js','tests/test_live_status.js','tests/test_city_timezone.js','tests/test_borough_coverage_frontend.js','tests/test_city_frontend.js',
                  'tests/test_bike_analysis_frontend.js','tests/test_city_boundaries.js','tests/test_city_gis.js',
                  'tests/test_live_boundaries.js','tests/test_journey_frontend.js'):
         result=subprocess.run([node,test],cwd=root)

@@ -6,9 +6,11 @@
   const state = {start:null, end:null, picking:null, result:null, request:null};
   const labels = {walk_to_bike:"① 步行取车", cycle:"② 骑行至还车站",
     walk_to_destination:"③ 步行到终点", walk:"步行", personal_bike:"个人自行车骑行"};
-  const metrics = [["PM25", "PM₂.₅"], ["PM10", "PM₁₀"], ["NO2", "NO₂"], ["O3", "O₃"]];
+  // The <sub> run keeps PM2.5's decimal point at the subscript baseline.
+  const metrics = [["PM25", "PM<sub>2.5</sub>"], ["PM10", "PM<sub>10</sub>"], ["NO2", "NO<sub>2</sub>"], ["O3", "O<sub>3</sub>"]];
   const airSources = [["laqn", "LAQN"], ["breathe", "Breathe London"]];
   const tabs = [["journeyRouteTab", "journeyRoutePanel"], ["journeyEnvironmentTab", "journeyEnvironmentPanel"]];
+  const ROUTE_TIMEOUT_MS = 60000;
   const esc = value => String(value ?? "—").replace(/[&<>"']/g, c =>
     ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
   const km = meters => meters >= 1000 ? (meters/1000).toFixed(2) + " 公里" : Math.round(meters) + " 米";
@@ -153,7 +155,7 @@
     return `${renderRouteAir(context.route_air, legs)}
       <section class="journey-environment"><h3>大伦敦官方 DAQI</h3><p>${regionalIndex}</p><p>${advice}</p><p><a href="https://www.gov.uk/government/publications/health-effects-of-air-pollution/health-advice-for-the-daily-air-quality-index-daqi" target="_blank" rel="noopener">查看 Defra 分人群指导</a></p></section>`;
   }
-  function render() {
+  function paint({fit = false} = {}) {
     const result = state.result;
     if (!result) return;
     let html = "";
@@ -168,12 +170,17 @@
       </dl>`;
     }
     if (result.routing_error) html += `<p class="journey-warning">${esc(result.routing_error)}</p>`;
+    const walkShown = result.mode === "shared_bike" && legs[0]?.kind === "walk";
+    const fallbackReason = result.fallback?.reason;
+    const walkBetter = fallbackReason === "walk_better";
     if (result.message) {
-      const fallback = result.mode === "shared_bike" && legs[0]?.kind === "walk";
-      html += `<p class="journey-warning">${fallback ? "当前显示步行备选路线。" : ""}${esc(result.message)}</p>`;
+      const prefix = walkShown && !walkBetter && fallbackReason !== "same_station"
+        ? "当前显示步行备选路线。" : "";
+      html += `<p class="${walkBetter ? "journey-fallback" : "journey-warning"}">${prefix}${esc(result.message)}</p>`;
     }
     if (legs.length) {
-      const pair = result.alternatives[0];
+      const alternatives = result.alternatives || [];
+      const pair = alternatives[0];
       if (legs.length === 3 && pair) {
         html += `<dl class="journey-stops">
           <div class="journey-stop"><dt>取车</dt><dd><span>${esc(pair.pickup.name)}</span><span class="journey-stop-count">${pair.pickup.bikes} 辆</span></dd></div>
@@ -184,19 +191,27 @@
         <summary>${labels[leg.kind]}<span>${km(leg.distance_m)} · ${minutes(leg.duration_s)}</span></summary>
         <ol>${(leg.steps || []).map(step => `<li>${esc(step.instruction)}</li>`).join("")}</ol>
       </details>`).join("")}</section>`;
-      if (result.alternatives.length > 1) html += `<div class="journey-alternatives"><h3>备选站点</h3>${result.alternatives.slice(1).map(pair => `<button type="button" data-pickup="${esc(pair.pickup.id)}" data-dropoff="${esc(pair.dropoff.id)}">${esc(pair.pickup.name)} → ${esc(pair.dropoff.name)} · 约 ${minutes(pair.duration_s)}</button>`).join("")}</div>`;
+      const bikeOptions = legs.length === 3 ? alternatives.slice(1) : alternatives;
+      if (bikeOptions.length) {
+        const heading = walkShown && legs.length !== 3 ? "仍可使用共享单车" : "备选站点";
+        html += `<div class="journey-alternatives"><h3>${heading}</h3>${bikeOptions.map(pair => `<button type="button" data-pickup="${esc(pair.pickup.id)}" data-dropoff="${esc(pair.dropoff.id)}">${esc(pair.pickup.name)} → ${esc(pair.dropoff.name)} · 约 ${minutes(pair.duration_s)}</button>`).join("")}</div>`;
+      }
       if (result.alerts.length) html += `<div class="journey-alerts"><h3>路线附近道路事件</h3><ul>${result.alerts.map(a => `<li>${esc(a.name)} · ${esc(a.category)} · 距路线约 ${km(a.distance_m)}</li>`).join("")}</ul></div>`;
     }
     if (result.bike_info?.captured_at && result.mode === "shared_bike") html += `<p class="muted">站点快照：${esc(time(result.bike_info.captured_at))}。车辆和空位未预留，出发前请重新规划。</p>`;
     showResult(html, renderContext(result.context || {}, legs));
     draw();
-    if (!$("journeyPage").hidden && legs.length) {
+    if (fit && !$("journeyPage").hidden && legs.length) {
       const coords = legs.flatMap(leg => leg.geometry.coordinates);
       const xs = coords.map(p => p[0]), ys = coords.map(p => p[1]);
       city.getMap()?.fitBounds?.([[Math.min(...xs),Math.min(...ys)],[Math.max(...xs),Math.max(...ys)]],
         {padding:70,maxZoom:15,duration:650});
     }
   }
+  function render() { paint({fit: true}); }
+  // Switching the display timezone only reformats text: keep the current route
+  // and the fitted map viewport untouched.
+  window.addEventListener("airwatch:timezone", () => { if (state.result) paint(); });
   async function plan(pair) {
     if (!state.start || !state.end || state.request) return;
     const request = new AbortController();
@@ -206,24 +221,43 @@
     draw();
     showResult('<p class="journey-status">正在检查站点并计算道路路线…</p>',
       '<p class="journey-status">正在规划路线并估算沿途空气质量…</p>');
+    const payload = {start:state.start,end:state.end,mode:$("journeyMode").value,
+      max_walk_m:Number($("maxWalk").value)};
+    if (pair) { payload.pickup_id = pair[0]; payload.dropoff_id = pair[1]; }
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; request.abort(); }, ROUTE_TIMEOUT_MS);
     try {
-      const payload = {start:state.start,end:state.end,mode:$("journeyMode").value,
-        max_walk_m:Number($("maxWalk").value)};
-      if (pair) { payload.pickup_id = pair[0]; payload.dropoff_id = pair[1]; }
       const response = await fetch("/api/journeys/plan", {method:"POST",cache:"no-store",
         headers:{"Content-Type":"application/json"},body:JSON.stringify(payload),signal:request.signal});
-      const data = await response.json();
       if (state.request !== request) return;
-      if (!response.ok) throw new Error(data.error || "规划失败");
+      if (!response.ok) {
+        // The server always sends JSON errors, but a proxy or a crashed worker
+        // may return HTML with a status that still has to reach the user.
+        let message = "规划失败（HTTP " + response.status + "）";
+        try {
+          const body = await response.json();
+          if (body && body.error) message = body.error;
+        } catch {}
+        throw new Error(message);
+      }
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        throw new Error("路线服务返回了无法读取的响应");
+      }
       state.result = data;
       render();
     } catch (error) {
       if (state.request !== request) return;
       state.result = null;
       draw();
-      showResult(`<p class="journey-warning journey-error">${esc(error.message)}</p>`,
+      const message = timedOut && error && error.name === "AbortError"
+        ? "路线规划超时，请稍后重试" : error.message;
+      showResult(`<p class="journey-warning journey-error">${esc(message)}</p>`,
         '<p class="journey-status">路线规划失败，请重新规划后查看沿途空气质量。</p>');
     } finally {
+      clearTimeout(timer);
       if (state.request === request) {
         state.request = null;
         updatePlanButton();

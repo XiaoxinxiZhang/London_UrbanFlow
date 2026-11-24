@@ -13,7 +13,8 @@ import unittest
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"tools"))
 import live_store as store
 from live_api import LiveAPI
-from city_analysis import EARTH_RADIUS_M, borough_at, hourly, distance, geometry_distance
+from city_analysis import (CityAnalysis, EARTH_RADIUS_M, borough_at, hourly, distance,
+                           geometry_distance, iso, quantiles)
 import live_sources as parsers
 import traffic_history
 
@@ -222,6 +223,34 @@ class CityAnalysisTests(unittest.TestCase):
         self.assertEqual(detail["replay_mode"],"reconstructed")
         self.assertEqual(detail["replayed_at_utc"],at.isoformat())
         self.assertEqual(detail["last_seen_utc"],after)
+
+    def test_road_replay_uses_the_archive_when_payload_is_not_stored(self):
+        stamp = (self.base + timedelta(hours=8)).isoformat()
+        sha = "a" * 64
+        raw_dir = self.root / "raw" / "tfl" / stamp[:10]
+        raw_dir.mkdir(parents=True)
+        events = [{**self.road, "id": "R9", "location": "Archived"}]
+        with gzip.open(raw_dir / (sha + ".json.gz"), "wt", encoding="utf-8") as handle:
+            json.dump(events, handle)
+        self.db.execute("INSERT INTO traffic_batches VALUES(?,?,?,?,NULL)",
+                        ("roads", stamp, sha, len(events)))
+        self.db.commit()
+
+        data = self.api.map({**self.params, "cursor": stamp})
+        self.assertFalse(data["road_info"]["gap"])
+        self.assertEqual(data["counts"]["roads"], 1)
+        self.assertEqual({f["properties"]["id"] for f in data["roads"]["features"]}, {"R9"})
+
+    def test_road_replay_reports_a_gap_without_payload_or_archive(self):
+        stamp = (self.base + timedelta(hours=9)).isoformat()
+        self.db.execute("INSERT INTO traffic_batches VALUES(?,?,?,?,NULL)",
+                        ("roads", stamp, "b" * 64, 0))
+        self.db.commit()
+
+        data = self.api.map({**self.params, "cursor": stamp})
+        self.assertTrue(data["road_info"]["gap"])
+        self.assertTrue(data["road_info"].get("payload_missing"))
+        self.assertEqual(data["counts"]["roads"], 0)
 
     def test_nearby_and_bike_nearest_air(self):
         p={**self.params,"cursor":(self.base+timedelta(minutes=12)).isoformat()}
@@ -470,6 +499,107 @@ class CityAnalysisTests(unittest.TestCase):
         self.assertEqual(traffic_history.recover(self.db,self.root,now),2)
         self.assertEqual(traffic_history.recover(self.db,self.root,now),0)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM bike_snapshots").fetchone()[0],4)
+
+    def _traced_map(self, params):
+        """Run map() and return (result, SQL statements) for query counting."""
+        statements = []
+        original = self.api.connect
+        def connect():
+            db = original()
+            db.set_trace_callback(statements.append)
+            return db
+        self.api.connect = connect
+        try:
+            return self.api.map(params), statements
+        finally:
+            del self.api.connect
+
+    def test_map_reads_each_air_source_once_for_all_metrics(self):
+        # PM10 is not a KPI metric, so the old code needed three passes:
+        # PM10 for the layer, PM25 and NO2 for the cards.
+        params = {**self.params, "metric": "PM10", "period": "3600"}
+        data, statements = self._traced_map(params)
+        self.assertEqual(len(data["air"]["features"]), 1)
+        measurements = [sql for sql in statements if " FROM measurements" in sql]
+        locations = [sql for sql in statements if " FROM locations" in sql]
+        self.assertEqual(len(measurements), 2, measurements)   # laqn + breathe
+        self.assertEqual(len(locations), 1, locations)
+        self.assertEqual(data["air_counts"],
+                         {"laqn": {"PM25": 1, "NO2": 0}, "breathe": {"PM25": 1, "NO2": 0}})
+
+    def test_map_breaks_only_use_the_requested_source(self):
+        store.location(self.db,"breathe","BL2","Second sensor",51.51,-.11)
+        for hour in range(60):
+            stamp = (self.base+timedelta(hours=10,minutes=hour)).isoformat()
+            store.measurement(self.db,"breathe","BL2","PM25_CONCENTRATION",stamp,stamp,3600,"hour",
+                              value_num=100+hour,unit="ug/m3",quality="P")
+        self.db.commit()
+        common = {**self.params, "metric":"PM25", "period":"3600"}
+        laqn = self.api.map({**common, "source":"laqn"})
+        breathe = self.api.map({**common, "source":"breathe"})
+        laqn_rows = [row[0] for row in self.db.execute(
+            """SELECT value_num FROM measurements WHERE source='laqn'
+               AND metric='PM25_CONCENTRATION' AND valid_at_utc>=? AND valid_at_utc<?
+               AND period_seconds IN (900,3600)""",
+            (common["start"],common["end"]))]
+        breathe_rows = [row[0] for row in self.db.execute(
+            """SELECT value_num FROM measurements WHERE source='breathe'
+               AND metric='PM25_CONCENTRATION' AND valid_at_utc>=? AND valid_at_utc<?
+               AND period_seconds IN (900,3600)""",
+            (common["start"],common["end"]))]
+        self.assertEqual(laqn["breaks"], quantiles(laqn_rows))
+        self.assertEqual(breathe["breaks"], quantiles(breathe_rows))
+        self.assertNotEqual(laqn["breaks"], breathe["breaks"])
+
+    def test_air_features_wrapper_matches_multi_metric_output(self):
+        start, end = self.base, self.base+timedelta(hours=30)
+        with closing(self.api.connect()) as db:
+            features, breaks = self.api.air_features(db, self.params, start, end, None)
+            many = self.api.air_features_many(db, self.params, start, end, None, ["PM25"])["PM25"]
+        self.assertEqual(features, many[0])
+        values = [row[0] for row in self.db.execute(
+            """SELECT value_num FROM measurements WHERE source='laqn'
+               AND metric='PM25_CONCENTRATION' AND valid_at_utc>=? AND valid_at_utc<?""",
+            (start.isoformat(), end.isoformat()))]
+        self.assertEqual(breaks, quantiles(values))
+
+    def test_replay_frame_reads_only_the_cursor_hour_and_reuses_breaks(self):
+        params = {**self.params, "metric":"PM25", "period":"3600"}
+        self.api.map(params)                       # warm the window's class breaks
+        cursor = (self.base+timedelta(hours=3,minutes=30)).isoformat()
+        hour_start, hour_end = (self.base+timedelta(hours=3)), (self.base+timedelta(hours=4))
+        calls = []
+        original = self.api.air_rows_many
+        def spy(db, source, metrics, start, end, site=None):
+            calls.append((source,iso(start),iso(end)))
+            return original(db,source,metrics,start,end,site)
+        self.api.air_rows_many = spy
+        try:
+            cached = self.api.map({**params, "cursor":cursor})
+        finally:
+            del self.api.air_rows_many
+        self.assertEqual(calls,[(source,iso(hour_start),iso(hour_end))
+                                for source in ("breathe","laqn")])
+        # Same result as a cold analysis that still scans the whole window.
+        fresh = CityAnalysis(self.api.connect, raw_root=self.root, breaks_ttl=0)
+        self.assertEqual(cached, fresh.map({**params, "cursor":cursor}))
+
+    def test_clear_caches_forces_a_fresh_window_scan(self):
+        params = {**self.params, "metric":"PM25", "period":"3600"}
+        cursor = (self.base+timedelta(hours=3,minutes=30)).isoformat()
+        self.api.map(params)
+        self.api.clear_caches()
+        calls = []
+        original = self.api.air_rows_many
+        def spy(db, source, metrics, start, end, site=None):
+            calls.append((iso(start),iso(end)))
+            return original(db,source,metrics,start,end,site)
+        self.api.air_rows_many = spy
+        try:
+            self.api.map({**params, "cursor":cursor})
+        finally:
+            del self.api.air_rows_many
+        self.assertEqual({span for span in calls}, {(params["start"],params["end"])})
 
 
 if __name__=="__main__":

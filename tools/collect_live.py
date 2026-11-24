@@ -44,6 +44,12 @@ CREDENTIALS_FILE = Path(os.environ.get("APPDATA") or (Path.home()/".config"))/"L
 MIN_REQUEST_GAP = 1.25  # At most 48 requests/minute from this process.
 BREATHE_CHART_BATCH_LIMIT = 12
 MET_OFFICE_DAILY_REQUEST_BUDGET = 300  # Free tier is 360; reserve room for checks outside this collector.
+# LAQN exposes one concentration endpoint per site, so a full pass is expensive.
+# Incremental runs only read sites whose data is stale; set URBANFLOW_LAQN_FULL=1
+# to force a full pass, and one scheduled run a day re-reads everything anyway.
+LAQN_FULL_REFRESH = os.environ.get("URBANFLOW_LAQN_FULL") == "1"
+LAQN_DEEP_PASS_HOUR = 3
+RAW_PRUNE_HOUR = 4
 
 
 def iso(dt=None):
@@ -207,6 +213,23 @@ def laqn_sites(db,fetcher,now):
     return len(rows),None
 
 
+def sites_due(db,source,period,grace,now):
+    """Return active sites whose newest observation of that cadence is stale.
+
+    LAQN has no bulk concentration endpoint, so a full pass costs one request
+    and a 1.25 s gap per site. Skipping sites that already published for the
+    current interval keeps the hourly jobs short without delaying new data:
+    a late site is retried on the next scheduled run.
+    """
+    cutoff=iso(now-grace)
+    rows=db.execute("""SELECT l.source_id, MAX(m.valid_at_utc) AS last
+      FROM locations l LEFT JOIN measurements m
+        ON m.source=l.source AND m.source_id=l.source_id AND m.period_seconds=?
+      WHERE l.source=? AND l.active=1
+      GROUP BY l.source_id ORDER BY l.source_id""",(period,source)).fetchall()
+    return [row["source_id"] for row in rows if not row["last"] or row["last"]<cutoff]
+
+
 def laqn_hourly(db,fetcher,now):
     payload,sha=fetcher.get("laqn","laqn_hourly",LAQN+"/Hourly/MonitoringIndex/GroupName=London/Json")
     sites,indices=parsers.laqn_indices(payload)
@@ -220,9 +243,13 @@ def laqn_hourly(db,fetcher,now):
         raise ValueError("LAQN has no active sites")
     start=(now-timedelta(days=2)).date().isoformat()
     end=(now+timedelta(days=1)).date().isoformat()
+    # Once a day every site is re-read even when it looks fresh, so values that
+    # upstream publishes late still arrive.
+    deep=LAQN_FULL_REFRESH or now.hour==LAQN_DEEP_PASS_HOUR
+    due=[row["source_id"] for row in active] if deep else sites_due(
+        db,"laqn",3600,timedelta(minutes=55),now)
     errors=[];last=latest(indices)
-    for site in active:
-        sid=site["source_id"]
+    for sid in due:
         url=f"{LAQN}/Data/Site/SiteCode={urllib.parse.quote(sid)}/StartDate={start}/EndDate={end}/Json"
         try:
             payload,sha=fetcher.get("laqn","laqn_hourly",url)
@@ -248,11 +275,13 @@ def laqn_15min(db,fetcher,now):
     if not active:
         raise ValueError("LAQN has no active sites")
     first_run=db.execute("SELECT last_success_utc FROM job_state WHERE job='laqn_15min'").fetchone()
-    days=7 if not first_run or not first_run[0] else 2
+    days=7 if not first_run or not first_run[0] else 1
     start=(now-timedelta(days=days)).date().isoformat()
     end=(now+timedelta(days=1)).date().isoformat()  # CSV end date is exclusive.
+    deep=LAQN_FULL_REFRESH or now.hour==LAQN_DEEP_PASS_HOUR
+    due=active if deep else sites_due(db,"laqn",900,timedelta(minutes=45),now)
     count=0;last=None;errors=[]
-    for sid in active:
+    for sid in due:
         query=urllib.parse.urlencode({"site":sid,"species1":"NO2m","species2":"O3m",
             "species3":"PM10m","species4":"PM25m","species5":"","species6":"",
             "start":laqn_csv_date(start),"end":laqn_csv_date(end),
@@ -383,7 +412,7 @@ def tfl_roads(db,fetcher,now):
         if modified:
             last=max(filter(None,(last,parsers.utc(modified))),default=None)
     store.finish_events(db,ids,seen)
-    traffic_history.save_roads(db,rows,seen,sha)
+    traffic_history.save_roads(db,rows,seen,sha,root=fetcher.raw_root)
     fetcher.mark("tfl_roads",sha,len(rows),last)
     return count,last
 
@@ -488,7 +517,9 @@ def run_once(db,fetcher=None,now=None,force=False,on_progress=None,only_job=None
         db.commit()
         if on_progress:
             on_progress(name,results[name])
-    if only_job is None:
+    # Deleting old archives walks thousands of files, so it runs once a day
+    # instead of on every five-minute cron tick.
+    if only_job is None and now.hour==RAW_PRUNE_HOUR:
         store.prune_raw(fetcher.raw_root,days=90,now=now)
     return results
 

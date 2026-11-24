@@ -21,6 +21,20 @@ from road_archive import SOURCE as ROAD_ARCHIVE_SOURCE
 
 SOURCES = {"laqn", "breathe", "breathe_wcc", "tfl", "metoffice"}
 VISIBLE_MEASUREMENT = "m.metric NOT IN (" + ",".join("?" for _ in EXCLUDED_INDEX_METRICS) + ")"
+# Archive and import jobs write to their own source names but belong to the
+# network they backfill, so the dashboard badges keep counting them.
+SOURCE_PARENTS = {"public_archive": "tfl", "public_road_archive": "tfl",
+                  "breathe_wcc": "breathe"}
+# Chinese labels live here instead of the browser so a new SCHEDULE entry is
+# named everywhere (badges, status table, update progress) by default.
+JOB_DISPLAY_NAMES = {
+    "laqn_sites": "站点目录", "laqn_hourly": "小时浓度与指数", "laqn_15min": "15 分钟浓度",
+    "laqn_bootstrap": "首次建库采集",
+    "breathe_web_hourly": "官网地图", "breathe_web_reconcile": "逐站曲线补查",
+    "tfl_bikes": "自行车", "tfl_roads": "道路列表",
+    "tfl_bike_archive": "自行车公开归档补录", "tfl_road_archive": "道路公开归档补录",
+    "met_sites": "站点发现", "met_hourly": "气象观测", "met_other_daily": "全国气象站点日更",
+}
 
 
 def utc_now():
@@ -80,7 +94,7 @@ def location_row(row):
 class LiveAPI:
     def __init__(self, database):
         self.database = Path(database).resolve()
-        self.analysis = CityAnalysis(self.connect)
+        self.analysis = CityAnalysis(self.connect, raw_root=self.database.parent)
 
     def connect(self):
         db = sqlite3.connect(self.database.as_uri()+"?mode=ro", uri=True, timeout=10)
@@ -137,29 +151,39 @@ class LiveAPI:
         source = source_param(params)
         period = int(params.get("period", "900" if source == "laqn" else "0" if source == "tfl" else "3600"))
         kind = params.get("kind","concentration")
-        time_filter = ""
-        time_values = []
-        for key, operator in (("start", ">="), ("end", "<")):
-            if params.get(key):
-                time_filter += f" AND n.valid_at_utc{operator}?"
-                time_values.append(timestamp(params[key]))
+        ids = [location["source_id"] for location in result["items"]]
         with closing(self.connect()) as db:
+            # One statement for the whole page instead of one per station. Each
+            # metric keeps its own latest timestamp through the correlated MAX,
+            # which the planner serves from the measurement index; a window
+            # function would have to scan every historical row per station.
+            rows = []
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                time_filter = ""
+                time_values = []
+                for key, operator in (("start", ">="), ("end", "<")):
+                    if params.get(key):
+                        time_filter += f" AND n.valid_at_utc{operator}?"
+                        time_values.append(timestamp(params[key]))
+                rows = db.execute(f"""SELECT m.* FROM measurements m
+                    WHERE source=? AND period_seconds=? AND {VISIBLE_MEASUREMENT}
+                      AND source_id IN ({placeholders}) AND valid_at_utc=(
+                        SELECT MAX(n.valid_at_utc) FROM measurements n
+                        WHERE n.source=m.source AND n.source_id=m.source_id
+                          AND n.metric=m.metric AND n.period_seconds=m.period_seconds{time_filter})
+                    ORDER BY source_id, metric""",
+                  (source, period, *EXCLUDED_INDEX_METRICS, *ids, *time_values)).fetchall()
+            by_station = {}
+            for row in rows:
+                metric = row["metric"]
+                if params.get("metric") and metric != params["metric"]:
+                    continue
+                if source == "laqn" and (metric.endswith("_CONCENTRATION") != (kind=="concentration")):
+                    continue
+                by_station.setdefault(row["source_id"], {})[metric] = dict(row)
             for location in result["items"]:
-                rows = db.execute(f"""SELECT m.* FROM measurements m WHERE source=? AND source_id=?
-                  AND period_seconds=? AND {VISIBLE_MEASUREMENT} AND valid_at_utc=(
-                    SELECT MAX(n.valid_at_utc) FROM measurements n
-                    WHERE n.source=m.source AND n.source_id=m.source_id
-                      AND n.metric=m.metric AND n.period_seconds=m.period_seconds{time_filter})""",
-                  (source,location["source_id"],period,*EXCLUDED_INDEX_METRICS,*time_values)).fetchall()
-                metrics = {}
-                for row in rows:
-                    metric = row["metric"]
-                    if params.get("metric") and metric != params["metric"]:
-                        continue
-                    if source == "laqn" and (metric.endswith("_CONCENTRATION") != (kind=="concentration")):
-                        continue
-                    metrics[metric] = dict(row)
-                location["values"] = metrics
+                location["values"] = by_station.get(location["source_id"], {})
         return result
 
     def roads(self, params):
@@ -239,6 +263,11 @@ class LiveAPI:
                                          now-datetime.fromisoformat(last)>timedelta(seconds=threshold))
                 jobs.append(row)
             jobs.extend(row for row in saved.values() if row["source"]=="breathe_wcc")
+            # Presentation metadata is derived once for every job, including the
+            # appended breathe_wcc import rows that never pass the SCHEDULE loop.
+            for row in jobs:
+                row["parent_source"] = SOURCE_PARENTS.get(row["source"], row["source"])
+                row["display_name"] = JOB_DISPLAY_NAMES.get(row["job"], row["job"])
             cutoff = (now-timedelta(hours=24)).isoformat(timespec="seconds")
             coverage = db.execute("""SELECT COUNT(*),
               COUNT(CASE WHEN s.last_success_utc>=? THEN 1 END),
@@ -257,11 +286,23 @@ class LiveAPI:
 
 
 class UpdateManager:
-    def __init__(self, database):
+    def __init__(self, database, on_finished=None):
         self.database = Path(database).resolve()
         self.lock = threading.Lock()
         self.current = None
         self.recent = deque(maxlen=5)
+        # Called once per run, right before the final state is published, so
+        # caches derived from the database are refreshed before clients poll.
+        self.on_finished = on_finished
+
+    def _notify(self):
+        callback = self.on_finished
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            pass
 
     def start(self):
         with self.lock:
@@ -307,10 +348,12 @@ class UpdateManager:
                 state = "completed_external"
             else:
                 state = "completed" if code==0 else "partial"
+            self._notify()
             with self.lock:
                 self.current.update(state=state,finished_at=store.utcnow())
                 if code not in (0,75):
                     self.current["error"]="部分任务失败，请查看各来源的采集状态"
         except Exception:
+            self._notify()
             with self.lock:
                 self.current.update(state="error",finished_at=store.utcnow(),error="采集进程启动或读取失败")

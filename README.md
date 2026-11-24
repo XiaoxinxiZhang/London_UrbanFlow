@@ -52,7 +52,7 @@ bash scripts/tmux.sh status    # 查看状态
 | 页面 | 可以做什么 |
 | --- | --- |
 | 城市总览 | 查看污染浓度、监测点、共享单车、道路事件和行政区划。可选择图层、查属性表、按前 48 小时回放、查看污染分区和选点周边。健康提示参考大伦敦官方 [DAQI](https://www.gov.uk/government/publications/health-effects-of-air-pollution/using-the-daily-air-quality-index-daqi)。 |
-| 智慧出行 | 在地图上选起点和终点，规划步行、个人自行车或 Santander Cycles 共享单车路线。共享单车方案结合 [TfL](https://tfl.gov.uk/)  车辆与空位快照选择取还车站。 |
+| 智慧出行 | 在地图上选起点和终点，规划步行、个人自行车或 Santander Cycles 共享单车路线。共享单车方案结合 [TfL](https://tfl.gov.uk/)  车辆与空位快照选择取还车站；步行明显更快或取还车站相同时自动改用步行路线。 |
 | 环境与交通分析 | 先选择分析模块，再调整相关参数。污染趋势可对比最多 4 个站点；热力图、覆盖与缺测、气象关联的站点为单选。自行车时空分析在地图上回放最近 7 天的站点库存，并对比所选站 500 米内的邻站。行政区覆盖用地图填色和圆点展示有效时段占比与站点数，并配合排名列表联动查看。污染指标按来源提供：[Breathe London](https://www.breathelondon.org/) 只有 PM₂.₅ 和 NO₂，[LAQN](https://www.londonair.org.uk/) 的四项指标只列出能观测该指标的站点。 |
 | 数据中心 | 按来源查找站点和道路事件，查看元数据、历史观测、道路事件修订和采集状态。 |
 
@@ -109,6 +109,7 @@ powershell -ExecutionPolicy Bypass -File tools\install_live_task.ps1 -Python .\.
 
 - 运行 `python tools/diagnose_data.py` 可读取数据库记录数、采集错误，并用系统 `curl` 检查 LAQN 接口。此诊断对数据库只读。
 - 运行 `python tools/run_tests.py` 可执行项目测试。安装 Node.js 后，测试入口会继续运行 JavaScript 测试。
+- 运行 `python tools/prune_db.py --dry-run` 可查看各表按保留期将删除的行数；加 `--vacuum` 回收磁盘。静态资源默认按内容哈希长缓存，`URBANFLOW_COMPRESS=0` 可关闭应用内 gzip。
 - 城市总览、分析和数据中心的站点观测使用最近 48 小时的数据。地图标题旁可切换污染指标和历史回放。
 
 ## 项目结构

@@ -1,9 +1,11 @@
 """Journey selection uses the current dock snapshot and actual routed legs."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 import json
 import sqlite3
 import sys
+import threading
+import time
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -48,6 +50,10 @@ class Analysis:
     def air_features(self, db, params, start, end, cursor):
         return self.air.get((params["metric"], params["source"]), []), []
 
+    def air_features_many(self, db, params, start, end, cursor, metrics, include_sources=()):
+        source = params.get("source") or ""
+        return {metric: (self.air.get((metric, source), []), {}) for metric in metrics}
+
 
 class Router:
     def __init__(self, fail=False):
@@ -75,6 +81,33 @@ class Router:
 class FixedDAQI:
     def current(self):
         return {"status": "fresh", "index": 3, "band": "低"}
+
+
+class RejectWalkRouter(Router):
+    def directions(self, profile, start, end):
+        if profile == "foot-walking" and start == START and end == END:
+            raise RoutingUnavailable("walk comparison down")
+        return super().directions(profile, start, end)
+
+
+class BarrierRouter(Router):
+    """Only completes when the expected requests really run at the same time."""
+
+    def __init__(self):
+        super().__init__()
+        self.first_wave = threading.Barrier(4, timeout=5)
+        self.second_wave = threading.Barrier(3, timeout=5)
+
+    def matrix(self, profile, sources, destinations):
+        self.first_wave.wait()
+        return super().matrix(profile, sources, destinations)
+
+    def directions(self, profile, start, end):
+        if profile == "foot-walking" and start == START and end == END:
+            self.first_wave.wait()
+        else:
+            self.second_wave.wait()
+        return super().directions(profile, start, end)
 
 
 class JourneyTests(unittest.TestCase):
@@ -134,10 +167,11 @@ class JourneyTests(unittest.TestCase):
         result = planner.plan(self.payload)
         self.assertEqual([leg["kind"] for leg in result["legs"]],
                          ["walk_to_bike", "cycle", "walk_to_destination"])
+        self.assertIsNone(result["fallback"])
         self.assertEqual(result["alternatives"][0]["pickup"]["id"], "pickup")
         self.assertEqual(result["alternatives"][0]["dropoff"]["id"], "dropoff")
-        self.assertEqual([call[0] for call in router.matrix_calls],
-                         ["foot-walking", "foot-walking", "cycling-regular"])
+        self.assertCountEqual([call[0] for call in router.matrix_calls],
+                              ["foot-walking", "foot-walking", "cycling-regular"])
         self.assertEqual(result["context"]["daqi"]["index"], 3)
         profile = result["context"]["route_air"]
         segments = profile["segments"]
@@ -152,13 +186,117 @@ class JourneyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不可用"):
             planner.plan({**self.payload, "pickup_id": "empty", "dropoff_id": "dropoff"})
 
+    def test_repeat_plan_reuses_routing_results(self):
+        router = Router()
+        planner = JourneyPlanner(Analysis(self.bikes), router, FixedDAQI())
+        planner.plan(self.payload)
+        matrix_calls = len(router.matrix_calls)
+        direction_calls = len(router.directions_calls)
+        self.assertGreater(matrix_calls, 0)
+        self.assertGreater(direction_calls, 0)
+        planner.plan(self.payload)
+        self.assertEqual(len(router.matrix_calls), matrix_calls)
+        self.assertEqual(len(router.directions_calls), direction_calls)
+        # A different destination must not be served from the cache.
+        planner.plan({**self.payload, "end": [-.105, 51.51]})
+        self.assertGreater(len(router.directions_calls), direction_calls)
+
     def test_stale_bikes_use_direct_walk_without_claiming_docks(self):
         router = Router()
         result = JourneyPlanner(Analysis(self.bikes, stale=True), router, FixedDAQI()).plan(self.payload)
         self.assertEqual([leg["kind"] for leg in result["legs"]], ["walk"])
         self.assertEqual(result["alternatives"], [])
+        self.assertEqual(result["fallback"], {"reason": "bike_unavailable"})
         self.assertIn("15 分钟", result["message"])
         self.assertEqual({s["leg_index"] for s in result["context"]["route_air"]["segments"]}, {0})
+
+    def test_walk_fallback_when_walk_is_clearly_faster(self):
+        start, end = [-.1500, 51.5100], [-.1480, 51.5100]
+        bikes = [dock("pickup", [-.1630, 51.5100], 4, 0),
+                 dock("dropoff", [-.1350, 51.5100], 0, 6)]
+        router = Router()
+        planner = JourneyPlanner(Analysis(bikes), router, FixedDAQI())
+        result = planner.plan({"start": start, "end": end, "mode": "shared_bike", "max_walk_m": 1000})
+        walk = result["legs"][0]
+        self.assertEqual([leg["kind"] for leg in result["legs"]], ["walk"])
+        self.assertAlmostEqual(walk["duration_s"], distance(start, end)*1.1/1.3)
+        self.assertEqual(result["fallback"]["reason"], "walk_better")
+        self.assertEqual(result["fallback"]["walk_duration_s"], round(walk["duration_s"]))
+        self.assertGreaterEqual(result["fallback"]["bike_duration_s"],
+                                result["fallback"]["walk_duration_s"]+120)
+        self.assertIn("已改用更快的步行路线", result["message"])
+        self.assertGreater(result["fallback"]["bike_duration_s"], 0)
+        self.assertEqual(len(result["alternatives"]), 1)
+        # Walking won before the three bike legs were routed.
+        self.assertEqual(router.directions_calls, [("foot-walking", start, end)])
+        self.assertEqual({s["leg_index"] for s in result["context"]["route_air"]["segments"]}, {0})
+
+    def test_explicit_station_choice_keeps_shared_bike_plan(self):
+        start, end = [-.1500, 51.5100], [-.1480, 51.5100]
+        bikes = [dock("pickup", [-.1630, 51.5100], 4, 0),
+                 dock("dropoff", [-.1350, 51.5100], 0, 6)]
+        router = Router()
+        planner = JourneyPlanner(Analysis(bikes), router, FixedDAQI())
+        result = planner.plan({"start": start, "end": end, "mode": "shared_bike",
+                               "max_walk_m": 1000, "pickup_id": "pickup", "dropoff_id": "dropoff"})
+        self.assertEqual([leg["kind"] for leg in result["legs"]],
+                         ["walk_to_bike", "cycle", "walk_to_destination"])
+        self.assertIsNone(result["fallback"])
+        self.assertIsNone(result["message"])
+        self.assertEqual(len(router.directions_calls), 3)
+
+    def test_same_station_pickup_and_dropoff_fall_back_to_walk(self):
+        start, end = [-.1500, 51.5100], [-.1480, 51.5100]
+        bikes = [dock("shared", [-.1490, 51.5100], 4, 6)]
+        router = Router()
+        planner = JourneyPlanner(Analysis(bikes), router, FixedDAQI())
+        payload = {"start": start, "end": end, "mode": "shared_bike", "max_walk_m": 1000}
+        result = planner.plan(payload)
+        self.assertEqual([leg["kind"] for leg in result["legs"]], ["walk"])
+        self.assertEqual(result["fallback"], {"reason": "same_station"})
+        self.assertIn("同一站点", result["message"])
+        self.assertEqual(result["alternatives"], [])
+        # No zero-distance cycle leg is requested or returned.
+        self.assertEqual(router.directions_calls, [("foot-walking", start, end)])
+        with self.assertRaisesRegex(ValueError, "同一站点"):
+            planner.plan({**payload, "pickup_id": "shared", "dropoff_id": "shared"})
+
+    def test_same_station_best_pair_keeps_only_distinct_alternatives(self):
+        start, end = [-.1500, 51.5100], [-.1480, 51.5100]
+        bikes = [dock("shared", [-.1490, 51.5100], 4, 6),
+                 dock("other-pickup", [-.1620, 51.5100], 3, 0),
+                 dock("other-dropoff", [-.1360, 51.5100], 0, 5)]
+        router = Router()
+        planner = JourneyPlanner(Analysis(bikes), router, FixedDAQI())
+        result = planner.plan({"start": start, "end": end, "mode": "shared_bike", "max_walk_m": 1000})
+        self.assertEqual([leg["kind"] for leg in result["legs"]], ["walk"])
+        self.assertEqual(result["fallback"], {"reason": "same_station"})
+        self.assertTrue(result["alternatives"])
+        self.assertTrue(all(pair["pickup"]["id"] != pair["dropoff"]["id"]
+                            for pair in result["alternatives"]))
+        self.assertNotIn(("shared", "shared"),
+                         [(pair["pickup"]["id"], pair["dropoff"]["id"])
+                          for pair in result["alternatives"]])
+        self.assertEqual(router.directions_calls, [("foot-walking", start, end)])
+
+    def test_walk_comparison_failure_keeps_bike_plan(self):
+        router = RejectWalkRouter()
+        planner = JourneyPlanner(Analysis(self.bikes), router, FixedDAQI())
+        with self.assertLogs("journey", level="WARNING"):
+            result = planner.plan(self.payload)
+        self.assertEqual([leg["kind"] for leg in result["legs"]],
+                         ["walk_to_bike", "cycle", "walk_to_destination"])
+        self.assertIsNone(result["routing_error"])
+        self.assertIsNone(result["fallback"])
+
+    def test_routing_requests_run_in_parallel(self):
+        router = BarrierRouter()
+        planner = JourneyPlanner(Analysis(self.bikes), router, FixedDAQI())
+        result = planner.plan(self.payload)
+        self.assertEqual([leg["kind"] for leg in result["legs"]],
+                         ["walk_to_bike", "cycle", "walk_to_destination"])
+        self.assertIsNone(result["fallback"])
+        self.assertIsNone(result["routing_error"])
 
     def test_no_docks_and_routing_failure_are_explicit(self):
         result = JourneyPlanner(Analysis([]), Router(fail=True), FixedDAQI()).plan(self.payload)
@@ -184,9 +322,9 @@ class JourneyTests(unittest.TestCase):
         })
         planner = JourneyPlanner(analysis, router, FixedDAQI())
         with patch.object(router, "directions", return_value=leg), patch.object(
-                analysis, "air_features", wraps=analysis.air_features) as queried:
+                analysis, "air_features_many", wraps=analysis.air_features_many) as queried:
             result = planner.plan({**self.payload, "mode": "walk"})
-        self.assertEqual(queried.call_count, 8)
+        self.assertEqual(queried.call_count, 2)
         context = result["context"]
         self.assertEqual(context["start"]["NO2"]["laqn"]["value"], 0)
         self.assertEqual(context["end"]["NO2"]["laqn"]["status"], "insufficient")
@@ -246,6 +384,69 @@ class JourneyTests(unittest.TestCase):
         self.assertEqual(current["index"], 3)
         self.assertEqual(current["band"], "低")
         self.assertIn(current["status"], ("fresh", "stale"))
+
+    def test_daqi_refreshes_in_background_after_the_cache_ages(self):
+        feed = (b"<rss><channel><item><title>Greater London</title>"
+                b"<description>Current pollution level is Low at index 3</description>"
+                b"<pubDate>Wed, 18 Nov 2026 15:00:00 +0000</pubDate></item></channel></rss>")
+        class Response(BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *args): self.close()
+        calls = []
+        def opener(url, timeout):
+            calls.append(url)
+            time.sleep(0.2)
+            return Response(feed)
+        daqi = DAQI(opener=opener)
+        self.assertEqual(daqi.current()["index"], 3)      # cold start stays blocking
+        self.assertEqual(len(calls), 1)
+        daqi.checked_at = datetime.now(UTC)-timedelta(minutes=11)
+        started = time.monotonic()
+        snapshot = daqi.current()
+        self.assertLess(time.monotonic()-started, 0.15)  # served from the cache
+        self.assertEqual(snapshot["index"], 3)
+        self.assertTrue(snapshot["refreshing"])
+        deadline = time.monotonic()+3
+        while daqi.refreshing and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(daqi.refreshing)
+
+    def test_daqi_prewarm_fills_the_cache_without_blocking(self):
+        feed = (b"<rss><channel><item><title>Greater London</title>"
+                b"<description>Current pollution level is Low at index 3</description>"
+                b"<pubDate>Wed, 18 Nov 2026 15:00:00 +0000</pubDate></item></channel></rss>")
+        class Response(BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *args): self.close()
+        calls = []
+        def opener(url, timeout):
+            calls.append(url)
+            time.sleep(0.1)
+            return Response(feed)
+        daqi = DAQI(opener=opener)
+        daqi.prewarm()
+        self.assertIsNone(daqi.cached)
+        deadline = time.monotonic()+3
+        while daqi.refreshing and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(daqi.current()["index"], 3)
+        daqi.prewarm()                                   # already warm: no new fetch
+        self.assertEqual(len(calls), 1)
+
+    def test_daqi_failure_is_reported_and_not_retried_immediately(self):
+        calls = []
+        def opener(url, timeout):
+            calls.append(url)
+            raise URLError("offline")
+        daqi = DAQI(opener=opener)
+        with self.assertLogs("journey", level="WARNING"):
+            self.assertEqual(daqi.current()["status"], "unavailable")
+        self.assertEqual(daqi.current()["status"], "unavailable")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(daqi.error, "URLError")
+        self.assertFalse(daqi.refreshing)
 
     def test_ors_matrix_uses_string_location_indices(self):
         class Response(BytesIO):

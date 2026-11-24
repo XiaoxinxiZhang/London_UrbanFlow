@@ -138,6 +138,8 @@ def connect(path=DB):
     CREATE INDEX IF NOT EXISTS idx_measurements_source_time
       ON measurements(source,valid_at_utc DESC);
     CREATE INDEX IF NOT EXISTS idx_fetch_runs_job ON fetch_runs(job,ended_at_utc);
+    CREATE INDEX IF NOT EXISTS idx_event_versions_event
+      ON event_versions(event_id,replaced_at_utc DESC);
     """)
     # Existing local databases from early collector runs retain their records.
     if "duration_ms" not in {row[1] for row in db.execute("PRAGMA table_info(fetch_runs)")}:

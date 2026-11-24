@@ -163,6 +163,7 @@ python run.py --open
 | `URBANFLOW_PYTHON` | 自动查找 | `scripts/*.sh` 使用的 Python 解释器 |
 | `URBANFLOW_TMUX_SESSION` | `urbanflow` | tmux 会话名 |
 | `URBANFLOW_LOG` | `data/live/server.log` | tmux 启动时的日志路径 |
+| `URBANFLOW_COMPRESS` | `1` | 设为 `0` 关闭应用内 gzip（前置代理已压缩时使用） |
 
 `run.py` 也支持同名参数：`--host`、`--port`、`--db`、`--open`、`--trusted-host`、`--trusted-origin`。
 
@@ -297,6 +298,61 @@ SQLite 使用 WAL 模式，不要在服务运行时直接 `cp` 主库文件。�
 ```bash
 sqlite3 data/live/airwatch_live.sqlite3 "PRAGMA wal_checkpoint(TRUNCATE);"   # 首字段须为 0
 ```
+
+### 静态资源缓存与压缩
+
+网页自带的 MapLibre GL 和 ECharts 约 2 MB。服务按类型设置缓存策略，并对文本响应做 gzip：
+
+| 路径 | Cache-Control |
+| --- | --- |
+| `/assets/vendor/*` | `public, max-age=31536000, immutable` |
+| `/assets/*.js`、`/assets/*.css`（URL 带内容哈希） | 同上 |
+| `/data/*.geojson` | `public, max-age=604800` |
+| `/index.html` | `no-cache`（每次用 ETag 重新验证） |
+| `/api/*` | `no-store` |
+
+`index.html` 里的资源 URL 由服务端自动追加 `?v=<内容哈希>`，不需要手工维护版本号。首屏静态体积从 2.6 MB 降到约 805 KB，`/api/map` 从 442 KB 降到约 57 KB；重复访问命中 304 或强缓存。
+
+如果前面已经有 Caddy/Cloudflare 做压缩，设置 `URBANFLOW_COMPRESS=0` 关闭应用内 gzip，避免重复压缩；brotli 需要前置代理支持。
+
+### 数据保留与数据库维护
+
+网页只展示最近 48 小时到 7 天的数据，但 SQLite 默认保留每一行。`tools/prune_db.py` 按表应用保留期，并可回收磁盘空间：
+
+| 表 | 默认保留 | 说明 |
+| --- | --- | --- |
+| `bike_snapshots` | 8 天 | 7 天分析窗口 + 1 天缓冲 |
+| `bike_archive_snapshots` / `bike_archive_batches` | 8 天 | 公开自行车归档 |
+| `traffic_batches`（bikes） | 8 天 | 自行车批次清单 |
+| `traffic_batches`（roads） | 30 天 | 只保留时间、SHA 与计数，事件 JSON 在 raw |
+| `road_archive_batches` | 30 天 | 公开道路归档 |
+| `fetch_runs` | 30 天 | 采集请求诊断 |
+| `measurement_versions` | 90 天 | 观测修订历史 |
+| `event_versions` | 30 天 | 道路事件修订历史（实测约 14 MB/天） |
+| `api_request_usage` | 90 天 | Met Office 每日请求计数 |
+
+不清理 `measurements`、`locations`、`job_state` 和 `bike_archive_files`：结构化观测长期保留，文件表用于避免重复下载。所有天数都有同名参数（如 `--bike-days 14`）。
+
+先看影响面再执行：
+
+```bash
+.venv/bin/python tools/prune_db.py --dry-run
+.venv/bin/python tools/prune_db.py            # 删除过期行
+.venv/bin/python tools/prune_db.py --vacuum   # 删除后回收磁盘
+```
+
+建议每周维护一次：
+
+```cron
+17 4 * * 0 cd /path/to/London_UrbanFlow && .venv/bin/python tools/prune_db.py --vacuum >> data/live/prune.log 2>&1
+```
+
+注意事项：
+
+- `VACUUM` 需要约等于数据库大小的临时空间，并短暂持有写锁；采集运行时工具会因 `CollectorLock` 退出码 3，稍后重试即可。
+- 道路事件的解析结果不再写入 SQLite：采集器确认 `raw/tfl/<日期>/<sha>.json.gz` 存在时只写批次行，回放按需读取 raw。因此 raw 保留期必须长于 `traffic_batches`（默认 90 天 > 30 天）。
+- 从旧版本升级时可一次性清掉已有副本：`python tools/prune_db.py --compact-payloads --vacuum`。工具逐行确认 raw 可读，读不到的行保留原数据。
+- `event_versions(event_id, replaced_at_utc)` 索引会在下次打开数据库时自动创建。
 
 ### 把数据库放在本地磁盘（网络盘部署）
 

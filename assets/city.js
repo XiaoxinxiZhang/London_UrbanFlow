@@ -83,10 +83,12 @@
     overviewWeatherKey: null,
     localAirHtml: "",
     localAirHasData: false,
+    localAirReadings: null,
     airRefOpen: {},
     nearbySelectionKey: null,
+    nearbyData: null,
+    nearbyCursor: null,
     playback: null,
-    lastRefresh: 0,
     selectedBoundary: null,
     pendingBoundaryFocus: false,
     gisLayer: "laqn",
@@ -258,13 +260,24 @@
       selectFeature(layer === "bikes" ? "bike" : layer.startsWith("road") ? "road" : "air", feature, lngLat, true);
   }
   const zone = () => $("timezone").value;
-  const metric = (value = $("cityMetric").value) =>
-    ({
-      PM25: "PM₂.₅",
-      NO2: "NO₂",
-      PM10: "PM₁₀",
-      O3: "O₃",
-    })[value];
+  // Unicode subscripts (₂, ₅) have no subscript period, so "PM₂.₅" leaves the
+  // decimal point floating on the normal baseline. Real <sub> markup lowers
+  // the whole "2.5" run, including the point. Text-only targets (native
+  // <option>, canvas chart labels) use the plain form.
+  const METRIC_TEXT = {
+    PM25: "PM2.5",
+    NO2: "NO2",
+    PM10: "PM10",
+    O3: "O3",
+  };
+  const METRIC_HTML = {
+    PM25: "PM<sub>2.5</sub>",
+    NO2: "NO<sub>2</sub>",
+    PM10: "PM<sub>10</sub>",
+    O3: "O<sub>3</sub>",
+  };
+  const metric = (value = $("cityMetric").value) => METRIC_TEXT[value];
+  const metricHtml = (value = $("cityMetric").value) => METRIC_HTML[value];
   function hourKey(v) {
     const d = new Date(v);
     d.setUTCMinutes(0, 0, 0);
@@ -442,46 +455,30 @@
     notice.textContent = message;
     notice.hidden = !message;
   }
-  function removeAttributionSeparator(node, pattern) {
-    if (node?.nodeType !== Node.TEXT_NODE) return;
-    node.data = node.data.replace(pattern, "");
-    if (!node.data) node.remove();
-  }
   function groupBasemapAttribution(mapNode) {
     const inner = mapNode.querySelector?.(".maplibregl-ctrl-attrib-inner");
     if (!inner) return;
     const group = () => {
       const card = inner.querySelector(":scope > .map-attribution-card");
-      if (!card || inner.childNodes.length === 1) return;
-      // MapLibre joins the sanitized basemap credits and the custom card with pipes.
-      if (!card.nextSibling) removeAttributionSeparator(card.previousSibling, /\s*\|\s*$/);
-      removeAttributionSeparator(card.nextSibling, /^\s*\|\s*/);
-      const credits = Array.from(inner.childNodes).filter(node => node !== card);
-      card.querySelector(".map-basemap-live").append(...credits);
+      if (!card) return;
+      // MapLibre re-renders the style's own basemap credit next to the custom
+      // card. The card already carries that credit (as static markup), and
+      // swapping or appending text here changed the card height after load.
+      for (const node of Array.from(inner.childNodes))
+        if (node !== card) node.remove();
     };
     group();
     new MutationObserver(group).observe(inner, { childList: true });
   }
-  function collapseAttributionAfterLoad(map, mapNode) {
+  function collapseAttribution(mapNode) {
     const disclosure = mapNode.querySelector?.(".maplibregl-ctrl-attrib");
     if (!disclosure) return;
-    const toggle = disclosure.querySelector("summary");
-    let interacted = false;
-    let scheduled = false;
-    const markInteraction = () => { interacted = true; };
-    disclosure.addEventListener("pointerdown", markInteraction, { once: true });
-    disclosure.addEventListener("focusin", markInteraction, { once: true });
-    toggle.addEventListener("click", markInteraction, { once: true });
-    const schedule = () => {
-      if (scheduled) return;
-      scheduled = true;
-      setTimeout(() => {
-        if (!interacted && disclosure.open && disclosure.classList.contains("maplibregl-compact-show"))
-          toggle.click();
-      }, 5000);
-    };
-    map.once("load", schedule);
-    map.once("error", schedule);
+    // MapLibre's compact control starts expanded. Collapse it before the first
+    // paint (the old code waited five seconds) so the attribution card does
+    // not flash over the map on every refresh; the summary button still opens
+    // it on demand, when the content is complete.
+    disclosure.classList.remove("maplibregl-compact-show");
+    disclosure.removeAttribute("open");
   }
   function initMap() {
     const mapNode = $("cityMap");
@@ -520,7 +517,7 @@
         "bottom-right",
       );
       groupBasemapAttribution(mapNode);
-      collapseAttributionAfterLoad(S.map, mapNode);
+      collapseAttribution(mapNode);
       S.map.on("style.load", () => {
         S.ready = true;
         $("pickOverviewLocation").disabled = $("pickLocationFromPanel").disabled = false;
@@ -560,9 +557,9 @@
     });
   }
   function positionBoundaryLayers() {
-    if (!S.map.getLayer("bike-clusters")) return;
+    if (!S.map.getLayer("bike-points")) return;
     for (const id of ["london-region-fill", "london-borough-fill", "london-borough-boundaries", "london-outer-boundary", "london-selected-region", "london-selected-borough"])
-      if (S.map.getLayer(id)) S.map.moveLayer(id, "bike-clusters");
+      if (S.map.getLayer(id)) S.map.moveLayer(id, "bike-points");
   }
   function installBoundaryLayers() {
     if (!S.ready) return;
@@ -572,7 +569,7 @@
       ["london-boroughs", "data/london_boroughs_2025.geojson"],
     ])
       if (!m.getSource(id)) m.addSource(id, { type: "geojson", data: file });
-    const before = m.getLayer("bike-clusters") ? "bike-clusters" : undefined;
+    const before = m.getLayer("bike-points") ? "bike-points" : undefined;
     if (!m.getLayer("london-region-fill")) m.addLayer({
       id:"london-region-fill", type:"fill", source:"london-region",
       paint:{"fill-color":boundaryColors.outer,"fill-opacity":0.035},
@@ -676,31 +673,6 @@
       source: "city-roads",
       filter: ["==", ["geometry-type"], "Point"],
       layout: pointSymbolLayout(gisPointStyles.roadPoint.shape, roadColor),
-    });
-    m.addLayer({
-      id: "bike-clusters",
-      type: "circle",
-      source: "city-bikes",
-      filter: ["has", "point_count"],
-      paint: {
-        "circle-color": "#497da0",
-        "circle-radius": ["step", ["get", "point_count"], 15, 20, 20, 100, 25],
-        "circle-opacity": 0.85,
-        "circle-stroke-width": 1.5,
-        "circle-stroke-color": "#d9f4fc",
-      },
-    });
-    m.addLayer({
-      id: "bike-cluster-label",
-      type: "symbol",
-      source: "city-bikes",
-      filter: ["has", "point_count"],
-      layout: {
-        "text-field": ["get", "point_count_abbreviated"],
-        "text-size": 11,
-        "text-allow-overlap": true,
-      },
-      paint: { "text-color": "#fff" },
     });
     m.addLayer({
       id: "bike-points",
@@ -831,16 +803,6 @@
       m.on("mouseenter", layer, () => (m.getCanvas().style.cursor = "pointer"));
       m.on("mouseleave", layer, () => (m.getCanvas().style.cursor = ""));
     }
-    m.on("click", "bike-clusters", async (event) => {
-      if (S.pickingLocation || event.originalEvent?.overviewPicked) return;
-      if (S.page === "journey" && $("journeyPage")?.dataset?.picking) return;
-      if (!S.bikeIndex) return;
-      const f = event.features[0],
-        zoom = S.bikeIndex.getClusterExpansionZoom(f.properties.cluster_id);
-      m.easeTo({ center: f.geometry.coordinates, zoom });
-    });
-    m.on("mouseenter", "bike-clusters", () => (m.getCanvas().style.cursor = "pointer"));
-    m.on("mouseleave", "bike-clusters", () => (m.getCanvas().style.cursor = ""));
     for (const [layer, gisLayer] of [["london-borough-fill","borough"],["london-region-fill","region"]]) {
       m.on("click", layer, (event) => {
         if (S.pickingLocation || event.originalEvent?.overviewPicked) return;
@@ -896,12 +858,12 @@
       const palette = window.AirWatchInsights.pollutionPalette;
       const b = S.data.breaks;
       const labels = b.length ? b.map((v,i)=>(i ? "> "+b[i-1]+"–" : "≤ ")+v).concat("> "+b[b.length-1]) : ["同值 / 单一等级"];
-      const title = metric() + "（µg/m³）";
+      const title = metricHtml() + "（µg/m³）";
       const scale = labels.map((label, i) => {
         const color = palette[i];
         return "<span><i style='background:" + color + "'></i>" + esc(label) + "</span>";
       }).join("");
-      box.innerHTML = "<strong>" + esc(title) + "</strong><div class='zone-scale'>" + scale +
+      box.innerHTML = "<strong>" + title + "</strong><div class='zone-scale'>" + scale +
         "<span><i style='background:#657481'></i>无有效观测</span></div>";
     } catch(e) { box.textContent="污染划分暂不可用："+e.message; }
   }
@@ -996,7 +958,6 @@
       "air-laqn":gisVisible("laqn") && !(low && S.pointGroups.laqn?.index),
       "air-breathe":gisVisible("breathe") && !(low && S.pointGroups.breathe?.index),
       "air-values":(gisVisible("laqn") || gisVisible("breathe")) && !(low && (S.pointGroups.laqn?.index || S.pointGroups.breathe?.index)),
-      "bike-clusters":gisVisible("bikes"), "bike-cluster-label":gisVisible("bikes"),
       "bike-points":gisVisible("bikes") && !(low && S.bikeIndex),
       "road-point":gisVisible("roadPoint") && !(low && S.pointGroups.roadPoint?.index),
       "road-fill":gisVisible("roadArea"), "road-line":gisVisible("roadArea"),
@@ -1094,7 +1055,7 @@
       ? `<div class="city-kpi-body">
           <table class="city-kpi-air" aria-label="各污染物有值站点数">
             <thead><tr><td aria-hidden="true"></td>${Object.values(sourceNames).map((name) => `<th scope="col">${esc(name)}</th>`).join("")}</tr></thead>
-            <tbody>${airMetrics.map((pollutant) => `<tr><th scope="row">${esc(metric(pollutant))}</th>${Object.keys(sourceNames).map((source) => `<td><strong>${esc(airValue(source, pollutant))}</strong></td>`).join("")}</tr>`).join("")}</tbody>
+            <tbody>${airMetrics.map((pollutant) => `<tr><th scope="row">${metricHtml(pollutant)}</th>${Object.keys(sourceNames).map((source) => `<td><strong>${esc(airValue(source, pollutant))}</strong></td>`).join("")}</tr>`).join("")}</tbody>
           </table>
         </div>`
       : "";
@@ -1104,6 +1065,7 @@
         ? "最新观测 " + time(d.air_info.observed_at)
         : "各站最新观测";
     const airFoot = airMatrix ? `有值站点数 · ${airDetail}` : `有值站点数 · ${metric(d.metric)}`;
+    const airFootHtml = airMatrix ? `有值站点数 · ${esc(airDetail)}` : `有值站点数 · ${metricHtml(d.metric)}`;
     const bikes = snapshotStatus(d.bike_info);
     const roads = snapshotStatus(d.road_info);
     const bikeCounts = [
@@ -1115,30 +1077,37 @@
       const classes = ["city-kpi-foot"].concat(
         status.nearest || status.reconstructed || status.archived ? ["kpi-note"] : [],
       );
-      return ` class="${classes.join(" ")}"` + (status.detail ? ` title="${esc(status.detail)}"` : "");
+      // Keep every footer on one line: the static placeholder cards in
+      // index.html reserve exactly this height, so a footer wrapping after the
+      // data arrives would shift the map below.
+      return ` class="${classes.join(" ")}" title="${esc(status.detail || status.label)}"`;
     };
     $("cityKpis").innerHTML = `
       <div class="city-kpi">
         <h2>有值空气监测点</h2>
         ${airMatrix || `<div class="city-kpi-body"><div class="city-kpi-metrics">${renderCounts(airCounts)}</div></div>`}
-        <small class="city-kpi-foot" title="${esc(airFoot)}">${esc(airFoot)}</small>
+        <small class="city-kpi-foot" title="${esc(airFoot)}"><span>${airFootHtml}</span></small>
       </div>
       <div class="city-kpi">
         <h2>自行车资源</h2>
         <div class="city-kpi-body"><div class="city-kpi-metrics">${renderCounts(bikeCounts)}</div></div>
-        <small${footAttrs(bikes)}>${esc(bikes.label)}</small>
+        <small${footAttrs(bikes)}><span>${esc(bikes.label)}</span></small>
       </div>
       <div class="city-kpi">
         <h2>道路事件</h2>
         <div class="city-kpi-body"><strong>${esc(roads.available ? d.counts.roads : "—")}</strong></div>
-        <small${footAttrs(roads)}>${esc(roads.label)}</small>
+        <small${footAttrs(roads)}><span>${esc(roads.label)}</span></small>
       </div>`;
+    $("cityKpis").setAttribute("aria-busy", "false");
     $("mapWindow").textContent = "时间范围：" + time(d.start) + " 至 " + time(d.end);
     if ($("changeLocation").getAttribute?.("aria-expanded") === "true") renderLocationSearch();
     legend();
     fitInitialMap();
   }
-  async function refreshCity(reset = false) {
+  // While a replay plays, only the map layers are refreshed on every frame;
+  // detail panels (nearby, health, weather, analysis) are refreshed every few
+  // frames and once more when playback stops.
+  async function refreshCity(reset = false, { detail = true } = {}) {
     if (location.protocol === "file:") return;
     if (reset || !S.start || $("cityMode").value === "latest") resetWindow();
     const generation = ++S.generation;
@@ -1157,19 +1126,20 @@
         S.popup.remove();
         S.popup = null;
       }
-      S.lastRefresh = Date.now();
       summaries();
       drawLayers();
       highlightGis();
       renderGisTable();
       if (!S.selected) {
-        const f =
-          d.air.features.find(
-            (f) => f.properties.id === "BL0027" && f.properties.value !== null,
-          ) || d.air.features.find((f) => f.properties.value !== null);
-        if (f) await selectFeature("air", f, null, false);
+        if (detail) {
+          const f =
+            d.air.features.find(
+              (f) => f.properties.id === "BL0027" && f.properties.value !== null,
+            ) || d.air.features.find((f) => f.properties.value !== null);
+          if (f) await selectFeature("air", f, null, false);
+        }
       } else if (S.selected.kind === "point") {
-        await loadNearby();
+        if (detail) await loadNearby();
       } else {
         const bucket =
             S.selected.kind === "air"
@@ -1183,9 +1153,10 @@
             f.properties.id === p.id &&
             (bucket !== "air" || f.properties.source === p.source),
         );
-        if (f) await selectFeature(S.selected.kind, f, null, false);
-        else if (S.selected.kind === "air") await loadNearby();
-        else {
+        if (f) await selectFeature(S.selected.kind, f, null, false, { nearby: detail });
+        else if (S.selected.kind === "air") {
+          if (detail) await loadNearby();
+        } else {
           S.detailGeneration++;
           S.selected = null;
           S.comparePrefill = null;
@@ -1202,7 +1173,7 @@
           drawOverviewLocation();
         }
       }
-      if (S.page === "analysis") await loadAnalysis();
+      if (detail && S.page === "analysis") await loadAnalysis();
     } catch (e) {
       if (generation === S.generation) error(e.message);
     }
@@ -1289,28 +1260,28 @@
     text.className = "map-popup-text";
     text.style.whiteSpace = "pre-line";
     if (kind === "air")
-      text.textContent =
-        sourceNames[p.source] +
+      text.innerHTML =
+        esc(sourceNames[p.source]) +
         " · " +
-        p.kind +
+        esc(p.kind) +
         "\n" +
-        metric() +
+        metricHtml() +
         " " +
         (p.value === null
           ? "缺测"
-          : p.value + " " + (p.unit || "") + " · " + p.quality) +
+          : esc(p.value) + " " + esc(p.unit || "") + " · " + esc(p.quality)) +
         "\n观测 " +
-        time(p.observed_at) +
+        esc(time(p.observed_at)) +
         (p.age_minutes === null
           ? ""
           : " · 相隔 " +
-            p.age_minutes +
+            esc(p.age_minutes) +
             " 分钟" +
             (p.stale ? " · 已过期" : "")) +
         "\n时长 " +
-        (p.period_seconds / 60 || "—") +
+        esc(p.period_seconds / 60 || "—") +
         " 分钟 · 获取 " +
-        time(p.fetched_at);
+        esc(time(p.fetched_at));
     const archivedBike = kind === "bike" && p.snapshot_source === "public_archive";
     if (kind === "bike")
       text.textContent =
@@ -1458,7 +1429,7 @@
       if (selected && focus) button.focus();
     }
   }
-  async function selectFeature(kind, f, lngLat = null, withPopup = true) {
+  async function selectFeature(kind, f, lngLat = null, withPopup = true, { nearby = true } = {}) {
     const previous = S.selected;
     const p = f.properties;
     const changed = !previous || previous.kind !== kind || kind === "point" ||
@@ -1498,7 +1469,7 @@
       S.popup = null;
     }
     drawOverviewLocation();
-    await loadNearby();
+    if (nearby) await loadNearby();
   }
   let compareStationsMarkup;
   function compareStationInputs() {
@@ -1579,6 +1550,7 @@
         .join("");
     if (select.innerHTML !== markup) select.innerHTML = markup;
     select.value = metricForSource(source, prefer);
+    window.AirWatchSelect?.refresh(select);
   }
   function setAnalysisSource(source, prefer) {
     $("analysisSource").value = source;
@@ -1616,11 +1588,12 @@
     paintLocalAir(`<p class="muted">${esc(message)}</p>`);
   }
   function renderLocalAir(readings) {
+    S.localAirReadings = readings;
     const items = OUTLOOK_AIR_METRICS.map(pollutant => {
-      const label = metric(pollutant);
+      const label = metricHtml(pollutant);
       const reading = readings[pollutant];
       if (!reading || reading.status === "insufficient") {
-        return `<li><p class="local-air-value"><span class="local-air-label">${esc(label)}</span> <strong>—</strong></p>
+        return `<li><p class="local-air-value"><span class="local-air-label">${label}</span> <strong>—</strong></p>
           <p class="muted">${reading ? "附近观测不足" : "读数暂不可用"}</p><p class="muted">&nbsp;</p></li>`;
       }
       const {status, value, unit, observed_at, period_seconds, stations} = reading;
@@ -1636,7 +1609,7 @@
       const referenceList = status === "estimated"
         ? `<ul id="${referenceId}" class="nearby-list air-ref-list"${S.airRefOpen[pollutant] ? "" : " hidden"}>${stations.map(station => `<li><span>${esc(station.name)}<small>${esc(station.id)} · ${esc(station.distance_m)} 米</small></span>
           <span>${esc(station.value)} ${esc(airUnit(station.unit))}</span></li>`).join("")}</ul>` : "";
-      return `<li><p class="local-air-value"><span class="local-air-label">${esc(label)}</span> <strong>${esc(value)}</strong> ${esc(airUnit(unit))}${references ? " " + references : ""}</p>
+      return `<li><p class="local-air-value"><span class="local-air-label">${label}</span> <strong>${esc(value)}</strong> ${esc(airUnit(unit))}${references ? " " + references : ""}</p>
         <p title="${esc(basis)}">${esc(basis)}</p><p class="muted" title="${esc(time(observed_at))}${duration ? ` · ${duration}` : ""}">${esc(time(observed_at))}${duration ? ` · ${duration}` : ""}</p>${referenceList}</li>`;
     });
     S.localAirHasData = true;
@@ -1808,6 +1781,8 @@
         S.localAirKey = key;
       }
       renderNearbyResources(data, queryParams.cursor);
+      S.nearbyData = data;
+      S.nearbyCursor = queryParams.cursor;
       await prefillNearbyComparison(selected, data, queryParams, generation);
     } catch (e) {
       if (generation !== S.detailGeneration) return;
@@ -2663,7 +2638,6 @@
   $("healthGroup").addEventListener("change", renderCitizen);
   $("localAir").addEventListener("click", toggleAirReferences);
   $("closeGisTable")?.addEventListener?.("click", () => $("gisTableDialog").close());
-  $("closeLinkage")?.addEventListener?.("click", () => $("linkageDialog").close());
   OUTLOOK_TABS.forEach((name, index) => {
     const button = $("outlookTab-" + name);
     button.addEventListener("click", () => showOutlookTab(name));
@@ -2763,6 +2737,7 @@
   $("replayPlay").addEventListener("click", async () => {
     if (S.playback) {
       stopReplay();
+      await refreshCity(false);
       return;
     }
     const playback = S.playback = {};
@@ -2770,16 +2745,21 @@
     const slider = $("replayHour");
     const max = Number(slider.max);
     let next = Number(slider.value) + 1;
+    let frame = 0;
     if (next > max) next = 0;
     while (S.playback === playback && next <= max) {
       slider.value = next;
       replayLabel();
-      await refreshCity();
+      // The map updates on every frame; detail panels follow every sixth one.
+      await refreshCity(false, { detail: frame++ % 6 === 0 });
       next++;
       if (S.playback === playback && next <= max)
         await new Promise((resolve) => setTimeout(resolve, 1200));
     }
-    if (S.playback === playback) stopReplay();
+    if (S.playback === playback) {
+      stopReplay();
+      await refreshCity(false);
+    }
   });
   for (const id of ["nearRadius", "roadRadius"])
     $(id).addEventListener("change", () => {
@@ -2875,15 +2855,28 @@
       window.AirWatchBikeAnalysis?.refresh();
       return;
     }
-    if (!S.start || S.page === "tables") return;
+    // Playback owns the request stream while it runs; an auto-refresh in the
+    // middle of it would fight for the same generation counter.
+    if (S.playback || !S.start || S.page === "tables") return;
     refreshCity();
   });
-  window.addEventListener("airwatch:timezone", () => {
+  // Every visible timestamp is formatted from the selected display zone, so a
+  // timezone change repaints each panel instead of only the charts.
+  function repaintForTimezone() {
     replayLabel();
     repaintOverviewWeather();
     if (S.data) summaries();
     if (S.series) drawAnalysis();
-  });
+    if (S.localAirHasData && S.localAirReadings) renderLocalAir(S.localAirReadings);
+    if (S.nearbyData) renderNearbyResources(S.nearbyData, S.nearbyCursor);
+    if (S.selected) renderCitizen();
+    renderGisTable();
+    if (S.popup && S.selected && S.map && S.ready) {
+      const lngLat = S.popup.getLngLat();
+      popup(S.selected.kind, S.selected.feature, [lngLat.lng, lngLat.lat]);
+    }
+  }
+  window.addEventListener("airwatch:timezone", repaintForTimezone);
   const gisSidebar = document.querySelector?.(".gis-sidebar");
   gisSidebar?.addEventListener("toggle", () => S.map?.resize());
   legend();
@@ -2892,5 +2885,256 @@
   if (location.protocol !== "file:") {
     initMap();
     refreshCity(true).catch((e) => error(e.message));
+  }
+
+  // Native <select> options are plain text, so NO2/PM10/O3 cannot be shown with
+  // subscript digits in the browser's own popup. Keep the native select as the
+  // state/layout element and render a small rich listbox over it instead.
+  if (typeof document !== "undefined" && typeof document.createElement === "function" &&
+      typeof document.querySelectorAll === "function") {
+    const richSelectLabels = {
+      "PM2.5": "PM<sub>2.5</sub>",
+      "NO2": "NO<sub>2</sub>",
+      "PM10": "PM<sub>10</sub>",
+      "O3": "O<sub>3</sub>",
+      "PM10 指数": "PM<sub>10</sub> 指数",
+      "O3 指数": "O<sub>3</sub> 指数",
+    };
+    const richSelectWrapped = new WeakMap();
+    const richSelectEntries = [];
+    let richSelectSerial = 0;
+    const richSelectHtml = value => richSelectLabels[value] || esc(value);
+
+    const closeRichSelect = (entry, focus, defer = true) => {
+      if (entry.menu.hidden) return;
+      entry.menu.blur();
+      entry.menu.hidden = true;
+      entry.menu.removeAttribute("aria-activedescendant");
+      entry.button.setAttribute("aria-expanded", "false");
+      entry.wrap.classList.remove("open");
+      if (focus) {
+        entry.button.focus({preventScroll: true});
+        // Hiding the focused listbox can restore focus asynchronously; put it
+        // back on the trigger after that settles. Tab must keep its default
+        // navigation, so it passes defer=false.
+        if (defer) setTimeout(() => {
+          if (entry.menu.hidden) entry.button.focus({preventScroll: true});
+        }, 0);
+      }
+    };
+    const setRichSelectActive = (entry, index) => {
+      const items = entry.menu.children;
+      if (!items.length) return;
+      entry.active = (index + items.length) % items.length;
+      for (let i = 0; i < items.length; i++)
+        items[i].classList.toggle("active", i === entry.active);
+      entry.menu.setAttribute("aria-activedescendant", items[entry.active].id);
+      items[entry.active].scrollIntoView?.({block: "nearest"});
+    };
+    const buildRichSelectMenu = (entry) => {
+      const select = entry.select;
+      entry.menu.innerHTML = "";
+      Array.from(select.options).forEach((option, index) => {
+        const item = document.createElement("div");
+        item.className = "rich-select-option";
+        item.id = entry.menu.id + "-option-" + index;
+        item.setAttribute("role", "option");
+        item.setAttribute("aria-selected", String(index === select.selectedIndex));
+        item.innerHTML = richSelectHtml(option.textContent);
+        item.addEventListener("pointerdown", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        });
+        item.addEventListener("mouseenter", () => setRichSelectActive(entry, index));
+        item.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          select.selectedIndex = index;
+          select.dispatchEvent(new Event("change", {bubbles: true}));
+          closeRichSelect(entry, true);
+          refreshRichSelect(select);
+        });
+        entry.menu.appendChild(item);
+      });
+      setRichSelectActive(entry, Math.max(0, select.selectedIndex));
+    };
+    const refreshRichSelect = (select) => {
+      const entry = richSelectWrapped.get(select);
+      if (!entry) return;
+      const option = select.options[select.selectedIndex];
+      const text = option ? option.textContent : "";
+      entry.label.innerHTML = option ? richSelectHtml(text) : "";
+      entry.button.setAttribute("aria-label", (entry.labelText ? entry.labelText + " " : "") + text);
+      if (!entry.menu.hidden) buildRichSelectMenu(entry);
+    };
+    const positionRichSelect = (entry) => {
+      const rect = entry.button.getBoundingClientRect();
+      // The menu is portaled to <body>/<dialog>, so match the control's font
+      // size explicitly instead of inheriting the page's base font.
+      entry.menu.style.fontSize = getComputedStyle(entry.button).fontSize;
+      entry.menu.style.minWidth = Math.round(rect.width) + "px";
+      const menuRect = entry.menu.getBoundingClientRect();
+      const margin = 8;
+      const gap = 4;
+      const left = Math.max(margin, Math.min(rect.left, window.innerWidth - menuRect.width - margin));
+      let top = rect.bottom + gap;
+      if (top + menuRect.height > window.innerHeight - margin &&
+          rect.top - gap - menuRect.height >= margin)
+        top = rect.top - gap - menuRect.height;
+      entry.menu.style.left = Math.round(left) + "px";
+      entry.menu.style.top = Math.round(top) + "px";
+    };
+    const openRichSelect = (entry) => {
+      if (!entry.menu.hidden || !entry.select.options.length) return;
+      buildRichSelectMenu(entry);
+      if (entry.menu.parentNode !== entry.portal) entry.portal.appendChild(entry.menu);
+      entry.menu.hidden = false;
+      entry.menu.style.visibility = "hidden";
+      positionRichSelect(entry);
+      entry.menu.style.visibility = "";
+      entry.wrap.classList.add("open");
+      entry.button.setAttribute("aria-expanded", "true");
+      entry.menu.focus({preventScroll: true});
+    };
+    const closeAllRichSelects = (event) => {
+      for (const entry of richSelectEntries)
+        if (!entry.menu.hidden && !entry.menu.contains(event?.target))
+          closeRichSelect(entry, false);
+    };
+    const toggleRichSelect = (entry) => {
+      if (entry.menu.hidden) openRichSelect(entry);
+      else closeRichSelect(entry, true);
+    };
+    const enhanceRichSelect = (select) => {
+      if (richSelectWrapped.has(select) || !select.parentNode) return;
+      // index.html pre-renders the visual shell (wrapper, button and label) so
+      // the first paint already looks like the custom control instead of a
+      // native <select>; only selects added later need the shell built here.
+      let wrap = select.parentElement?.classList?.contains("rich-select")
+        ? select.parentElement : null;
+      if (!wrap) {
+        wrap = document.createElement("span");
+        wrap.className = "rich-select";
+        select.parentNode.insertBefore(wrap, select);
+        wrap.appendChild(select);
+      }
+      let button = wrap.querySelector(":scope > .rich-select-button");
+      if (button) {
+        // The shell is inert until this point (aria-hidden + tabindex -1 so
+        // clicks and focus go to the native select underneath).
+        button.removeAttribute("aria-hidden");
+        button.removeAttribute("tabindex");
+      } else {
+        button = document.createElement("button");
+        button.type = "button";
+        button.className = "rich-select-button";
+        wrap.appendChild(button);
+      }
+      const serial = ++richSelectSerial;
+      button.id = "rich-select-button-" + serial;
+      button.setAttribute("aria-haspopup", "listbox");
+      button.setAttribute("aria-expanded", "false");
+      let label = button.querySelector(".rich-select-value");
+      if (!label) {
+        label = document.createElement("span");
+        label.className = "rich-select-value";
+        button.insertBefore(label, button.firstChild);
+      }
+      if (!button.querySelector(".rich-select-arrow")) {
+        const arrow = document.createElement("span");
+        arrow.className = "rich-select-arrow";
+        arrow.setAttribute("aria-hidden", "true");
+        button.appendChild(arrow);
+      }
+      const menu = document.createElement("div");
+      menu.className = "rich-select-menu";
+      menu.id = "rich-select-menu-" + serial;
+      menu.setAttribute("role", "listbox");
+      menu.tabIndex = -1;
+      menu.hidden = true;
+      button.setAttribute("aria-controls", menu.id);
+      wrap.appendChild(menu);
+
+      const parentLabel = select.closest?.("label") || null;
+      const labelText = parentLabel
+        ? Array.from(parentLabel.childNodes).filter(node => node.nodeType === 3)
+          .map(node => node.textContent.trim()).filter(Boolean).join(" ")
+        : "";
+      const entry = {wrap, button, label, menu, select, parentLabel, labelText, active: 0,
+        portal: select.closest?.("dialog") || document.body};
+      richSelectWrapped.set(select, entry);
+      richSelectEntries.push(entry);
+      menu.setAttribute("aria-label", (labelText ? labelText + " " : "") + "选项");
+      select.setAttribute("aria-hidden", "true");
+      select.tabIndex = -1;
+      // If the native select was focused before the script ran, keep keyboard
+      // focus on the equivalent (now visible) control instead of the hidden
+      // select.
+      if (document.activeElement === select) button.focus({preventScroll: true});
+      if (entry.portal !== document.body)
+        entry.portal.addEventListener?.("scroll", (event) => {
+          if (!entry.menu.hidden && !entry.menu.contains(event.target)) closeRichSelect(entry, false);
+        }, true);
+
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        toggleRichSelect(entry);
+      });
+      button.addEventListener("keydown", (event) => {
+        if (event.key === "ArrowDown" || event.key === "ArrowUp" ||
+            event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          openRichSelect(entry);
+        } else if (event.key === "Escape") {
+          closeRichSelect(entry, false);
+        }
+      });
+      menu.addEventListener("keydown", (event) => {
+        const count = select.options.length;
+        if (!count) return;
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          setRichSelectActive(entry, entry.active + 1);
+        } else if (event.key === "ArrowUp") {
+          event.preventDefault();
+          setRichSelectActive(entry, entry.active - 1);
+        } else if (event.key === "Home") {
+          event.preventDefault();
+          setRichSelectActive(entry, 0);
+        } else if (event.key === "End") {
+          event.preventDefault();
+          setRichSelectActive(entry, count - 1);
+        } else if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          entry.menu.children[entry.active]?.click();
+        } else if (event.key === "Escape") {
+          event.preventDefault();
+          closeRichSelect(entry, true);
+        } else if (event.key === "Tab") {
+          closeRichSelect(entry, true, false);
+        }
+      });
+      parentLabel?.addEventListener("click", (event) => {
+        if (event.target === select || event.target === parentLabel) {
+          event.preventDefault();
+          toggleRichSelect(entry);
+        }
+      });
+      select.addEventListener("change", () => refreshRichSelect(select));
+      if (typeof MutationObserver === "function")
+        new MutationObserver(() => refreshRichSelect(select)).observe(select, {childList: true});
+      refreshRichSelect(select);
+    };
+    window.AirWatchSelect = {refresh: refreshRichSelect};
+    Array.from(document.querySelectorAll("select[data-rich-select]")).forEach(enhanceRichSelect);
+    document.addEventListener?.("pointerdown", (event) => {
+      for (const entry of richSelectEntries)
+        if (!entry.menu.hidden && !entry.wrap.contains(event.target) &&
+            !entry.parentLabel?.contains(event.target) &&
+            !entry.menu.contains(event.target))
+          closeRichSelect(entry, false);
+    });
+    window.addEventListener?.("resize", () => closeAllRichSelects());
+    window.addEventListener?.("scroll", closeAllRichSelects, true);
   }
 })();

@@ -53,13 +53,13 @@ powershell -ExecutionPolicy Bypass -File tools\install_live_task.ps1 -Python .\.
 
 ## 数据与时间
 
-数据库默认是 `data/live/airwatch_live.sqlite3`（可用 `URBANFLOW_DB` 覆盖，Web 服务、采集、`diagnose_data.py` 和备份工具统一读取该变量）；压缩原始响应在 `data/live/raw/<来源>/<UTC日期>/`，默认保留 90 天。`tools/backup_db.py` 可在采集运行时生成一致性备份。结构化记录长期保留。站点以 `(source, source_id)` 区分，不因名称相同而合并。数据库采用 UTC ISO 时间，同时保留原始时间文本和 `time_basis`。TfL 停靠站如无源时间，则以获取时间记一条快照并标记 `retrieval_time`；这不代表设备实际观测时间。气象局的 geohash/区域名不等于气象站精确经纬度，因此坐标保持空值。
+数据库默认是 `data/live/airwatch_live.sqlite3`（可用 `URBANFLOW_DB` 覆盖，Web 服务、采集、`diagnose_data.py` 和备份工具统一读取该变量）；压缩原始响应在 `data/live/raw/<来源>/<UTC日期>/`，默认保留 90 天。`tools/backup_db.py` 可在采集运行时生成一致性备份。道路事件的解析结果只保存在 `raw/tfl`，`traffic_batches` 仅保留时间、SHA 与计数；`tools/prune_db.py` 按保留期清理自行车快照、批次、修订历史和采集日志，`measurements` 不参与清理。结构化记录长期保留。站点以 `(source, source_id)` 区分，不因名称相同而合并。数据库采用 UTC ISO 时间，同时保留原始时间文本和 `time_basis`。TfL 停靠站如无源时间，则以获取时间记一条快照并标记 `retrieval_time`；这不代表设备实际观测时间。气象局的 geohash/区域名不等于气象站精确经纬度，因此坐标保持空值。
 
 `measurements` 按指标保存浓度、指数、气象值或自行车数。浓度和指数使用不同 `metric`；缺失或负值不填零。LAQN 小时浓度接口未提供逐值质量标记，因此存 `U`；15 分钟 CSV 则保留 `P`（暂定）或 `R`（已审定）。两种浓度使用同一 `metric`，以 `period_seconds=3600` 或 `900` 区分。`road_events` 保存当前道路事件，`event_versions` 和 `measurement_versions` 保存变更前的版本。`fetch_runs` 留存每次请求的 HTTP 状态、耗时（`duration_ms`）、解析计数、最新观测时间和响应 SHA256；`job_state` 供到期判断与 `status` 命令使用。
 
 ## 来源与限制
 
-- LAQN：[接口目录](https://api.erg.ic.ac.uk/AirQuality/help)与[15 分钟 CSV 说明](https://www.londonair.org.uk/london/asp/datadownload.asp)。每日动态发现伦敦组活动站。每小时收录 PM₁₀ 和 O₃ 的最新小时指数，获取最近约 48 小时的小时浓度，并逐站下载四种污染物的 15 分钟 CSV。CSV 首次补取最近 7 天，之后每小时重取最近约 48 小时以接收修订。CSV 的 `ReadingDateTime` 是观测时段开始时间，但无时区标识；经与 LAQN GMT 小时标签及英国夏令时切换日的 96 个时段核对后，按 GMT 解释，并在 `time_basis` 标记该推断。普通质量浓度单位规范为 `ug/m3`；若颗粒物的单位注明 `reference equiv by VCM` 等换算信息，则原样保留。CSV 的 15 分钟粒度不保证 15 分钟发布延迟；各站是否有值以原始文件为准。该来源建议由单一采集端代理和缓存，勿让每个浏览器直接轮询。
+- LAQN：[接口目录](https://api.erg.ic.ac.uk/AirQuality/help)与[15 分钟 CSV 说明](https://www.londonair.org.uk/london/asp/datadownload.asp)。每日动态发现伦敦组活动站。每小时收录 PM₁₀ 和 O₃ 的最新小时指数，获取最近约 48 小时的小时浓度，并逐站下载四种污染物的 15 分钟 CSV。CSV 首次补取最近 7 天，之后每小时重取最近约 24 小时以接收修订。上游没有批量浓度接口，逐站请求之间至少间隔 1.25 秒；常规运行只请求数据已过期的站点（小时浓度超过 55 分钟、15 分钟浓度超过 45 分钟），每天 03:00 的一次运行会重读全部站点以接收上游补发，设置 `URBANFLOW_LAQN_FULL=1` 可随时强制全量。CSV 的 `ReadingDateTime` 是观测时段开始时间，但无时区标识；经与 LAQN GMT 小时标签及英国夏令时切换日的 96 个时段核对后，按 GMT 解释，并在 `time_basis` 标记该推断。普通质量浓度单位规范为 `ug/m3`；若颗粒物的单位注明 `reference equiv by VCM` 等换算信息，则原样保留。CSV 的 15 分钟粒度不保证 15 分钟发布延迟；各站是否有值以原始文件为准。该来源建议由单一采集端代理和缓存，勿让每个浏览器直接轮询。
 - Breathe London：`breathe_web_hourly` 每小时读取[官网地图数据](https://www.breathelondon.org/api/air-quality.json)，更新站点目录和 PM₂.₅、NO₂ 浓度。每个指标使用自己的来源时间。随后 `breathe_web_reconcile` 每次最多为 12 个活动站补查最近 48 小时的[站点曲线](https://www.breathelondon.org/sensors/sensor-profile?sitecode=BL0027)。优先补查尚未检查的站；已检查站在观测超过 3 小时且距上次成功补查至少 1 小时后可再次补查，其他成功站至少间隔 24 小时，单站失败后至少间隔 1 小时。SQLite 保存每站进度。相同观测优先使用曲线记录，保留修订历史，质量状态为 `U`。用 `status` 查看最新观测和 `breathe_web_coverage`，后者统计过去 24 小时成功补查的活动站及最近一次补查失败的活动站。成功补查也可能返回空序列。
 
 旧版写入的 PM₂.₅ 和 NO₂ 指数留存于 SQLite，数据中心查询会滤掉这两项。上游原始响应按现有保留期归档。
@@ -116,6 +116,8 @@ python tools/collect_live.py status
 
 附近查询设置 `include_air_metrics=1` 时，`local_air_by_metric` 按污染物返回四项地点读数。气象查询设置 `context_only=1` 时，返回站点编号 `station`、站名 `station_name` 及时间窗口内最新的一组气象观测 `latest`；同时设置 `aggregate=mean` 时，`station_name` 为「伦敦 N 站平均」，`latest` 中温度、湿度、风速、气压按各项可用站点平均，并带 `samples` 站数与单位。
 
-智慧出行使用 `POST /api/journeys/plan`，请求体含 `[经度,纬度]` 的 `start`、`end`，`mode=shared_bike / walk / personal_bike`，以及 `max_walk_m=1000 / 2000`。服务器只读取最新 TfL BikePoint 快照，超过 15 分钟时不推荐取还车站。取车站需要至少 1 辆车，还车站需要至少 1 个空位。道路路线由 openrouteservice 的步行与骑行服务计算，需在启动服务的进程中设置 `ORS_API_KEY`。密钥保存在服务端。
+智慧出行使用 `POST /api/journeys/plan`，请求体含 `[经度,纬度]` 的 `start`、`end`，`mode=shared_bike / walk / personal_bike`，以及 `max_walk_m=1000 / 2000`。服务器只读取最新 TfL BikePoint 快照，超过 15 分钟时不推荐取还车站。取车站需要至少 1 辆车，还车站需要至少 1 个空位。共享单车方案还会比较起点到终点的直达步行路线；步行全程比最优共享单车方案（含取还车步行）至少快 120 秒时，响应改为单段步行路线。取车与还车站为同一站点时也直接改用步行路线，并且不会把该站点组合放入 `alternatives`。请求携带 `pickup_id`、`dropoff_id` 时视为用户显式选站，不自动回退；两者相同时返回 400。道路路线由 openrouteservice 的步行与骑行服务计算，需在启动服务的进程中设置 `ORS_API_KEY`。密钥保存在服务端。
 
 响应的 `context.route_air` 按实际道路折线返回有序分块与污染物汇总。服务以每个分块的中点估计浓度，每块通常不超过 250 米，长路线最多取 120 块。LAQN 和 Breathe London 分别使用近三小时的监测数据计算，覆盖率按有估计结果的分块长度占全程距离的比例计算。沿途估计、监测依据和 Defra 的 Greater London DAQI 地区等级可在「出行环境参考」查看。路线服务失败时，该页签仍显示 DAQI 状态。
+
+响应的 `fallback` 取值为 `null`、`{"reason":"walk_better","walk_duration_s":…,"bike_duration_s":…}`、`{"reason":"same_station"}` 或 `{"reason":"bike_unavailable"}`。后三者分别表示步行明显更快、取还车站相同以及快照不可用/无车无空位/没有可达站点组合时自动切换为步行；`alternatives` 始终只列出取还车站不同的组合，供用户改回共享单车。同一站点组合的距离矩阵和道路路线在 10 分钟内复用；一次共享单车规划并发请求 3 个距离矩阵与直达步行路线，再并发请求 3 段道路路线，减少串行等待。

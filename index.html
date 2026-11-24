@@ -20,7 +20,7 @@
 <body>
 <noscript><p class="notice">请启用 JavaScript 以查询数据库。</p></noscript>
 <header>
-  <div class="brand"><div class="brandmark" aria-hidden="true">⌁</div><div><span class="wordmark">London <b>UrbanFlow</b></span><h1>伦敦环境与出行观测平台</h1></div></div>
+  <div class="brand"><div class="brandmark" aria-hidden="true"><img src="assets/big-ben.png" alt="" width="48" height="48"></div><div><span class="wordmark">London <b>UrbanFlow</b></span><h1>伦敦环境与出行观测平台</h1></div></div>
   <div class="updates">
     <details class="update-progress" id="updateProgress" hidden>
       <summary><span id="updateStatus" role="status"></span></summary>
@@ -45,7 +45,37 @@
         <h2 id="weatherKpiTitle">伦敦气象背景</h2>
         <div id="outlookWeather" class="city-kpi-weather-body" aria-live="polite"><div class="city-kpi-body"><p class="muted">选点后查看气象观测。</p></div><small class="city-kpi-foot">&nbsp;</small></div>
       </section>
-      <div id="cityKpis" class="city-kpi-cards"></div>
+      <!-- Placeholder cards mirror summaries() so the KPI row keeps its final
+           height while /api/map is still loading; the numbers show an em dash. -->
+      <div id="cityKpis" class="city-kpi-cards" aria-busy="true">
+        <div class="city-kpi">
+          <h2>有值空气监测点</h2>
+          <div class="city-kpi-body">
+            <table class="city-kpi-air" aria-label="各污染物有值站点数">
+              <thead><tr><td aria-hidden="true"></td><th scope="col">LAQN</th><th scope="col">Breathe London</th></tr></thead>
+              <tbody>
+                <tr><th scope="row">PM2.5</th><td><strong>—</strong></td><td><strong>—</strong></td></tr>
+                <tr><th scope="row">NO2</th><td><strong>—</strong></td><td><strong>—</strong></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <small class="city-kpi-foot">&nbsp;</small>
+        </div>
+        <div class="city-kpi">
+          <h2>自行车资源</h2>
+          <div class="city-kpi-body"><div class="city-kpi-metrics">
+            <div><small>空站数量</small><strong>—</strong></div>
+            <div><small>满站数量</small><strong>—</strong></div>
+            <div><small>有车有空位</small><strong>—</strong></div>
+          </div></div>
+          <small class="city-kpi-foot">&nbsp;</small>
+        </div>
+        <div class="city-kpi">
+          <h2>道路事件</h2>
+          <div class="city-kpi-body"><strong>—</strong></div>
+          <small class="city-kpi-foot">&nbsp;</small>
+        </div>
+      </div>
     </div>
     <div class="city-grid">
       <section class="panel geo-panel">
@@ -54,7 +84,7 @@
             <h2>伦敦环境与出行分布</h2>
             <p id="mapWindow"></p>
             <div class="map-toolbar">
-              <label>污染指标<select id="cityMetric"><option value="PM25">PM₂.₅</option><option value="NO2">NO₂</option><option value="PM10">PM₁₀</option><option value="O3">O₃</option></select></label>
+              <label>污染指标<span class="rich-select"><select id="cityMetric" data-rich-select><option value="PM25">PM2.5</option><option value="NO2">NO2</option><option value="PM10">PM10</option><option value="O3">O3</option></select><button type="button" class="rich-select-button" aria-hidden="true" tabindex="-1"><span class="rich-select-value">PM<sub>2.5</sub></span><span class="rich-select-arrow" aria-hidden="true"></span></button></span></label>
               <label>查看方式<select id="cityMode"><option value="latest">最新状态</option><option value="history">历史回放</option></select></label>
               <label class="check pollution-toggle"><input id="pollutionZones" type="checkbox"> 污染划分</label>
               <button id="pickOverviewLocation" type="button" aria-pressed="false" disabled>选点</button>
@@ -251,7 +281,7 @@
     <nav class="analysis-tabs" aria-label="分析模块"><button type="button" data-analysis-tab="series" class="active" aria-pressed="true">污染趋势</button><button type="button" data-analysis-tab="heatmap" aria-pressed="false">小时热力</button><button type="button" data-analysis-tab="coverage" aria-pressed="false">覆盖与缺测</button><button type="button" data-analysis-tab="weather" aria-pressed="false">气象关联</button><button type="button" data-analysis-tab="bike" aria-pressed="false">自行车时空分析</button><button type="button" data-analysis-tab="borough" aria-pressed="false">行政区覆盖</button></nav>
     <div id="analysisSelection" class="panel analysis-selection" role="group" aria-label="当前分析模块参数">
       <label data-analysis-control="source">分析来源<select id="analysisSource"><option value="laqn">LAQN 参考站</option><option value="breathe">Breathe London 传感器</option></select></label>
-      <label data-analysis-control="metric">污染指标<select id="analysisMetric"></select></label>
+      <label data-analysis-control="metric">污染指标<span class="rich-select"><select id="analysisMetric" data-rich-select></select><button type="button" class="rich-select-button" aria-hidden="true" tabindex="-1"><span class="rich-select-value"></span><span class="rich-select-arrow" aria-hidden="true"></span></button></span></label>
       <div class="compare-select" data-analysis-control="compare">
         <span id="compareStationsLabel">对比站点（最多 4 站）</span>
         <details id="compareStationsPicker">
@@ -395,7 +425,7 @@
     <button class="source" data-source="metoffice"><strong>Met Office</strong><span>地面气象观测</span><small id="badge-metoffice">读取中</small></button>
     <button class="source" data-source="boundaries"><strong>伦敦行政区划</strong><span>大伦敦与 33 个行政区</span><small>2025 年边界</small></button>
   </nav>
-  <section id="collectionStatus" class="panel status-panel"><details><summary>采集状态 <span id="statusSummary"></span></summary><div id="sourceStatus"></div></details></section>
+  <section id="collectionStatus" class="panel status-panel"><details><summary>采集状态 <span id="statusSummary"></span></summary><p id="statusError" class="notice error" role="alert" hidden></p><div id="sourceStatus"></div></details></section>
   <section class="panel data-results" aria-labelledby="tableTitle">
     <div class="panel-title">
       <div><h2 id="tableTitle">LAQN 最新浓度</h2><p id="tableDescription">每项读数显示各自的观测时间</p></div>
@@ -441,8 +471,10 @@
       <div class="map-attribution-body">
         <section>
           <h3>地图与边界</h3>
-          <div class="map-basemap-live"></div>
-          <p class="map-basemap-fallback">
+          <!-- Static basemap credit. MapLibre also injects the style's own
+               attribution, but it is dropped below so this paragraph never
+               rewraps after load (which used to change the card height). -->
+          <p class="map-basemap-credit">
             <a href="https://openfreemap.org/" target="_blank" rel="noopener">OpenFreeMap</a> ·
             <a href="https://openmaptiles.org/" target="_blank" rel="noopener">© OpenMapTiles</a> ·
             <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a>
@@ -471,7 +503,6 @@
   </details>
 </template>
 <dialog id="gisTableDialog" class="workspace-dialog"><div class="dialog-header"><h2>图层属性表</h2><button id="closeGisTable" type="button">关闭 ×</button></div></dialog>
-<dialog id="linkageDialog" class="workspace-dialog"><div class="dialog-header"><h2>周边详情</h2><button id="closeLinkage" type="button">关闭 ×</button></div></dialog>
 <dialog id="detail" aria-labelledby="detailTitle">
   <div class="dialog-header"><div><h2 id="detailTitle">站点详情</h2><p id="detailSubtitle"></p></div><button id="closeDetail" type="button" aria-label="关闭详情">关闭 ×</button></div>
   <div id="detailError" class="notice error" hidden role="alert"></div>
@@ -479,7 +510,7 @@
     <details id="stationMetadata" class="metadata-section"><summary>站点元数据</summary><div id="metadata" class="metadata"></div></details>
     <h3>最近 48 小时观测</h3>
     <div class="filters">
-      <label>指标<select id="historyMetric"><option value="">全部指标</option></select></label>
+      <label>指标<span class="rich-select"><select id="historyMetric" data-rich-select><option value="">全部指标</option></select><button type="button" class="rich-select-button" aria-hidden="true" tabindex="-1"><span class="rich-select-value">全部指标</span><span class="rich-select-arrow" aria-hidden="true"></span></button></span></label>
       <label>观测时长<select id="historyPeriod"><option value="">全部时长</option><option value="900">15 分钟</option><option value="3600">1 小时</option><option value="0">快照</option></select></label>
       <button id="queryHistory" class="primary">查询</button>
     </div>

@@ -17,6 +17,7 @@ import collect_live as collector
 import live_sources as p
 import live_store as s
 import import_breathe_wcc as wcc
+import traffic_history
 
 
 def breathe_map_row(sid="BL0027", **updates):
@@ -294,7 +295,7 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(collector.laqn_15min(self.db,f,now)[0],1)
             self.assertEqual(collector.laqn_15min(self.db,f,now)[0],0)
         self.assertIn("start=10-nov-2026",calls[0])
-        self.assertIn("start=15-nov-2026",calls[1])
+        self.assertIn("start=16-nov-2026",calls[1])
         self.assertEqual(self.db.execute("SELECT value_num,quality,period_seconds,revision FROM measurements").fetchone()[:],
                          (5.1,"R",900,2))
         self.assertEqual(self.db.execute("SELECT old_value_num,old_quality FROM measurement_versions").fetchone()[:],
@@ -449,6 +450,117 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(wcc.london_local_to_utc("2026-10-25 01:00:00.0000000"))
         self.assertEqual(wcc.london_local_to_utc("2026-10-25 02:00:00.0000000"),
                          "2026-10-25T02:00:00+00:00")
+
+
+class TrafficPayloadTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.db = s.connect(self.root / "live.sqlite3")
+
+    def tearDown(self):
+        self.db.close()
+        self.temp.cleanup()
+
+    def test_save_roads_skips_payload_when_the_archive_holds_the_response(self):
+        events = [{"id": "E1", "location": "Road"}]
+        stamp = "2026-11-23T10:05:00+00:00"
+        raw_dir = self.root / "raw" / "tfl" / stamp[:10]
+        raw_dir.mkdir(parents=True)
+        with gzip.open(raw_dir / "sha.json.gz", "wt", encoding="utf-8") as handle:
+            json.dump(events, handle)
+        traffic_history.save_roads(self.db, events, stamp, "sha", root=self.root)
+        row = self.db.execute("SELECT payload_json,record_count FROM traffic_batches").fetchone()
+        self.assertIsNone(row["payload_json"])
+        self.assertEqual(row["record_count"], 1)
+        loaded = traffic_history.road_events(
+            {"payload_json": None, "raw_sha256": "sha", "captured_at_utc": stamp}, self.root)
+        self.assertEqual(loaded, events)
+
+    def test_save_roads_keeps_payload_without_an_archive(self):
+        events = [{"id": "E1", "location": "Road"}]
+        traffic_history.save_roads(self.db, events, "2026-11-23T10:05:00+00:00",
+                                   "missing", root=self.root)
+        stored = self.db.execute("SELECT payload_json FROM traffic_batches").fetchone()[0]
+        self.assertEqual(json.loads(stored), events)
+
+
+def laqn_index_payload(sids, stamp="2026-11-17 11:00:00"):
+    return {"HourlyAirQualityIndex":{"LocalAuthority":[{"@LocalAuthorityName":"London","Site":[
+        {"@SiteCode":sid,"@SiteName":sid,"@SiteType":"Roadside","@Latitude":"51.5",
+         "@Longitude":"-0.1","@BulletinDate":stamp,
+         "Species":[{"@SpeciesCode":"PM25","@AirQualityIndex":"2"}]} for sid in sids]}]}}
+
+
+class LaqnIncrementalTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory()
+        self.root=Path(self.temp.name)
+        self.db=s.connect(self.root/"test.sqlite3")
+        self.now=datetime(2026,11,17,12,0,tzinfo=timezone.utc)
+
+    def tearDown(self):
+        self.db.close()
+        self.temp.cleanup()
+
+    def _seed(self,sid,valid_at,period=3600):
+        s.location(self.db,"laqn",sid,lat=51.5,lon=-.1)
+        s.measurement(self.db,"laqn",sid,"PM25_CONCENTRATION",valid_at,valid_at,period,"hour",
+                      value_num=5,unit="ug/m3",sha="seed")
+        self.db.commit()
+
+    def _fetcher(self,concentrations_sid="B"):
+        index=laqn_index_payload(("A","B"))
+        concentrations={"AirQualityData":{"@SiteCode":concentrations_sid,"Data":[
+            {"@SpeciesCode":"PM25","@MeasurementDateGMT":"2026-11-17 11:00:00","@Value":"7"}]}}
+        owner=self
+        class Fetcher:
+            raw_root=self.root
+            calls=[]
+            def get(self,source,job,url,headers=None):
+                self.calls.append(url)
+                return (index if "MonitoringIndex" in url else concentrations),"sha-%d"%len(self.calls)
+            def mark(self,*args,**kwargs):
+                pass
+        return Fetcher()
+
+    def test_sites_due_returns_only_stale_or_missing_sites(self):
+        self._seed("A",(self.now-timedelta(minutes=10)).isoformat())
+        self._seed("B",(self.now-timedelta(hours=2)).isoformat())
+        s.location(self.db,"laqn","C",lat=51.5,lon=-.1)
+        self.db.commit()
+        due=collector.sites_due(self.db,"laqn",3600,timedelta(minutes=55),self.now)
+        self.assertEqual(due,["B","C"])
+
+    def test_laqn_hourly_skips_sites_that_already_published(self):
+        self._seed("A",(self.now-timedelta(minutes=10)).isoformat())
+        self._seed("B",(self.now-timedelta(hours=2)).isoformat())
+        fetcher=self._fetcher()
+        count,last=collector.laqn_hourly(self.db,fetcher,self.now)
+        site_calls=[url for url in fetcher.calls if "/Data/Site/SiteCode=" in url]
+        self.assertEqual(len(site_calls),1,site_calls)
+        self.assertIn("SiteCode=B",site_calls[0])
+        self.assertGreater(count,0)
+
+    def test_hourly_deep_pass_reads_every_site(self):
+        self._seed("A",(self.now-timedelta(minutes=10)).isoformat())
+        self._seed("B",(self.now-timedelta(minutes=10)).isoformat())
+        fetcher=self._fetcher()
+        deep=self.now.replace(hour=collector.LAQN_DEEP_PASS_HOUR)
+        collector.laqn_hourly(self.db,fetcher,deep)
+        site_calls=[url for url in fetcher.calls if "/Data/Site/SiteCode=" in url]
+        self.assertEqual(len(site_calls),2,site_calls)
+
+    def test_prune_runs_once_per_day(self):
+        class Fetcher:
+            raw_root=self.root
+        with patch.object(collector,"SCHEDULE",()), \
+                patch.object(collector.store,"prune_raw",return_value=0) as prune:
+            collector.run_once(self.db,Fetcher(),self.now.replace(hour=collector.RAW_PRUNE_HOUR))
+            prune.assert_called_once()
+            prune.reset_mock()
+            collector.run_once(self.db,Fetcher(),self.now.replace(hour=collector.RAW_PRUNE_HOUR+1))
+            prune.assert_not_called()
 
 
 if __name__=="__main__":unittest.main()

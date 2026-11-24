@@ -28,11 +28,13 @@ const context = {
   window: {dispatchEvent(event) { dispatched.push(event); }, addEventListener() {}},
   document: {getElementById: element, addEventListener() {}},
   location: {protocol: "file:"},
-  fetch: async url => ({ok: true, async json() {
-    if (url.startsWith("/api/")) return {items: [], total: 0};
-    return JSON.parse(fs.readFileSync(path.join(root, url.slice(1)), "utf8"));
-  }}),
+  fetch: async url => {
+    const payload = url.startsWith("/api/") ? {items: [], total: 0}
+      : JSON.parse(fs.readFileSync(path.join(root, url.slice(1)), "utf8"));
+    return {ok: true, status: 200, text: async () => JSON.stringify(payload)};
+  },
   CustomEvent: function (name, options) { this.type = name; this.detail = options.detail; },
+  AbortController, setTimeout, clearTimeout,
   URLSearchParams, Date, Intl, Promise, Map, Set, console,
 };
 vm.runInNewContext(source, context);

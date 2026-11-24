@@ -1,5 +1,6 @@
 """Current journeys and air quality context along their routed paths."""
 from bisect import bisect_left
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -17,6 +18,7 @@ import xml.etree.ElementTree as ET
 from city_analysis import (AIR_ESTIMATE_NEAREST_M, AIR_ESTIMATE_RADIUS_M, distance, dt,
                            geometry_distance, local_air_unit, valid_air_value, valid_coordinate,
                            weighted_air_value)
+from caching import TTLCache
 from secure_curl import curl_https, open_https, urllib_https
 
 UTC = timezone.utc
@@ -26,7 +28,21 @@ METRICS = ("PM25", "PM10", "NO2", "O3")
 AIR_SOURCES = ("laqn", "breathe")
 ROUTE_AIR_SPACING_M = 250
 MAX_ROUTE_AIR_SEGMENTS = 120
+# Seconds a routed leg or distance matrix stays reusable for repeated plans.
+ROUTE_CACHE_TTL = 600.0
+# A direct walking route has to save at least this much time over the whole
+# shared-bike itinerary before it replaces it. The margin also covers the dock
+# unlock/return time that openrouteservice does not model.
+WALK_FALLBACK_MARGIN_S = 120
+# One plan issues its matrix and directions calls in two concurrent waves, so
+# the slowest single upstream request sets the wait instead of their sum.
+ROUTE_REQUEST_WORKERS = 4
 LOGGER = logging.getLogger(__name__)
+
+
+def whole_minutes(seconds):
+    """Round an estimated duration the same way the page does."""
+    return max(1, math.floor(seconds / 60 + 0.5))
 
 
 class RoutingUnavailable(Exception):
@@ -108,46 +124,100 @@ class OpenRouteService:
 
 
 class DAQI:
+    REFRESH_AFTER = timedelta(minutes=10)
+    STALE_AFTER = timedelta(hours=3)
+
     def __init__(self, opener=None):
         self.opener = opener
         self.lock = threading.Lock()
         self.cached = None
         self.checked_at = None
+        self.refreshing = False
+        self.error = None
+
+    def _fetch(self):
+        """Read and parse the official feed; raises on any upstream problem."""
+        if self.opener is not None:
+            with self.opener(DAQI_FEED, timeout=6) as response:
+                raw = response.read()
+        else:
+            status, raw = open_https(DAQI_FEED, {"Accept": "application/xml"}, timeout=6)
+            if status != 200:
+                raise ValueError("DAQI feed unavailable")
+        root = ET.fromstring(raw)
+        item = next(row for row in root.findall("./channel/item")
+                    if row.findtext("title") == "Greater London")
+        match = re.search(r"index\s+(\d+)", item.findtext("description", ""), re.I)
+        if not match:
+            raise ValueError("DAQI index missing")
+        index = int(match.group(1))
+        if not 1 <= index <= 10:
+            raise ValueError("DAQI index outside 1..10")
+        observed = parsedate_to_datetime(item.findtext("pubDate")).astimezone(UTC)
+        band = "低" if index <= 3 else "中" if index <= 6 else "高" if index <= 9 else "极高"
+        return {"index": index, "band": band,
+                "observed_at": observed.isoformat(timespec="seconds"),
+                "source": DAQI_FEED}
+
+    def _refresh(self):
+        """Fetch in the calling thread and publish the result (or the error)."""
+        try:
+            value = self._fetch()
+        except (URLError, OSError, ValueError, StopIteration, ET.ParseError, TypeError) as exc:
+            LOGGER.warning("DAQI feed refresh failed (%s)", type(exc).__name__)
+            with self.lock:
+                self.error = type(exc).__name__
+                # Back off for a full refresh window instead of hammering upstream.
+                self.checked_at = datetime.now(UTC)
+                self.refreshing = False
+            return
+        with self.lock:
+            self.cached = value
+            self.checked_at = datetime.now(UTC)
+            self.error = None
+            self.refreshing = False
+
+    def prewarm(self):
+        """Fill the cache in the background so the first page load does not wait."""
+        with self.lock:
+            if self.cached is not None or self.refreshing:
+                return
+            self.refreshing = True
+        threading.Thread(target=self._refresh, daemon=True).start()
+
+    def _snapshot(self, now):
+        with self.lock:
+            cached = dict(self.cached) if self.cached else None
+            refreshing = self.refreshing
+        if not cached:
+            return {"status": "unavailable", "source": DAQI_FEED, "refreshing": refreshing}
+        result = dict(cached)
+        result["status"] = ("fresh" if now-dt(result["observed_at"]) <= self.STALE_AFTER
+                            else "stale")
+        result["refreshing"] = refreshing
+        return result
 
     def current(self):
         now = datetime.now(UTC)
         with self.lock:
-            if self.checked_at is None or now-self.checked_at > timedelta(minutes=10):
-                self.checked_at = now
-                try:
-                    if self.opener is not None:
-                        with self.opener(DAQI_FEED, timeout=6) as response:
-                            raw = response.read()
-                    else:
-                        status, raw = open_https(DAQI_FEED, {"Accept": "application/xml"}, timeout=6)
-                        if status != 200:
-                            raise ValueError("DAQI feed unavailable")
-                    root = ET.fromstring(raw)
-                    item = next(row for row in root.findall("./channel/item")
-                                if row.findtext("title") == "Greater London")
-                    match = re.search(r"index\s+(\d+)", item.findtext("description", ""), re.I)
-                    if not match:
-                        raise ValueError("DAQI index missing")
-                    index = int(match.group(1))
-                    if not 1 <= index <= 10:
-                        raise ValueError("DAQI index outside 1..10")
-                    observed = parsedate_to_datetime(item.findtext("pubDate")).astimezone(UTC)
-                    band = "低" if index <= 3 else "中" if index <= 6 else "高" if index <= 9 else "极高"
-                    self.cached = {"index": index, "band": band,
-                                   "observed_at": observed.isoformat(timespec="seconds"),
-                                   "source": DAQI_FEED}
-                except (URLError, OSError, ValueError, StopIteration, ET.ParseError, TypeError):
-                    pass
-            if not self.cached:
-                return {"status": "unavailable", "source": DAQI_FEED}
-            result = dict(self.cached)
-            result["status"] = "fresh" if now-dt(result["observed_at"]) <= timedelta(hours=3) else "stale"
-            return result
+            cold = (self.cached is None and not self.refreshing
+                    and (self.checked_at is None
+                         or now-self.checked_at > self.REFRESH_AFTER))
+            expired = (self.checked_at is not None
+                       and now-self.checked_at > self.REFRESH_AFTER)
+            start_refresh = expired and not self.refreshing and not cold
+            if cold:
+                self.refreshing = True
+            elif start_refresh:
+                self.refreshing = True
+        if cold:
+            # Keep the original blocking contract for the first call in a
+            # process that did not prewarm, so /api/health still has a value.
+            self._refresh()
+            return self._snapshot(now)
+        if start_refresh:
+            threading.Thread(target=self._refresh, daemon=True).start()
+        return self._snapshot(now)
 
 
 def coordinates(value, name):
@@ -300,16 +370,87 @@ class JourneyPlanner:
         self.analysis = analysis
         self.router = router or OpenRouteService()
         self.daqi = daqi or DAQI()
+        # Routing is by far the slowest and most quota-limited dependency; a
+        # short cache makes the "pick another station" loop cheap.
+        self._directions_cache = TTLCache(max_entries=256)
+        self._matrix_cache = TTLCache(max_entries=64)
+        self.route_cache_ttl = ROUTE_CACHE_TTL
+
+    @staticmethod
+    def _point_key(point):
+        return tuple(round(value,5) for value in point)
+
+    def _directions(self, profile, start, end):
+        key = (profile,self._point_key(start),self._point_key(end))
+        cached = self._directions_cache.get(key)
+        if cached is not None:
+            return cached
+        result = self.router.directions(profile, start, end)
+        self._directions_cache.put(key, result, self.route_cache_ttl)
+        return result
+
+    def _matrix(self, profile, sources, destinations):
+        key = (profile,tuple(self._point_key(point) for point in sources),
+               tuple(self._point_key(point) for point in destinations))
+        cached = self._matrix_cache.get(key)
+        if cached is not None:
+            return cached
+        result = self.router.matrix(profile, sources, destinations)
+        self._matrix_cache.put(key, result, self.route_cache_ttl)
+        return result
 
     def _air_snapshot(self, db, now):
-        air = {}
-        for metric in METRICS:
-            air[metric] = {}
-            for source in AIR_SOURCES:
-                features, _ = self.analysis.air_features(db, {"metric": metric, "source": source,
-                                                               "period": "3600"}, now-timedelta(hours=4), now, None)
-                air[metric][source] = features
+        air = {metric: {} for metric in METRICS}
+        for source in AIR_SOURCES:
+            features = self.analysis.air_features_many(
+                db, {"source": source, "period": "3600"},
+                now-timedelta(hours=4), now, None, list(METRICS))
+            for metric, (items, _values) in features.items():
+                air[metric][source] = items
         return air
+
+    @staticmethod
+    def _nearest_docks(features, point, field, max_walk):
+        """Return up to ten docks with stock inside the walk radius.
+
+        Distance is measured once per dock instead of inside every comparison of
+        a sort key, which on 800 docks removed hundreds of redundant haversines.
+        """
+        candidates = []
+        for feature in features:
+            stock = feature["properties"].get(field)
+            if stock is None or stock < 1:
+                continue
+            meters = distance(point, feature["geometry"]["coordinates"])
+            if meters <= max_walk:
+                candidates.append((meters, feature))
+        candidates.sort(key=lambda item: item[0])
+        return [feature for _meters, feature in candidates[:10]]
+
+    @staticmethod
+    def _walk_candidate(future):
+        """Resolve the direct walking route, downgrading a comparison failure.
+
+        A failed comparison must never discard an otherwise usable bike plan,
+        so only this future's routing error is swallowed; the caller keeps the
+        three-leg itinerary when ``None`` is returned.
+        """
+        if future is None:
+            return None
+        try:
+            return {"kind": "walk", **future.result()}
+        except RoutingUnavailable:
+            LOGGER.warning("walk comparison route unavailable; keeping the shared-bike plan")
+            return None
+
+    @staticmethod
+    def _walk_beats_bike(walk_s, bike_s):
+        """True when the direct walk is clearly faster than the bike itinerary."""
+        durations = (walk_s, bike_s)
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               or not math.isfinite(value) for value in durations):
+            return False
+        return walk_s >= 0 and walk_s + WALK_FALLBACK_MARGIN_S <= bike_s
 
     def plan(self, payload):
         if not isinstance(payload, dict):
@@ -333,64 +474,101 @@ class JourneyPlanner:
         context = {"start": estimate_air(air, start), "end": estimate_air(air, end), "daqi": self.daqi.current()}
         result = {"mode": mode, "start": start, "end": end, "bike_info": bike_info,
                   "road_info": road_info, "context": context, "alternatives": [], "legs": [],
-                  "alerts": [], "routing_error": None, "message": None}
+                  "alerts": [], "routing_error": None, "message": None, "fallback": None}
+        walk_leg = None
         try:
             if mode != "shared_bike":
                 profile = "foot-walking" if mode == "walk" else "cycling-regular"
-                result["legs"] = [{"kind": mode, **self.router.directions(profile, start, end)}]
+                result["legs"] = [{"kind": mode, **self._directions(profile, start, end)}]
             elif bike_info.get("stale") or bike_info.get("gap") or not bike_info.get("captured_at"):
                 result["message"] = "自行车快照缺失或超过 15 分钟，请更新数据后重新规划"
             else:
-                pickup = sorted((f for f in bikes if f["properties"]["bikes"] is not None and
-                                 f["properties"]["bikes"] >= 1 and
-                                 distance(start, f["geometry"]["coordinates"]) <= max_walk),
-                                key=lambda f: distance(start, f["geometry"]["coordinates"]))[:10]
-                dropoff = sorted((f for f in bikes if f["properties"]["empty_docks"] is not None and
-                                  f["properties"]["empty_docks"] >= 1 and
-                                  distance(end, f["geometry"]["coordinates"]) <= max_walk),
-                                 key=lambda f: distance(end, f["geometry"]["coordinates"]))[:10]
+                pickup = self._nearest_docks(bikes, start, "bikes", max_walk)
+                dropoff = self._nearest_docks(bikes, end, "empty_docks", max_walk)
                 if not pickup or not dropoff:
                     result["message"] = "起点附近无可取车辆或终点附近无可还空位" + (
                         "；可扩大步行范围" if max_walk == 1000 else "；当前搜索范围内无法使用 Santander Cycles")
                 else:
                     pcoords = [f["geometry"]["coordinates"] for f in pickup]
                     dcoords = [f["geometry"]["coordinates"] for f in dropoff]
-                    p_dist, p_time = self.router.matrix("foot-walking", [start], pcoords)
-                    d_dist, d_time = self.router.matrix("foot-walking", dcoords, [end])
-                    c_dist, c_time = self.router.matrix("cycling-regular", pcoords, dcoords)
-                    ranked = []
-                    for i, first in enumerate(pickup):
-                        for j, last in enumerate(dropoff):
-                            values = (p_dist[0][i], d_dist[j][0], c_dist[i][j],
-                                      p_time[0][i], d_time[j][0], c_time[i][j])
-                            if any(v is None or not math.isfinite(v) for v in values):
-                                continue
-                            if values[0] > max_walk or values[1] > max_walk:
-                                continue
-                            ranked.append((values[3]+values[4]+values[5], values[0]+values[1],
-                                           first["properties"]["id"], last["properties"]["id"], i, j))
-                    ranked.sort()
                     requested = (payload.get("pickup_id"), payload.get("dropoff_id"))
-                    if any(requested):
-                        chosen = next((row for row in ranked if row[2:4] == requested), None)
-                        if chosen is None:
-                            raise ValueError("所选取还车站已不可用，请重新规划")
-                        ranked.remove(chosen)
-                        ranked.insert(0, chosen)
-                    for total, walk, _, _, i, j in ranked[:3]:
-                        result["alternatives"].append({"pickup": pickup[i]["properties"],
-                             "dropoff": dropoff[j]["properties"], "duration_s": round(total),
-                             "walk_distance_m": round(walk)})
-                    if not ranked:
-                        result["message"] = "附近站点之间没有符合步行距离限制的可达骑行路线"
-                    else:
-                        i, j = ranked[0][-2:]
-                        result["legs"] = [
-                            {"kind": "walk_to_bike", **self.router.directions("foot-walking", start, pcoords[i])},
-                            {"kind": "cycle", **self.router.directions("cycling-regular", pcoords[i], dcoords[j])},
-                            {"kind": "walk_to_destination", **self.router.directions("foot-walking", dcoords[j], end)}]
+                    with ThreadPoolExecutor(max_workers=ROUTE_REQUEST_WORKERS) as pool:
+                        p_future = pool.submit(self._matrix, "foot-walking", [start], pcoords)
+                        d_future = pool.submit(self._matrix, "foot-walking", dcoords, [end])
+                        c_future = pool.submit(self._matrix, "cycling-regular", pcoords, dcoords)
+                        # The direct walk is compared against the whole bike
+                        # itinerary, so fetch it in the same wave. An explicit
+                        # station pair is a user override and never falls back.
+                        walk_future = None if any(requested) else pool.submit(
+                            self._directions, "foot-walking", start, end)
+                        p_dist, p_time = p_future.result()
+                        d_dist, d_time = d_future.result()
+                        c_dist, c_time = c_future.result()
+                        walk_leg = self._walk_candidate(walk_future)
+                        ranked = []
+                        for i, first in enumerate(pickup):
+                            for j, last in enumerate(dropoff):
+                                values = (p_dist[0][i], d_dist[j][0], c_dist[i][j],
+                                          p_time[0][i], d_time[j][0], c_time[i][j])
+                                if any(v is None or not math.isfinite(v) for v in values):
+                                    continue
+                                if values[0] > max_walk or values[1] > max_walk:
+                                    continue
+                                ranked.append((values[3]+values[4]+values[5], values[0]+values[1],
+                                               first["properties"]["id"], last["properties"]["id"], i, j))
+                        ranked.sort()
+                        # A bike has to be returned to a different station, so
+                        # a same-station pair is never a usable itinerary.
+                        selectable = [row for row in ranked if row[2] != row[3]]
+                        same_station_best = bool(ranked) and ranked[0][2] == ranked[0][3]
+                        if any(requested):
+                            if requested[0] == requested[1]:
+                                raise ValueError("取车与还车站不能为同一站点")
+                            chosen = next((row for row in selectable if row[2:4] == requested), None)
+                            if chosen is None:
+                                raise ValueError("所选取还车站已不可用，请重新规划")
+                            selectable.remove(chosen)
+                            selectable.insert(0, chosen)
+                        for total, walk, _, _, i, j in selectable[:3]:
+                            result["alternatives"].append({"pickup": pickup[i]["properties"],
+                                 "dropoff": dropoff[j]["properties"], "duration_s": round(total),
+                                 "walk_distance_m": round(walk)})
+                        if same_station_best and not any(requested) and walk_leg is not None:
+                            result["legs"] = [walk_leg]
+                            result["fallback"] = {"reason": "same_station"}
+                            result["message"] = "取车与还车站为同一站点，无法形成共享单车路线，已改用步行路线"
+                        elif selectable:
+                            i, j = selectable[0][-2:]
+                            if (walk_leg is not None and not any(requested)
+                                    and self._walk_beats_bike(walk_leg["duration_s"], selectable[0][0])):
+                                result["legs"] = [walk_leg]
+                                result["fallback"] = {
+                                    "reason": "walk_better",
+                                    "walk_duration_s": round(walk_leg["duration_s"]),
+                                    "bike_duration_s": round(selectable[0][0])}
+                                result["message"] = (
+                                    "步行全程约 " + str(whole_minutes(walk_leg["duration_s"])) + " 分钟，"
+                                    "共享单车方案约 " + str(whole_minutes(selectable[0][0])) + " 分钟"
+                                    "（含取还车步行），已改用更快的步行路线")
+                            else:
+                                specs = (("walk_to_bike", "foot-walking", start, pcoords[i]),
+                                         ("cycle", "cycling-regular", pcoords[i], dcoords[j]),
+                                         ("walk_to_destination", "foot-walking", dcoords[j], end))
+                                futures = [pool.submit(self._directions, profile, leg_start, leg_end)
+                                           for _kind, profile, leg_start, leg_end in specs]
+                                result["legs"] = [
+                                    {"kind": kind, **future.result()}
+                                    for (kind, _profile, _start, _end), future in zip(specs, futures)]
+                        else:
+                            result["message"] = (
+                                "取车与还车站为同一站点，附近没有其他可用的站点组合"
+                                if same_station_best else
+                                "附近站点之间没有符合步行距离限制的可达骑行路线")
             if result["message"] and mode == "shared_bike" and not result["legs"]:
-                result["legs"] = [{"kind": "walk", **self.router.directions("foot-walking", start, end)}]
+                if walk_leg is None:
+                    walk_leg = {"kind": "walk", **self._directions("foot-walking", start, end)}
+                result["legs"] = [walk_leg]
+                result["fallback"] = {"reason": "bike_unavailable"}
             if result["legs"] and not road_info.get("stale") and not road_info.get("gap"):
                 result["alerts"] = road_alerts(roads, result["legs"], now)
         except RoutingUnavailable as exc:

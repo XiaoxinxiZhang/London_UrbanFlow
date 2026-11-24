@@ -33,6 +33,66 @@ function testAnalysisMarkup() {
   console.log("PASS analysis module tabs and bicycle map toolbar");
 }
 
+function testOverviewKpiPlaceholders() {
+  const html = fs.readFileSync(require.resolve("../index.html"), "utf8");
+  const start = html.indexOf('<div id="cityKpis"');
+  const end = html.indexOf('<div class="city-grid">');
+  assert.ok(start >= 0 && end > start, "the overview must keep the KPI card container");
+  const kpis = html.slice(start, end);
+  assert.match(kpis, /aria-busy="true"/);
+  assert.equal((kpis.match(/class="city-kpi"/g) || []).length, 3);
+  for (const title of ["有值空气监测点", "自行车资源", "道路事件"])
+    assert.match(kpis, new RegExp(`<h2>${title}</h2>`));
+  // The air card uses the same two-row matrix as the loaded state, so the
+  // placeholder row is exactly as tall as the rendered one.
+  assert.match(kpis, /<table class="city-kpi-air"/);
+  assert.match(kpis, /<th scope="col">LAQN<\/th><th scope="col">Breathe London<\/th>/);
+  assert.equal((kpis.match(/<td><strong>—<\/strong><\/td>/g) || []).length, 4);
+  assert.equal((kpis.match(/<strong>—<\/strong>/g) || []).length, 8);
+  assert.equal((kpis.match(/class="city-kpi-foot"/g) || []).length, 3);
+  console.log("PASS overview KPI placeholders reserve card height before data arrives");
+}
+
+function testRichSelectShell() {
+  const html = fs.readFileSync(require.resolve("../index.html"), "utf8");
+  // The custom select shell is part of the HTML so the first paint already
+  // looks like the final control. If it were built only by city.js, browsers
+  // painted the native <select> first and its full-size digits/native arrow
+  // visibly shrank when the enhancement replaced it on every refresh.
+  const selects = [...html.matchAll(/<select[^>]*data-rich-select[^>]*>/g)].map(m => m.index);
+  assert.equal(selects.length, 3);
+  for (const at of selects) {
+    const before = html.slice(Math.max(0, at - 200), at);
+    assert.match(before, /<span class="rich-select">[^<]*$/, "rich select must be pre-rendered around the native select");
+    const tail = html.slice(at, at + 2000);
+    const button = tail.match(/<button[^>]*class="rich-select-button"[^>]*>/);
+    assert.ok(button, "pre-rendered shell must include the visible button");
+    assert.match(button[0], /aria-hidden="true"/, "pre-rendered button must stay inert for assistive tech");
+    assert.match(button[0], /tabindex="-1"/, "pre-rendered button must not steal focus from the native select");
+    assert.match(tail.slice(button.index), /<span class="rich-select-value">/, "pre-rendered button needs a value label");
+    assert.match(tail.slice(button.index), /<span class="rich-select-arrow"/, "pre-rendered button needs the chevron");
+  }
+  const source = fs.readFileSync(require.resolve("../assets/city.js"), "utf8");
+  assert.match(source, /button\.removeAttribute\("aria-hidden"\)/,
+    "city.js must activate the pre-rendered button when it wires the listbox");
+  assert.match(source, /button\.removeAttribute\("tabindex"\)/);
+  console.log("PASS rich select shell is pre-rendered instead of replacing the native control on load");
+}
+
+function testAttributionCardMarkup() {
+  const html = fs.readFileSync(require.resolve("../index.html"), "utf8");
+  const template = html.slice(html.indexOf('<template id="mapAttributionTemplate">'), html.indexOf("</template>", html.indexOf('<template id="mapAttributionTemplate">')));
+  // The basemap credit is static: MapLibre previously injected the style's
+  // version after load, which changed the card height while it was open.
+  assert.match(template, /class="map-basemap-credit"/);
+  assert.ok(!template.includes("map-basemap-live"));
+  assert.ok(!template.includes("map-basemap-fallback"));
+  const source = fs.readFileSync(require.resolve("../assets/city.js"), "utf8");
+  assert.match(source, /function collapseAttribution\(/, "the attribution control must collapse before the first paint");
+  assert.ok(!source.includes("collapseAttributionAfterLoad"), "the old five-second auto-expand (and its height flash) must stay removed");
+  console.log("PASS attribution card uses a static basemap credit and starts collapsed");
+}
+
 async function testMapFailure(failure) {
   const elements = new Map();
   const requests = [];
@@ -112,7 +172,7 @@ async function testMapFailure(failure) {
     requestAnimationFrame: handler => handler(),
     console, Date, Intl, Map, Set, Promise,
   };
-  const instrumented = source.replace(/\}\)\(\);\s*$/, "window.bikeTest = {S, showAnalysisSection, normalizeBoroughName, boroughCoverageModel, boroughBubbleSize, drawBikes, finishOverviewPick, heatmap, summaries, refreshOverviewWeather, repaintOverviewWeather, setWeatherMessage, renderLocalAir, toggleAirReferences, loadNearby};})();");
+  const instrumented = source.replace(/\}\)\(\);\s*$/, "window.bikeTest = {S, refreshCity, showAnalysisSection, normalizeBoroughName, boroughCoverageModel, boroughBubbleSize, drawBikes, finishOverviewPick, heatmap, summaries, refreshOverviewWeather, repaintOverviewWeather, setWeatherMessage, renderLocalAir, toggleAirReferences, loadNearby};})();");
   vm.runInNewContext(instrumented, context);
   if (failure === "network-error") events.error();
   assert.match(element("mapNotice").textContent, /未加载|无法初始化|暂不可用/);
@@ -165,14 +225,14 @@ async function testMapFailure(failure) {
     element("analysisSource").value = "breathe";
     element("analysisSource").change();
     assert.equal(element("analysisMetric").innerHTML,
-      '<option value="PM25">PM₂.₅</option><option value="NO2">NO₂</option>');
+      '<option value="PM25">PM2.5</option><option value="NO2">NO2</option>');
     assert.equal(element("analysisMetric").value, "PM25");
     element("analysisMetric").value = "NO2";
     element("analysisSource").value = "laqn";
     element("analysisSource").change();
     assert.equal(element("analysisMetric").innerHTML,
-      '<option value="PM25">PM₂.₅</option><option value="PM10">PM₁₀</option>' +
-      '<option value="NO2">NO₂</option><option value="O3">O₃</option>');
+      '<option value="PM25">PM2.5</option><option value="PM10">PM10</option>' +
+      '<option value="NO2">NO2</option><option value="O3">O3</option>');
     assert.equal(element("analysisMetric").value, "NO2");
     assert.equal(mapQueries.length, mapRequests);
 
@@ -292,11 +352,12 @@ async function testMapFailure(failure) {
     let kpis = element("cityKpis").innerHTML;
     assert.match(kpis, /class="city-kpi-air"/);
     assert.match(kpis, /<th scope="col">LAQN<\/th><th scope="col">Breathe London<\/th>/);
-    assert.match(kpis, /PM₂\.₅<\/th><td><strong>24<\/strong><\/td><td><strong>66<\/strong><\/td>/);
-    assert.match(kpis, /NO₂<\/th><td><strong>40<\/strong><\/td><td><strong>60<\/strong><\/td>/);
+    assert.match(kpis, /PM<sub>2\.5<\/sub><\/th><td><strong>24<\/strong><\/td><td><strong>66<\/strong><\/td>/);
+    assert.match(kpis, /NO<sub>2<\/sub><\/th><td><strong>40<\/strong><\/td><td><strong>60<\/strong><\/td>/);
     assert.match(kpis, /有值站点数 · 所选小时/);
     assert.equal((kpis.match(/class="city-kpi-foot"/g) || []).length, 3);
-    assert.equal((kpis.match(/所选小时无可用快照/g) || []).length, 2);
+    assert.equal((kpis.match(/class="city-kpi-foot[^"]*" title="[^"]*"><span>/g) || []).length, 3);
+    assert.equal((kpis.match(/<span>所选小时无可用快照<\/span>/g) || []).length, 2);
     assert.equal((kpis.match(/<strong>—<\/strong>/g) || []).length, 4);
     assert.doesNotMatch(kpis, /<strong>0<\/strong>/);
     S.data.bike_info = {captured_at: capturedAt, gap: false};
@@ -337,7 +398,7 @@ async function testMapFailure(failure) {
     assert.doesNotMatch(kpis, /class="city-kpi-air"/);
     assert.match(kpis, /LAQN<\/small><strong>24<\/strong>/);
     assert.match(kpis, /Breathe London<\/small><strong>66<\/strong>/);
-    assert.match(kpis, /有值站点数 · PM₂\.₅/);
+    assert.match(kpis, /有值站点数 · PM<sub>2\.5<\/sub>/);
 
     let heatmapOption;
     S.charts.regressionHeatmap = {setOption(option){heatmapOption=option;}};
@@ -437,10 +498,10 @@ async function testMapFailure(failure) {
     pending[0].resolve(response(999));
     await firstPick;
     const local = element("localAir").innerHTML;
-    assert.match(local,/PM₂\.₅<\/span> <strong>12<\/strong>/);
-    assert.match(local,/PM₁₀<\/span> <strong>17<\/strong>/);
-    assert.match(local,/NO₂<\/span> <strong>22<\/strong>/);
-    assert.match(local,/O₃[\s\S]*附近观测不足/);
+    assert.match(local,/PM<sub>2\.5<\/sub><\/span> <strong>12<\/strong>/);
+    assert.match(local,/PM<sub>10<\/sub><\/span> <strong>17<\/strong>/);
+    assert.match(local,/NO<sub>2<\/sub><\/span> <strong>22<\/strong>/);
+    assert.match(local,/O<sub>3<\/sub>[\s\S]*附近观测不足/);
     const weatherHtml = element("outlookWeather").innerHTML;
     assert.match(weatherHtml,/class="city-kpi-body"[\s\S]*class="city-kpi-foot"/);
     assert.match(weatherHtml,/class="city-kpi-weather-source"/);
@@ -651,10 +712,44 @@ async function testMapFailure(failure) {
       local_air_by_metric:{PM25:{status:"insufficient"}}});
     await refreshing;
     assert.match(element("localAir").innerHTML, /附近观测不足|读数暂不可用/);
+
+    // During playback only the map layer is refreshed; a full refresh still
+    // asks for the nearby panel. This is what keeps 48 frames affordable.
+    const {S: state, refreshCity} = context.window.bikeTest;
+    const detailFeature = {
+      type: "Feature", geometry: {type: "Point", coordinates: [-0.1, 51.5]},
+      properties: {id: "BL0027", source: "breathe", name: "Test", value: 12, stale: false,
+                   observed_at: "2026-11-22T10:00:00Z", unit: "ug/m3", quality: "R"},
+    };
+    const mapReply = {
+      air: {features: [detailFeature]}, bikes: {features: []}, roads: {features: []},
+      breaks: [], counts: {}, bike_info: {}, road_info: {}, coverage: {}, source_stats: {},
+      air_counts: {laqn: {}, breathe: {}}, air_metrics: [], start: "", end: "",
+    };
+    answer = (path) => {
+      if (path === "/api/map") return Promise.resolve(mapReply);
+      if (path === "/api/analysis/nearby")
+        return Promise.resolve({bikes: [], roads: [], air: [], available_bikes: 0,
+          empty_docks: 0, bike_info: {}, road_info: {}, trend: null,
+          local_air_by_metric: {PM25: {status: "insufficient"}}});
+      if (path === "/api/analysis/series") return Promise.resolve({available_sites: [], stations: []});
+      return Promise.resolve({});
+    };
+    state.selected = {kind: "air", feature: detailFeature, center: [-0.1, 51.5]};
+    const quiet = requests.length;
+    await refreshCity(false, {detail: false});
+    assert.deepEqual(requests.slice(quiet), ["/api/map"]);
+    const loud = requests.length;
+    await refreshCity(false);
+    assert.ok(requests.slice(loud).includes("/api/analysis/nearby"),
+      "a full refresh must still load the nearby panel");
   }
 }
 async function main() {
   testAnalysisMarkup();
+  testOverviewKpiPlaceholders();
+  testRichSelectShell();
+  testAttributionCardMarkup();
   for (const failure of ["missing-library", "webgl-failure", "network-error"]) await testMapFailure(failure);
   console.log("PASS map library, WebGL and basemap network failures preserve data queries and table navigation");
   console.log("PASS bike clusters preserve all stations, expand at street zoom, refresh and retain raw-point fallback");

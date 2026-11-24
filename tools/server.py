@@ -20,13 +20,16 @@ import sys
 import threading
 import webbrowser
 
-from flask import Flask, abort, jsonify, request, send_from_directory
+from flask import Flask, Response, abort, jsonify, request
 
 from live_api import LiveAPI, UpdateManager
 import live_sources as parsers
 import live_store as store
 import traffic_history
+from caching import TTLCache
 from journey import JourneyPlanner
+from web_cache import (AssetStore, COMPRESSIBLE, MIN_COMPRESS_BYTES, IndexCache,
+                       accepts_gzip, cache_policy, gzip_bytes)
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = {
@@ -38,6 +41,7 @@ STATIC = {
     "/assets/journey.js",
     "/assets/insights.js",
     "/assets/bike-analysis.js",
+    "/assets/big-ben.png",
     "/assets/vendor/maplibre-gl-5.6.2.js",
     "/assets/vendor/maplibre-gl-5.6.2.css",
     "/assets/vendor/supercluster-8.0.1.min.js",
@@ -48,6 +52,9 @@ STATIC = {
 DEFAULT_PORT = 8765
 MAX_REQUEST_BYTES = 2048
 MAX_CONTENT_LENGTH = 4096
+# Set URBANFLOW_COMPRESS=0 when a reverse proxy (Caddy, Cloudflare) already
+# compresses responses, to avoid doing the work twice.
+COMPRESS = os.environ.get("URBANFLOW_COMPRESS", "1") != "0"
 
 # Windows' mimetypes database does not know .geojson; browsers parse it as
 # JSON either way, but MapLibre and developer tools prefer the correct type.
@@ -60,6 +67,14 @@ def _env_int(name, default):
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+# /api/map is the most expensive read endpoint: one request aggregates three
+# pollutants and two traffic feeds. A short cache collapses the repeated calls
+# made by playback and by several open tabs; set the TTLs to 0 to disable it.
+MAP_CACHE_TTL_LATEST = max(0, _env_int("URBANFLOW_MAP_CACHE_TTL", 10))
+MAP_CACHE_TTL_FRAME = max(0, _env_int("URBANFLOW_MAP_CACHE_FRAME_TTL", 300))
+MAP_CACHE_ENTRIES = 24
 
 
 def _env_list(name):
@@ -100,8 +115,16 @@ def create_app(database=store.DB, *, static_root=ROOT, trusted_hosts=(), trusted
     )
     app.json.ensure_ascii = False
     app.api = LiveAPI(database)
+    app.map_cache = TTLCache(max_entries=MAP_CACHE_ENTRIES)
+
+    def clear_caches():
+        app.map_cache.clear()
+        app.api.analysis.clear_caches()
+
     app.journeys = JourneyPlanner(app.api.analysis)
-    app.updates = UpdateManager(database)
+    # A finished data update invalidates the cached map payloads immediately
+    # instead of waiting for the TTL.
+    app.updates = UpdateManager(database, on_finished=clear_caches)
 
     def require_same_origin():
         """Reject cross-site POSTs; browser same-origin requests include Origin."""
@@ -128,20 +151,75 @@ def create_app(database=store.DB, *, static_root=ROOT, trusted_hosts=(), trusted
 
     @app.after_request
     def security_headers(response):
-        response.headers["Cache-Control"] = "no-store"
+        # API and error responses must not be cached; static handlers set their
+        # own policy before this runs.
+        response.headers.setdefault("Cache-Control", "no-store")
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response
 
+    @app.after_request
+    def compress_response(response):
+        if not COMPRESS or request.method == "HEAD":
+            return response
+        if response.direct_passthrough or response.headers.get("Content-Encoding"):
+            return response
+        if response.mimetype not in COMPRESSIBLE:
+            return response
+        if not accepts_gzip(request.headers.get("Accept-Encoding", "")):
+            return response
+        data = response.get_data()
+        if len(data) < MIN_COMPRESS_BYTES:
+            return response
+        packed = gzip_bytes(data)
+        if len(packed) >= len(data):
+            return response
+        response.set_data(packed)
+        response.headers["Content-Encoding"] = "gzip"
+        response.headers["Content-Length"] = str(len(packed))
+        response.headers["Vary"] = "Accept-Encoding"
+        return response
+
+    assets = AssetStore(static_root)
+    index_page = IndexCache(static_root, assets)
+
+    def _content_type(filename):
+        guessed = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        if guessed.startswith("text/") or guessed in ("application/javascript",
+                                                     "application/geo+json"):
+            return guessed + "; charset=utf-8"
+        return guessed
+
+    def _serve(filename, raw, packed, digest, cache_control):
+        use_gzip = COMPRESS and accepts_gzip(request.headers.get("Accept-Encoding", ""))
+        body = packed if use_gzip else raw
+        etag = digest + ("-gz" if use_gzip else "")
+        headers = {"Cache-Control": cache_control, "Vary": "Accept-Encoding",
+                   "ETag": f'"{etag}"'}
+        if etag in request.if_none_match:
+            return Response(status=304, headers=headers)
+        if use_gzip:
+            headers["Content-Encoding"] = "gzip"
+        return Response(body, headers=headers, content_type=_content_type(filename))
+
+    def _serve_index():
+        page = index_page.render()
+        return _serve("index.html", page["body"], page["gzip"],
+                      page["digest"], cache_policy("index.html"))
+
     @app.get("/")
     def index():
-        return send_from_directory(static_root, "index.html")
+        return _serve_index()
 
     @app.get("/<path:filename>")
     def static_file(filename):
         if "/" + filename not in STATIC:
             abort(404)
-        return send_from_directory(static_root, filename)
+        if filename == "index.html":
+            return _serve_index()
+        entry = assets.entry(filename)
+        return _serve(filename, entry["raw"], entry["gzip"], entry["digest"],
+                      cache_policy(filename))
 
     def query_params():
         return {key: values[-1] for key, values in request.args.lists()}
@@ -168,7 +246,16 @@ def create_app(database=store.DB, *, static_root=ROOT, trusted_hosts=(), trusted
 
     @app.get("/api/map")
     def api_map():
-        return app.api.analysis.map(query_params())
+        params = query_params()
+        key = json.dumps(params, sort_keys=True, ensure_ascii=False)
+        cached = app.map_cache.get(key)
+        if cached is not None:
+            return cached
+        result = app.api.analysis.map(params)
+        app.map_cache.put(
+            key, result,
+            MAP_CACHE_TTL_FRAME if params.get("cursor") else MAP_CACHE_TTL_LATEST)
+        return result
 
     @app.get("/api/analysis/series")
     def api_analysis_series():
@@ -325,6 +412,9 @@ def main(argv=None):
     trusted_hosts = set(args.trusted_host or _env_list("URBANFLOW_TRUSTED_HOSTS"))
     trusted_origins = set(args.trusted_origin or _env_list("URBANFLOW_TRUSTED_ORIGINS"))
     app = create_app(args.db, trusted_hosts=trusted_hosts, trusted_origins=trusted_origins)
+    # Warm the DAQI feed while the server starts, so /api/health never blocks
+    # the first page request on an external download.
+    app.journeys.daqi.prewarm()
 
     print("London UrbanFlow: " + _listen_url(args.host, args.port), flush=True)
     print("数据库: " + str(Path(args.db).resolve()), flush=True)

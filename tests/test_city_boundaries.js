@@ -104,7 +104,7 @@ assert.equal(sources.has("london-rivers"), false);
 assert.equal(layers.get("london-outer-boundary").type, "line");
 assert.equal(layers.get("london-borough-boundaries").type, "line");
 assert.equal(layers.has("london-thames"), false);
-assert.ok(layerOrder.indexOf("london-borough-boundaries") < layerOrder.indexOf("bike-clusters"));
+assert.ok(layerOrder.indexOf("london-borough-boundaries") < layerOrder.indexOf("bike-points"));
 assert.equal(layers.get("london-outer-boundary").paint["line-color"], "#8b5700");
 assert.equal(layers.get("london-borough-boundaries").paint["line-color"], "#416578");
 assert.equal(layers.get("london-selected-borough").paint["line-color"], "#b12645");
